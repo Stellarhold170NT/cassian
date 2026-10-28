@@ -1,0 +1,86 @@
+# diagrams.mmd — 3 sơ đồ C4 của apache/kafka (mermaid nguyên văn)
+
+Nguồn: `reports/gm-04-overview.md` mục 3 (L1 System Context), mục 4 (L2 Containers), mục 5 (L3 Components) — sao chép nguyên văn tại node publish, không sửa nội dung sơ đồ. Bản PlantUML C4 tương ứng: `workspace.dsl` (cùng thư mục).
+
+## L1 — System Context (gm-04 mục 3)
+
+```mermaid
+flowchart LR
+    subgraph apps["Ứng dụng doanh nghiệp (JVM)"]
+        P["Producer app<br/>KafkaProducer.send()<br/>clients .../KafkaProducer.java:251"]
+        C["Consumer app<br/>KafkaConsumer.poll()<br/>clients .../KafkaConsumer.java:987"]
+        S["Streams app<br/>KafkaStreams.start()<br/>streams .../KafkaStreams.java:165"]
+    end
+    OPS["Ops/Admin (con người)<br/>bin/kafka-topics.sh, kafka-consumer-groups.sh<br/>tools TopicCommand.java:84"]
+    EXT["Hệ thống ngoài<br/>(DB, file, cụm Kafka khác)<br/>connect/runtime ConnectDistributed.java:110<br/>connect/mirror MirrorMaker.java:329"]
+    KAFKA(["HỆ THỐNG APACHE KAFKA<br/>cluster broker+controller KRaft<br/>wire protocol nhị phân ApiKeys.java:48-49"])
+
+    P -->|"produce (PRODUCE)"| KAFKA
+    KAFKA -->|"consume (FETCH)"| C
+    S -->|"kèm internal topics"| KAFKA
+    OPS -->|"AdminClient / RPC quản trị"| KAFKA
+    EXT <-->|"Sink/Source connector, replication"| KAFKA
+```
+
+## L2 — Containers (gm-04 mục 4)
+
+```mermaid
+flowchart TB
+    subgraph jvmBroker["JVM Broker (kafka.Kafka) — File: bin/kafka-server-start.sh:44 → core/.../kafka/Kafka.scala:73"]
+        NET["Network layer<br/>SocketServer (Scala, 1695 dòng)<br/>core/.../network/SocketServer.scala:71"]
+        APIS["KafkaApis — bộ dispatch RPC<br/>core/.../server/KafkaApis.scala:95 (4414 dòng)"]
+        RE["ReplicaManager — replica/append/fetch<br/>core/.../ReplicaManager.scala:154 (2577)"]
+        GC["GroupCoordinatorService (KIP-848)<br/>group-coordinator .../GroupCoordinatorService.java:166"]
+        TC["Transaction coordinator data<br/>transaction-coordinator .../TransactionMetadata.java:37"]
+        SC["ShareCoordinatorService (KIP-932)<br/>share-coordinator .../ShareCoordinatorService.java:85"]
+        CM["ClientMetricsManager — telemetry<br/>server/.../ClientMetricsManager.java:82"]
+    end
+    subgraph jvmCtl["JVM Controller (KRaft) — có thể chung JVM broker ở combined mode (config/server.properties:19 process.roles=broker,controller)"]
+        QC["QuorumController<br/>metadata/.../QuorumController.java:177 (2245)"]
+        RAFT["KafkaRaftClient<br/>raft/.../KafkaRaftClient.java:170 (4185)"]
+    end
+    subgraph libs["Thư viện client (nhúng vào app JVM)"]
+        CL["clients.jar — producer/consumer/admin"]
+        ST["streams.jar"]
+        CR["connect-runtime.jar"]
+    end
+    DISK[("Đĩa: log segments<br/>storage UnifiedLog.java:105 + LogManager.java:81<br/>+ metadata log KRaft")]
+    CLIP[["CLI tools JVM<br/>tools/, shell/, bin/*.sh"]]
+
+    NET --> APIS --> RE --> DISK
+    APIS --> GC
+    APIS --> TC
+    APIS --> SC
+    APIS --> CM
+    QC --> RAFT --> DISK
+    jvmBroker <-->|"metadata quorum"| jvmCtl
+    CL -.->|"RPC"| NET
+    ST -.-> CL
+    CR -.-> CL
+    CLIP -.-> CL
+```
+
+## L3 — Components bên trong broker/controller (gm-04 mục 5)
+
+```mermaid
+flowchart TB
+    subgraph brokerInternal["Inside: Broker JVM (core + server + storage)"]
+        A["SocketServer (Scala)<br/>Acceptor/Processor đọc network<br/>core/.../network/SocketServer.scala:71"]
+        B["RequestChannel<br/>core/.../network/RequestChannel.scala (201)"]
+        C2["KafkaRequestHandler pool<br/>core/.../KafkaRequestHandler.scala:91<br/>gọi apis.handle — Dòng 167"]
+        D["KafkaApis — switch theo ApiKeys<br/>Dòng 175: case ApiKeys.PRODUCE => handleProduceRequest (Dòng 401)"]
+        E["ReplicaManager<br/>core/.../ReplicaManager.scala:154"]
+        F["UnifiedLog/LogManager<br/>storage/.../UnifiedLog.java:105, LogManager.java:81"]
+    end
+    subgraph coordRuntime["Inside: coordinator runtime (dùng chung)"]
+        G["CoordinatorRuntime<S,U> state-machine per-partition<br/>coordinator-common .../CoordinatorRuntime.java:100"]
+        H["GroupCoordinatorShard/GroupMetadataManager<br/>group-coordinator .../GroupMetadataManager.java (10188 — gm-02 m04)"]
+    end
+    subgraph kraftInternal["Inside: Controller JVM (metadata + raft)"]
+        I["QuorumController — event/claim per record<br/>metadata/.../QuorumController.java:177"]
+        J["KafkaRaftClient — leader election + log replication<br/>raft/.../KafkaRaftClient.java:170"]
+    end
+    A --> B --> C2 --> D --> E --> F
+    D -->|"consumer groups / share / txn"| G --> H
+    I --> J
+```
