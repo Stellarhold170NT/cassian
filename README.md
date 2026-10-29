@@ -5,44 +5,49 @@ identifies the modules worth reusing, maps their dependencies, and preserves
 verified source with provenance — the knowledge behind better engineering
 decisions.
 
-## What is here
+## How a subject is organized
 
-First subject: apache/kafka (trunk, pinned at `aa62a433`).
+Each studied repository becomes a subject and gets its own namespace:
 
-- `modules/kafka/<module>/` — verbatim source of all 66 gradle modules
-  (7,392 files, 1.88M measured lines), byte-identical to upstream at the
-  pin. Each module carries a `PROVENANCE.md` with the upstream sha, path,
-  license, and measured size.
-- `matrix/matrix.csv` — the index: 66 modules with ratings and locations.
+- `modules/<subject>/<module>/` — verbatim source, byte-identical to a pinned
+  upstream commit; every module carries a `PROVENANCE.md` with the upstream
+  sha, path, license, and measured size.
+- `docs/<subject>/` — cartography, module map, architecture, overview,
+  ratings, data flows; `docs/<subject>/index.md` is the reading order.
+- `specs/<subject>/` — extraction plan per module.
+- `tracking/<subject>.md` — pinned commit against upstream HEAD, plus the
+  harvest record and re-sync rule.
+- `matrix/` — one index per subject: every module, its rating, its location.
   Start here.
-- `docs/kafka/` — cartography, module map, architecture (C4), overview,
-  ratings, data flows.
-- `specs/kafka/` — extraction plan per module.
-- `tracking/kafka.md` — the pinned commit against upstream HEAD, plus the
-  harvest record.
+
+## Subjects
+
+| subject | upstream | pin | extracts |
+|---|---|---|---|
+| kafka | github.com/apache/kafka | `aa62a433` | 66 of 66 gradle modules under `modules/kafka/`, verified byte-identical; index at `matrix/matrix.csv` |
 
 ## Quick start
 
-1. Sort `matrix/matrix.csv` by rating; the top rows are the modules worth
-   taking first (clients, streams, core, group-coordinator…).
-2. Take the code from `modules/kafka/<module>/`; its `PROVENANCE.md` states
-   where it came from and its dependencies are documented in the module map.
-3. Read in order: cartography, overview, module map, data flows, ratings.
+1. Open the subject's index in `matrix/` and sort by rating; the top rows are
+   the modules worth taking first.
+2. Read the module's entry in `docs/<subject>/` — responsibility,
+   dependencies, main files.
+3. Take the code from `modules/<subject>/<module>/`; its `PROVENANCE.md`
+   states where it came from.
 
 ## Method
 
-Ratings follow a fixed rubric with measurable criteria
-(`docs/kafka/05-stars.md`). Extracts are verified with `diff -r` against
-upstream at the pin; the full sweep showed no differences.
+Ratings follow a fixed rubric with measurable criteria. Extracts are verified
+with `diff -r` against upstream at the pin.
 
 ## Limitations
 
-- Subject documentation is currently written in Vietnamese; an English
+- kafka subject documentation is currently written in Vietnamese; an English
   revision is in progress.
-- Data-flow measurements use a 100-commit window; treat rankings as
-  indicative, not definitive.
-- Module ratings weight centrality more than ease of reuse; a revision of
-  the rubric is planned.
+- Data-flow measurements for kafka use a 100-commit window; treat rankings
+  as indicative, not definitive.
+- Module ratings weight centrality more than ease of reuse; a rubric revision
+  is planned.
 
 ## License
 
