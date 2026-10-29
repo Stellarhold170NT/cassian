@@ -21,7 +21,7 @@ extracts pin.
 
 | id | module | rating | binding constraint |
 |---|---|---|---|
-| s01 | clients | 5★ | — (0 deps, 23 edges, ratio 0.48, loc 387364, PLM 7031, 2 evidence incl. out-of-repo) |
+| s01 | clients | 5★ | — (0 deps, 23 edges, ratio 0.48, loc 387364, PLM 6928, 2 evidence incl. out-of-repo) |
 | s02 | streams | 3★ | edges 5 < 8 |
 | s03 | core | 1★ | deps 11 ≥ 10 |
 | s04 | group-coordinator | 3★ | deps 5 |
