@@ -2,12 +2,26 @@
 
 | project | pinned_sha | head_now | state | last-check (UTC) |
 |---|---|---|---|---|
-| kafka | aa62a433553c14866521bd40ff446b6920d4d67e | 601492157a7e563b5cd4cdea8c9382302a1ea5f4 | STALE | 2026-10-28T23:35:39Z |
+| kafka | aa62a433553c14866521bd40ff446b6920d4d67e | 14ee92ca1ecf469eb8f006abf7b75453513cac49 | STALE | 2026-10-29T21:10:00Z |
 
-- Nguồn pin: cột `upstream_sha` của `matrix/matrix.csv` = cert gm-01 RUN 4 `aa62a433…` — commit "KAFKA-20866: Remove incremental-only append result state (#23749)" (File: reports/gm-01-cartography.md | Dòng: 348, workspace pipeline `workloop-ws`).
-- Lệnh kiểm (quy trình gm-final mục 6, bước 2): `git ls-remote https://github.com/apache/kafka refs/heads/trunk` → `601492157a7e563b5cd4cdea8c9382302a1ea5f4` ≠ pin → **STALE**. FRESH nếu bằng pin; STALE nếu khác (không resolve commit, chỉ ls-remote — ghi "HEAD moved").
-- Chính sách STALE (gm-final mục 6, bước 5): KHÔNG tự re-measure — đánh dấu và chờ orchestrator quyết định re-cert theo chu trình scan → worker → merge.
-- Drift đã chứng minh trong pipeline: cert `aa62a433` → clone gm-04 `3655d7c` → clone gm-09b/ex_b `6014921` (~1 ngày, 3 sha) — java LOC +42 tại m01 chỉ vì 1 commit (File: reports/mm_scan--ef360255.md | Dòng: 111).
+- Source of the pin: `docs/kafka/index.md` front matter (`measured_at`) — the
+  commit of upstream `trunk` the subject was frozen against: "KAFKA-20866:
+  Remove incremental-only append result state (#23749)".
+- Check command: `git ls-remote https://github.com/apache/kafka refs/heads/trunk`.
+  FRESH when it equals the pin; STALE otherwise (sha comparison only, no commit
+  resolution). Current head `14ee92ca` ("KAFKA-21230: Pause task executors on
+  byte limit (#23984)") differs from the pin → STALE.
+- STALE policy: do not re-measure automatically — the pin stays, a re-sync
+  cycle decides when to re-certify against a new commit.
+- Measurement note: documentation statistics (census, module sizes, ratings,
+  flow traces) were taken at `0c92b0664539d0dfb60b43ede0026497a581d8e0`
+  (KAFKA-20125), one of the commits after the pin. Upstream
+  `aa62a433..0c92b066` touched 15 files (`SslPrincipalMapper`, `BrokerServer`,
+  `KafkaConfig`, `BrokerLifecycleManager`, `AssignmentBuilder`, `QuotaConfig`,
+  `ServerLogConfigs`, `DynamicLogConfig` and related tests); none of them is
+  cited by the docs, so every reference resolves identically at both commits.
+  The current head moved one further commit (streams-only); the same reasoning
+  applies to the citation set.
 
 ## Harvest (extracted modules)
 
@@ -18,3 +32,13 @@
   measured size, re-sync rule).
 - Extracts are byte-identical to upstream at the pin; re-verify with
   `diff -r modules/kafka/<module> <upstream clone>/<module>`.
+
+## Documentation set
+
+- `docs/kafka/01…07` + `docs/method/rubric.md` + `matrix/matrix.csv` +
+  `specs/kafka/clients.plan.md` + `specs/kafka/server-common.plan.md` form the
+  documentation set for this subject; reading order in
+  [`docs/kafka/index.md`](../docs/kafka/index.md).
+- The set was verified against the upstream tree `0c92b066` as described in the
+  measurement note; per-file measurement provenance lives in each document's
+  own note and front matter.
