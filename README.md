@@ -1,27 +1,34 @@
 # cassian
 
-Cái tên lấy từ Consigliere — người cố vấn của gia đình: không ra trận,
-không khoe, nhưng luôn nắm rõ mọi chuyện và trả lời đúng lúc.
+Cassian is an archive of studied codebases. Each subject repository is read
+end to end, measured against its own source, and reduced to what is worth
+keeping — an index, maps, notes, and verbatim extracts of the code itself.
 
-Repo này là cố vấn của bạn cho apache/kafka. Nó đã đọc toàn bộ source ở
-trunk, chốt một commit, chấm giá 66 module bằng rubric đo được, vẽ bản đồ
-phụ thuộc, và nhặt nguyên vẹn phần code đáng lấy vào modules/. Bạn hỏi,
-nó trả lời bằng số liệu đã đo — không bằng cảm tính.
+The name nods to the consigliere: the advisor who has read everything and
+volunteers only what is asked.
 
-Bên trong:
-- matrix/matrix.csv — 66 module, sao, đường dẫn. Mở đầu từ đây.
-- modules/kafka/<module>/ — code gốc từng module kèm PROVENANCE.md
-  (upstream sha, license, files/LOC đo lại). Diff với upstream là rỗng.
-- docs/kafka/ — 01 cartography, 02 module-map, 03 C4, 04 overview,
-  05 stars, 06 flows, 07 usage (use case cho module 4-5 sao, mọi API
-  đều có file:line làm chứng), final.
-- specs/kafka/ — kế hoạch cắt từng module.
-- tracking/kafka.md — so commit chốt với HEAD upstream, biết khi nào
-  nên cắt lại.
+## Layout
 
-Cách dùng: chọn module trong matrix theo số sao, đọc dòng "dùng khi nào"
-trong 07 usage, kéo code từ modules/ kèm các phụ thuộc nó cần
-(deps_out ghi sẵn trong module map). Muốn hiểu sâu, docs đã có đủ.
+- `matrix/` — one index per subject: every module, its rating, its location.
+  Start here.
+- `modules/<subject>/<module>/` — verbatim source, byte-identical to a pinned
+  upstream commit. Each module carries a `PROVENANCE.md` with the upstream
+  sha, path, license, and measured size.
+- `docs/<subject>/` — cartography, module map, architecture (C4), overview,
+  ratings, data flows, usage.
+- `specs/<subject>/` — the extraction plan for each module.
+- `tracking/<subject>.md` — the pinned commit against upstream HEAD, so
+  drift is visible.
 
-License: code giữ nguyên Apache-2.0 của apache/kafka (xem PROVENANCE.md
-từng module). Tài liệu do cassian biên soạn, phát hành Apache-2.0.
+First subject: apache/kafka (trunk, pinned).
+
+## Use
+
+Choose a module by rating in the matrix, follow its declared dependencies,
+take the code from `modules/`. Nothing is paraphrased: extracts diff clean
+against upstream, and claims in the notes carry measurable references.
+
+## License
+
+Extracted code remains under its original Apache-2.0 terms. Notes and
+indices are Apache-2.0.
