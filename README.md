@@ -5,39 +5,41 @@ identifies the modules worth reusing, maps their dependencies, and preserves
 verified source with provenance — the knowledge behind better engineering
 decisions.
 
-## How it works
+## What is here
 
-For each subject repository, cassian:
+First subject: apache/kafka (trunk, pinned at a single commit).
 
-1. Reads the codebase end to end and pins a single upstream commit.
-2. Builds an index of every module — responsibility, public surface, size,
-   and a rating backed by measured criteria.
-3. Maps dependencies, so a module can be lifted out together with what it
-   needs.
-4. Extracts the source of every module verbatim, each with a PROVENANCE.md
-   recording where it came from and under which license.
-5. Tracks the pinned commit against upstream HEAD, so drift is visible.
+- `matrix/matrix.csv` — the index: 66 gradle modules with ratings and
+  locations. Start here.
+- `docs/kafka/` — cartography, module map, architecture (C4), overview,
+  ratings, data flows.
+- `specs/kafka/` — extraction plan per module.
+- `tracking/kafka.md` — the pinned commit against upstream HEAD, so drift
+  is visible.
 
-Nothing is paraphrased. Extracts diff clean against upstream; claims in the
-notes carry measurable references.
+## Quick start
 
-## Layout
+1. Sort `matrix/matrix.csv` by rating; the top rows are the modules worth
+   studying first.
+2. Open the module's entry in the module map: responsibility, dependencies,
+   main files.
+3. Read in order: cartography, overview, module map, data flows, ratings.
 
-- `matrix/` — the index per subject: every module, its rating, its location.
-  Start here.
-- `modules/<subject>/<module>/` — verbatim source, each module with its
-  `PROVENANCE.md`.
-- `docs/<subject>/` — cartography, module map, architecture (C4), overview,
-  ratings, data flows, usage.
-- `specs/<subject>/` — the extraction plan per module.
-- `tracking/<subject>.md` — pinned commit against upstream HEAD.
+Verbatim code extracts land under `modules/` in a separate harvest commit;
+`tracking/kafka.md` records the harvest state.
 
-First subject: apache/kafka (trunk, pinned).
+## Method
 
-## Use
+Ratings follow a fixed rubric with measurable criteria
+(`docs/kafka/05-stars.md`). Data-flow notes are measured on the pinned tree.
 
-Pick a module by rating in the matrix, follow its declared dependencies,
-take the code from `modules/`, and cite its PROVENANCE when reusing.
+## Limitations
+
+- `modules/` is not yet populated; extracts arrive with the harvest commit.
+- Subject documentation is currently written in Vietnamese; an English
+  revision is in progress.
+- Data-flow measurements use a 100-commit window; treat rankings as
+  indicative, not definitive.
 
 ## License
 
