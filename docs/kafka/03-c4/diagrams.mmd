@@ -1,86 +1,352 @@
-# diagrams.mmd — 3 sơ đồ C4 của apache/kafka (mermaid nguyên văn)
+%% Apache Kafka C4 model — mermaid rendering of workspace.dsl (Structurizr).
+%% Views: L1 SystemContext, L2 Containers, L3 components x6 (Broker, KRaft, Clients, Connect, Streams, Tools).
+%% Evidence anchors for every element/relationship are embedded as comments in workspace.dsl.
 
-Nguồn: `reports/gm-04-overview.md` mục 3 (L1 System Context), mục 4 (L2 Containers), mục 5 (L3 Components) — sao chép nguyên văn tại node publish, không sửa nội dung sơ đồ. Bản PlantUML C4 tương ứng: `workspace.dsl` (cùng thư mục).
+%% ================= VIEW 1: L1 SystemContext =================
 
-## L1 — System Context (gm-04 mục 3)
+graph LR
+  linkStyle default fill:#ffffff
 
-```mermaid
-flowchart LR
-    subgraph apps["Ứng dụng doanh nghiệp (JVM)"]
-        P["Producer app<br/>KafkaProducer.send()<br/>clients .../KafkaProducer.java:251"]
-        C["Consumer app<br/>KafkaConsumer.poll()<br/>clients .../KafkaConsumer.java:987"]
-        S["Streams app<br/>KafkaStreams.start()<br/>streams .../KafkaStreams.java:165"]
+
+  subgraph diagram ["System Context View: Apache Kafka"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    1["<div style='font-weight: bold'>Kafka Administrator / Operator</div><div style='font-size: 70%; margin-top: 0px'>[Person]</div><div style='font-size: 80%; margin-top:10px'>Human operator administering<br />topics, configs and consumer<br />groups through the bundled<br />CLI tooling.</div>"]
+    style 1 fill:#ffffff,stroke:#444444,color:#444444
+    2["<div style='font-weight: bold'>Producer Application</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External application that<br />publishes event records via<br />the Java producer API.</div>"]
+    style 2 fill:#ffffff,stroke:#444444,color:#444444
+    3["<div style='font-weight: bold'>Consumer Application</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External application that<br />subscribes to and consumes<br />event records via the Java<br />consumer API.</div>"]
+    style 3 fill:#ffffff,stroke:#444444,color:#444444
+    4["<div style='font-weight: bold'>Streams Application</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External application building<br />stateful stream-processing<br />topologies on the Kafka<br />Streams library.</div>"]
+    style 4 fill:#ffffff,stroke:#444444,color:#444444
+    5["<div style='font-weight: bold'>Remote Object Store</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External object/blob storage<br />used for tiered storage of<br />log segments via the<br />RemoteStorageManager SPI.</div>"]
+    style 5 fill:#ffffff,stroke:#444444,color:#444444
+    6["<div style='font-weight: bold'>Apache Kafka</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>Distributed event-streaming<br />platform; Gradle root project<br />'kafka' 4.5.0-SNAPSHOT,<br />KRaft-only (no ZooKeeper).</div>"]
+    style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+    2-. "<div>Publishes event records</div><div style='font-size: 70%'></div>" .->6
+    3-. "<div>Subscribes to and consumes<br />event records</div><div style='font-size: 70%'></div>" .->6
+    4-. "<div>Reads input topics, writes<br />results and state changelog<br />topics</div><div style='font-size: 70%'></div>" .->6
+    1-. "<div>Administers topics, configs<br />and consumer groups via CLI<br />tooling</div><div style='font-size: 70%'></div>" .->6
+    6-. "<div>Offloads and fetches tiered<br />log segments<br />(RemoteStorageManager SPI)</div><div style='font-size: 70%'></div>" .->5
+
+
+  end
+
+%% ================= VIEW 2: L2 Containers =================
+
+graph TB
+  linkStyle default fill:#ffffff
+
+
+  subgraph diagram ["Container View: Apache Kafka"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    1["<div style='font-weight: bold'>Kafka Administrator / Operator</div><div style='font-size: 70%; margin-top: 0px'>[Person]</div><div style='font-size: 80%; margin-top:10px'>Human operator administering<br />topics, configs and consumer<br />groups through the bundled<br />CLI tooling.</div>"]
+    style 1 fill:#ffffff,stroke:#444444,color:#444444
+    2["<div style='font-weight: bold'>Producer Application</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External application that<br />publishes event records via<br />the Java producer API.</div>"]
+    style 2 fill:#ffffff,stroke:#444444,color:#444444
+    3["<div style='font-weight: bold'>Consumer Application</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External application that<br />subscribes to and consumes<br />event records via the Java<br />consumer API.</div>"]
+    style 3 fill:#ffffff,stroke:#444444,color:#444444
+    4["<div style='font-weight: bold'>Streams Application</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External application building<br />stateful stream-processing<br />topologies on the Kafka<br />Streams library.</div>"]
+    style 4 fill:#ffffff,stroke:#444444,color:#444444
+    5["<div style='font-weight: bold'>Remote Object Store</div><div style='font-size: 70%; margin-top: 0px'>[Software System]</div><div style='font-size: 80%; margin-top:10px'>External object/blob storage<br />used for tiered storage of<br />log segments via the<br />RemoteStorageManager SPI.</div>"]
+    style 5 fill:#ffffff,stroke:#444444,color:#444444
+
+
+    subgraph 6 ["Apache Kafka"]
+      style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+      20["<div style='font-weight: bold'>KRaft Controller & Metadata</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java (modules raft, metadata)]</div><div style='font-size: 80%; margin-top:10px'>KRaft metadata quorum<br />replacing ZooKeeper:<br />consensus client, active<br />controller and metadata<br />layer.</div>"]
+      style 20 fill:#ffffff,stroke:#444444,color:#444444
+      25["<div style='font-weight: bold'>Clients Library (Java)</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java (module clients, 387364 lines / 1879 files)]</div><div style='font-size: 80%; margin-top:10px'>Link-time client library<br />embedded in applications:<br />producer, consumer, admin<br />plus common protocol/network.</div>"]
+      style 25 fill:#ffffff,stroke:#444444,color:#444444
+      31["<div style='font-weight: bold'>Kafka Streams</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java/Scala (modules streams, streams-scala, streams-test-utils; 338869 lines / 1273 files)]</div><div style='font-size: 80%; margin-top:10px'>Stream-processing client<br />library: DSL, processor API,<br />state stores and StreamThread<br />runtime.</div>"]
+      style 31 fill:#ffffff,stroke:#444444,color:#444444
+      37["<div style='font-weight: bold'>Kafka Connect</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java (modules connect-runtime, connect-api, connect-transforms, connect-json, connect-mirror (+mirror-client), connect-file, connect-basic-auth-extension, ...)]</div><div style='font-size: 80%; margin-top:10px'>Connector runtime integrating<br />external systems: CLI entry,<br />worker, herder, SPI,<br />transforms, converters,<br />MirrorMaker 2.</div>"]
+      style 37 fill:#ffffff,stroke:#444444,color:#444444
+      45["<div style='font-weight: bold'>CLI Tools</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java (modules tools, tools-api, shell)]</div><div style='font-size: 80%; margin-top:10px'>Official command-line tooling<br />shipped with the<br />distribution.</div>"]
+      style 45 fill:#ffffff,stroke:#444444,color:#444444
+      7["<div style='font-weight: bold'>Broker</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java/Scala (modules core, server, storage + storage/api, coordinator-common, group-coordinator (+group-coordinator-api), transaction-coordinator, share-coordinator, mirror-coordinator, server-common)]</div><div style='font-size: 80%; margin-top:10px'>Core broker process: request<br />handling, replication, log<br />storage and coordinator<br />runtimes; entrypoint<br />kafka.Kafka (Scala main).</div>"]
+      style 7 fill:#ffffff,stroke:#444444,color:#444444
     end
-    OPS["Ops/Admin (con người)<br/>bin/kafka-topics.sh, kafka-consumer-groups.sh<br/>tools TopicCommand.java:84"]
-    EXT["Hệ thống ngoài<br/>(DB, file, cụm Kafka khác)<br/>connect/runtime ConnectDistributed.java:110<br/>connect/mirror MirrorMaker.java:329"]
-    KAFKA(["HỆ THỐNG APACHE KAFKA<br/>cluster broker+controller KRaft<br/>wire protocol nhị phân ApiKeys.java:48-49"])
 
-    P -->|"produce (PRODUCE)"| KAFKA
-    KAFKA -->|"consume (FETCH)"| C
-    S -->|"kèm internal topics"| KAFKA
-    OPS -->|"AdminClient / RPC quản trị"| KAFKA
-    EXT <-->|"Sink/Source connector, replication"| KAFKA
-```
 
-## L2 — Containers (gm-04 mục 4)
+    2-. "<div>Links the client library and<br />publishes via KafkaProducer</div><div style='font-size: 70%'></div>" .->25
+    3-. "<div>Links the client library and<br />consumes via KafkaConsumer</div><div style='font-size: 70%'></div>" .->25
+    4-. "<div>Builds and runs stream<br />topologies</div><div style='font-size: 70%'></div>" .->31
+    1-. "<div>Invokes admin/maintenance<br />commands</div><div style='font-size: 70%'></div>" .->45
+    25-. "<div>Kafka wire protocol: produce,<br />fetch, metadata, join/sync,<br />offset commit</div><div style='font-size: 70%'></div>" .->7
+    31-. "<div>Built on<br />producer/consumer/admin<br />client APIs</div><div style='font-size: 70%'></div>" .->25
+    31-. "<div>Record I/O plus internal<br />state store and changelog<br />topic management</div><div style='font-size: 70%'></div>" .->7
+    37-. "<div>Embeds<br />producer/consumer/admin for<br />record and internal-topic I/O</div><div style='font-size: 70%'></div>" .->25
+    37-. "<div>Connector record flow plus<br />config/offset/status internal<br />topics</div><div style='font-size: 70%'></div>" .->7
+    45-. "<div>Admin, consumer and producer<br />APIs under every command</div><div style='font-size: 70%'></div>" .->25
+    7-. "<div>KRaft quorum membership;<br />appends and replicates the<br />metadata log</div><div style='font-size: 70%'></div>" .->20
+    20-. "<div>Publishes metadata deltas<br />into the broker metadata<br />cache</div><div style='font-size: 70%'></div>" .->7
+    7-. "<div>Copies and fetches remote log<br />segments (tiered storage)</div><div style='font-size: 70%'></div>" .->5
 
-```mermaid
-flowchart TB
-    subgraph jvmBroker["JVM Broker (kafka.Kafka) — File: bin/kafka-server-start.sh:44 → core/.../kafka/Kafka.scala:73"]
-        NET["Network layer<br/>SocketServer (Scala, 1695 dòng)<br/>core/.../network/SocketServer.scala:71"]
-        APIS["KafkaApis — bộ dispatch RPC<br/>core/.../server/KafkaApis.scala:95 (4414 dòng)"]
-        RE["ReplicaManager — replica/append/fetch<br/>core/.../ReplicaManager.scala:154 (2577)"]
-        GC["GroupCoordinatorService (KIP-848)<br/>group-coordinator .../GroupCoordinatorService.java:166"]
-        TC["Transaction coordinator data<br/>transaction-coordinator .../TransactionMetadata.java:37"]
-        SC["ShareCoordinatorService (KIP-932)<br/>share-coordinator .../ShareCoordinatorService.java:85"]
-        CM["ClientMetricsManager — telemetry<br/>server/.../ClientMetricsManager.java:82"]
-    end
-    subgraph jvmCtl["JVM Controller (KRaft) — có thể chung JVM broker ở combined mode (config/server.properties:19 process.roles=broker,controller)"]
-        QC["QuorumController<br/>metadata/.../QuorumController.java:177 (2245)"]
-        RAFT["KafkaRaftClient<br/>raft/.../KafkaRaftClient.java:170 (4185)"]
-    end
-    subgraph libs["Thư viện client (nhúng vào app JVM)"]
-        CL["clients.jar — producer/consumer/admin"]
-        ST["streams.jar"]
-        CR["connect-runtime.jar"]
-    end
-    DISK[("Đĩa: log segments<br/>storage UnifiedLog.java:105 + LogManager.java:81<br/>+ metadata log KRaft")]
-    CLIP[["CLI tools JVM<br/>tools/, shell/, bin/*.sh"]]
 
-    NET --> APIS --> RE --> DISK
-    APIS --> GC
-    APIS --> TC
-    APIS --> SC
-    APIS --> CM
-    QC --> RAFT --> DISK
-    jvmBroker <-->|"metadata quorum"| jvmCtl
-    CL -.->|"RPC"| NET
-    ST -.-> CL
-    CR -.-> CL
-    CLIP -.-> CL
-```
+  end
 
-## L3 — Components bên trong broker/controller (gm-04 mục 5)
+%% ================= VIEW 3: L3 Broker components =================
 
-```mermaid
-flowchart TB
-    subgraph brokerInternal["Inside: Broker JVM (core + server + storage)"]
-        A["SocketServer (Scala)<br/>Acceptor/Processor đọc network<br/>core/.../network/SocketServer.scala:71"]
-        B["RequestChannel<br/>core/.../network/RequestChannel.scala (201)"]
-        C2["KafkaRequestHandler pool<br/>core/.../KafkaRequestHandler.scala:91<br/>gọi apis.handle — Dòng 167"]
-        D["KafkaApis — switch theo ApiKeys<br/>Dòng 175: case ApiKeys.PRODUCE => handleProduceRequest (Dòng 401)"]
-        E["ReplicaManager<br/>core/.../ReplicaManager.scala:154"]
-        F["UnifiedLog/LogManager<br/>storage/.../UnifiedLog.java:105, LogManager.java:81"]
+graph TB
+  linkStyle default fill:#ffffff
+
+
+  subgraph diagram ["Component View: Apache Kafka - Broker"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    subgraph 6 ["Apache Kafka"]
+      style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+      subgraph 7 ["Broker"]
+        style 7 fill:#ffffff,stroke:#444444,color:#444444
+
+
+        10["<div style='font-weight: bold'>KafkaApis</div><div style='font-size: 70%; margin-top: 0px'>[Component: Scala (module core)]</div><div style='font-size: 80%; margin-top:10px'>Request-handling facade<br />implementing the Kafka<br />protocol APIs; largest file<br />of module core (4414 lines).</div>"]
+        style 10 fill:#ffffff,stroke:#444444,color:#444444
+        11["<div style='font-weight: bold'>ReplicaManager</div><div style='font-size: 70%; margin-top: 0px'>[Component: Scala (module core)]</div><div style='font-size: 80%; margin-top:10px'>Partition replication, fetch<br />and leader state management<br />on the broker.</div>"]
+        style 11 fill:#ffffff,stroke:#444444,color:#444444
+        12["<div style='font-weight: bold'>UnifiedLog / LogManager</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module storage, org.apache.kafka.storage.internals.log)]</div><div style='font-size: 80%; margin-top:10px'>Durable log storage engine:<br />UnifiedLog, LogSegment,<br />LogManager plus remote-log<br />hooks.</div>"]
+        style 12 fill:#ffffff,stroke:#444444,color:#444444
+        13["<div style='font-weight: bold'>Group Coordinator (KIP-848)</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module group-coordinator)]</div><div style='font-size: 80%; margin-top:10px'>GroupCoordinatorService +<br />GroupCoordinatorShard/GroupMetadataManager:<br />consumer/classic/streams/share<br />group state machines (largest<br />file 10188 lines).</div>"]
+        style 13 fill:#ffffff,stroke:#444444,color:#444444
+        14["<div style='font-weight: bold'>Transaction Coordinator</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module transaction-coordinator)]</div><div style='font-size: 80%; margin-top:10px'>TransactionMetadata state<br />machine + TransactionLog +<br />producer-id allocation<br />(RPCProducerIdManager).</div>"]
+        style 14 fill:#ffffff,stroke:#444444,color:#444444
+        15["<div style='font-weight: bold'>Share Coordinator (KIP-932)</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module share-coordinator)]</div><div style='font-size: 80%; margin-top:10px'>ShareCoordinatorService/Shard<br />managing share-group offsets<br />on the CoordinatorRuntime.</div>"]
+        style 15 fill:#ffffff,stroke:#444444,color:#444444
+        16["<div style='font-weight: bold'>Coordinator Runtime (coordinator-common)</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module coordinator-common, org.apache.kafka.coordinator.common.runtime)]</div><div style='font-size: 80%; margin-top:10px'>Shared runtime for KRaft<br />coordinators:<br />CoordinatorRuntime<br />per-partition state machine +<br />event processor,<br />CoordinatorLoader/RecordSerde<br />and metrics; base of the<br />group and share coordinators<br />(module coordinator-common,<br />18618 lines).</div>"]
+        style 16 fill:#ffffff,stroke:#444444,color:#444444
+        17["<div style='font-weight: bold'>RaftManager (broker-side)</div><div style='font-size: 70%; margin-top: 0px'>[Component: Scala (module core, kafka.raft)]</div><div style='font-size: 80%; margin-top:10px'>Broker-side KRaft client:<br />joins the quorum, appends and<br />replicates the metadata log.</div>"]
+        style 17 fill:#ffffff,stroke:#444444,color:#444444
+        18["<div style='font-weight: bold'>BrokerMetadataPublisher</div><div style='font-size: 70%; margin-top: 0px'>[Component: Scala (module core, kafka.server.metadata)]</div><div style='font-size: 80%; margin-top:10px'>Publishes metadata deltas<br />from the KRaft metadata log<br />into the broker in-memory<br />metadata cache (395 lines).</div>"]
+        style 18 fill:#ffffff,stroke:#444444,color:#444444
+        19["<div style='font-weight: bold'>Server-common infrastructure</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module server-common)]</div><div style='font-size: 80%; margin-top:10px'>Shared server library:<br />MetadataVersion/Feature,<br />ApiMessageAndVersion +<br />RecordSerde, KafkaEventQueue,<br />purgatory, fault handler<br />(widest fan-out module).</div>"]
+        style 19 fill:#ffffff,stroke:#444444,color:#444444
+        8["<div style='font-weight: bold'>kafka.Kafka</div><div style='font-size: 70%; margin-top: 0px'>[Component: Scala (module core)]</div><div style='font-size: 80%; margin-top:10px'>Broker entrypoint; parses<br />config, builds and starts the<br />broker server (Scala main at<br />line 73).</div>"]
+        style 8 fill:#ffffff,stroke:#444444,color:#444444
+        9["<div style='font-weight: bold'>SocketServer</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module server, org.apache.kafka.network)]</div><div style='font-size: 80%; margin-top:10px'>Network layer accepting<br />client connections and<br />request channels.</div>"]
+        style 9 fill:#ffffff,stroke:#444444,color:#444444
+      end
+
+
     end
-    subgraph coordRuntime["Inside: coordinator runtime (dùng chung)"]
-        G["CoordinatorRuntime<S,U> state-machine per-partition<br/>coordinator-common .../CoordinatorRuntime.java:100"]
-        H["GroupCoordinatorShard/GroupMetadataManager<br/>group-coordinator .../GroupMetadataManager.java (10188 — gm-02 m04)"]
+
+
+    10-. "<div>Delegates<br />produce/fetch/metadata<br />handling</div><div style='font-size: 70%'></div>" .->11
+    10-. "<div>Serves consumer-group APIs</div><div style='font-size: 70%'></div>" .->13
+    10-. "<div>Serves transactional APIs<br />(initProducerId and friends,<br />line 1699)</div><div style='font-size: 70%'></div>" .->14
+    10-. "<div>Serves share-group APIs</div><div style='font-size: 70%'></div>" .->15
+    13-. "<div>Runs group state machines on<br />the shared CoordinatorRuntime</div><div style='font-size: 70%'></div>" .->16
+    15-. "<div>Runs share-group state<br />machines on the shared<br />CoordinatorRuntime</div><div style='font-size: 70%'></div>" .->16
+    11-. "<div>Reads and writes log segments<br />through the log manager</div><div style='font-size: 70%'></div>" .->12
+
+
+  end
+
+%% ================= VIEW 4: L3 KRaft components =================
+
+graph TB
+  linkStyle default fill:#ffffff
+
+
+  subgraph diagram ["Component View: Apache Kafka - KRaft Controller & Metadata"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    subgraph 6 ["Apache Kafka"]
+      style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+      subgraph 20 ["KRaft Controller & Metadata"]
+        style 20 fill:#ffffff,stroke:#444444,color:#444444
+
+
+        21["<div style='font-weight: bold'>KafkaRaftClient</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module raft)]</div><div style='font-size: 80%; margin-top:10px'>Self-contained KRaft<br />consensus: leader election<br />and log replication (largest<br />file 4185 lines).</div>"]
+        style 21 fill:#ffffff,stroke:#444444,color:#444444
+        22["<div style='font-weight: bold'>QuorumController</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module metadata)]</div><div style='font-size: 80%; margin-top:10px'>Active/standby controller<br />driving cluster metadata<br />through the replicated log<br />(entry, line 177).</div>"]
+        style 22 fill:#ffffff,stroke:#444444,color:#444444
+        23["<div style='font-weight: bold'>ReplicationControlManager</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module metadata)]</div><div style='font-size: 80%; margin-top:10px'>Topic/partition/ACL/quota<br />control plane recorded into<br />the metadata log (largest<br />file 2604 lines).</div>"]
+        style 23 fill:#ffffff,stroke:#444444,color:#444444
+        24["<div style='font-weight: bold'>StandardAuthorizer</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module metadata)]</div><div style='font-size: 80%; margin-top:10px'>ACL-based authorization<br />persisted in the metadata<br />layer.</div>"]
+        style 24 fill:#ffffff,stroke:#444444,color:#444444
+      end
+
+
     end
-    subgraph kraftInternal["Inside: Controller JVM (metadata + raft)"]
-        I["QuorumController — event/claim per record<br/>metadata/.../QuorumController.java:177"]
-        J["KafkaRaftClient — leader election + log replication<br/>raft/.../KafkaRaftClient.java:170"]
+
+
+    22-. "<div>Replicates the metadata log<br />through the raft client</div><div style='font-size: 70%'></div>" .->21
+
+
+  end
+
+%% ================= VIEW 5: L3 Clients components =================
+
+graph TB
+  linkStyle default fill:#ffffff
+
+
+  subgraph diagram ["Component View: Apache Kafka - Clients Library (Java)"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    subgraph 6 ["Apache Kafka"]
+      style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+      subgraph 25 ["Clients Library (Java)"]
+        style 25 fill:#ffffff,stroke:#444444,color:#444444
+
+
+        26["<div style='font-weight: bold'>KafkaProducer</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module clients)]</div><div style='font-size: 80%; margin-top:10px'>Producer API entry (line<br />251): batching, partitioning,<br />transactions, delivery.</div>"]
+        style 26 fill:#ffffff,stroke:#444444,color:#444444
+        27["<div style='font-weight: bold'>KafkaConsumer</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module clients)]</div><div style='font-size: 80%; margin-top:10px'>Consumer API:<br />subscribe/assign, poll loop,<br />rebalance, fetch.</div>"]
+        style 27 fill:#ffffff,stroke:#444444,color:#444444
+        28["<div style='font-weight: bold'>KafkaAdminClient</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module clients)]</div><div style='font-size: 80%; margin-top:10px'>Admin API:<br />topic/config/ACL/quota<br />management (largest file 5387<br />lines).</div>"]
+        style 28 fill:#ffffff,stroke:#444444,color:#444444
+        29["<div style='font-weight: bold'>NetworkClient</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module clients)]</div><div style='font-size: 80%; margin-top:10px'>Protocol transport:<br />connection pooling, in-flight<br />requests, metadata updates.</div>"]
+        style 29 fill:#ffffff,stroke:#444444,color:#444444
+        30["<div style='font-weight: bold'>Kafka Wire Protocol (ApiKeys)</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module clients, org.apache.kafka.common.protocol)]</div><div style='font-size: 80%; margin-top:10px'>Protocol API enumeration and<br />serialization shared by all<br />clients (ApiKeys entry, line<br />340).</div>"]
+        style 30 fill:#ffffff,stroke:#444444,color:#444444
+      end
+
+
+      45["<div style='font-weight: bold'>CLI Tools</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java (modules tools, tools-api, shell)]</div><div style='font-size: 80%; margin-top:10px'>Official command-line tooling<br />shipped with the<br />distribution.</div>"]
+      style 45 fill:#ffffff,stroke:#444444,color:#444444
     end
-    A --> B --> C2 --> D --> E --> F
-    D -->|"consumer groups / share / txn"| G --> H
-    I --> J
-```
+
+
+    26-. "<div>Sends produce requests over<br />the network</div><div style='font-size: 70%'></div>" .->29
+    45-. "<div>Topic operations via the<br />admin API</div><div style='font-size: 70%'></div>" .->28
+
+
+  end
+
+%% ================= VIEW 6: L3 Connect components =================
+
+graph TB
+  linkStyle default fill:#ffffff
+
+
+  subgraph diagram ["Component View: Apache Kafka - Kafka Connect"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    subgraph 6 ["Apache Kafka"]
+      style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+      subgraph 37 ["Kafka Connect"]
+        style 37 fill:#ffffff,stroke:#444444,color:#444444
+
+
+        38["<div style='font-weight: bold'>ConnectDistributed (CLI)</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module connect-runtime, cli)]</div><div style='font-size: 80%; margin-top:10px'>Distributed Connect worker<br />entrypoint (main at line 110;<br />standalone entry<br />ConnectStandalone line 180).</div>"]
+        style 38 fill:#ffffff,stroke:#444444,color:#444444
+        39["<div style='font-weight: bold'>Worker</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module connect-runtime)]</div><div style='font-size: 80%; margin-top:10px'>Executes connector tasks:<br />source/sink task lifecycle,<br />converters, offset<br />management.</div>"]
+        style 39 fill:#ffffff,stroke:#444444,color:#444444
+        40["<div style='font-weight: bold'>DistributedHerder</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module connect-runtime, distributed)]</div><div style='font-size: 80%; margin-top:10px'>Cluster coordination of<br />connector/task assignment and<br />rebalancing (largest file<br />3126 lines).</div>"]
+        style 40 fill:#ffffff,stroke:#444444,color:#444444
+        41["<div style='font-weight: bold'>Connector SPI</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module connect-api)]</div><div style='font-size: 80%; margin-top:10px'>Plugin contract every<br />connector implements:<br />Connector/Task,<br />ConnectRecord, Schema/Struct<br />(entry Connector.java line<br />48).</div>"]
+        style 41 fill:#ffffff,stroke:#444444,color:#444444
+        42["<div style='font-weight: bold'>Single Message Transforms</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module connect-transforms)]</div><div style='font-size: 80%; margin-top:10px'>Standard SMT library: Cast,<br />TimestampConverter, Flatten,<br />InsertField, RegexRouter<br />(entry Cast.java line 57).</div>"]
+        style 42 fill:#ffffff,stroke:#444444,color:#444444
+        43["<div style='font-weight: bold'>JSON Converter</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module connect-json)]</div><div style='font-size: 80%; margin-top:10px'>Official JSON serde of<br />Connect data (entry<br />JsonConverter.java line 65,<br />largest 766 lines).</div>"]
+        style 43 fill:#ffffff,stroke:#444444,color:#444444
+        44["<div style='font-weight: bold'>MirrorMaker 2</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module connect-mirror)]</div><div style='font-size: 80%; margin-top:10px'>Cluster-to-cluster mirroring<br />on Connect:<br />MirrorSourceConnector,<br />checkpoint/heartbeat sync<br />(main MirrorMaker.java line<br />329).</div>"]
+        style 44 fill:#ffffff,stroke:#444444,color:#444444
+      end
+
+
+    end
+
+
+  end
+
+%% ================= VIEW 7: L3 Streams components =================
+
+graph TB
+  linkStyle default fill:#ffffff
+
+
+  subgraph diagram ["Component View: Apache Kafka - Kafka Streams"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    subgraph 6 ["Apache Kafka"]
+      style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+      subgraph 31 ["Kafka Streams"]
+        style 31 fill:#ffffff,stroke:#444444,color:#444444
+
+
+        32["<div style='font-weight: bold'>KafkaStreams</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module streams)]</div><div style='font-size: 80%; margin-top:10px'>Public application entry<br />(line 165): lifecycle, state<br />management, thread<br />orchestration.</div>"]
+        style 32 fill:#ffffff,stroke:#444444,color:#444444
+        33["<div style='font-weight: bold'>KStream / KTable DSL</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module streams, kstream)]</div><div style='font-size: 80%; margin-top:10px'>Declarative stream DSL:<br />KStream, KTable, windows,<br />joins (largest file KTable<br />2473 lines).</div>"]
+        style 33 fill:#ffffff,stroke:#444444,color:#444444
+        34["<div style='font-weight: bold'>StreamThread</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module streams, processor.internals)]</div><div style='font-size: 80%; margin-top:10px'>Runtime engine: partitions<br />stream tasks over input<br />topics, drives state stores<br />and standby replicas.</div>"]
+        style 34 fill:#ffffff,stroke:#444444,color:#444444
+        35["<div style='font-weight: bold'>Scala DSL wrapper</div><div style='font-size: 70%; margin-top: 0px'>[Component: Scala (module streams-scala)]</div><div style='font-size: 80%; margin-top:10px'>Scala-friendly<br />KStream/KTable/StreamsBuilder<br />API (entry<br />StreamsBuilder.scala line<br />34).</div>"]
+        style 35 fill:#ffffff,stroke:#444444,color:#444444
+        36["<div style='font-weight: bold'>TopologyTestDriver</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module streams-test-utils)]</div><div style='font-size: 80%; margin-top:10px'>Official test harness<br />executing topologies without<br />a broker (largest file 2103<br />lines).</div>"]
+        style 36 fill:#ffffff,stroke:#444444,color:#444444
+      end
+
+
+    end
+
+
+    32-. "<div>Runs and rebalances stream<br />tasks</div><div style='font-size: 70%'></div>" .->34
+
+
+  end
+
+%% ================= VIEW 8: L3 Tools components =================
+
+graph TB
+  linkStyle default fill:#ffffff
+
+
+  subgraph diagram ["Component View: Apache Kafka - CLI Tools"]
+    style diagram fill:#ffffff,stroke:#ffffff
+
+
+    subgraph 6 ["Apache Kafka"]
+      style 6 fill:#ffffff,stroke:#444444,color:#444444
+
+
+      subgraph 45 ["CLI Tools"]
+        style 45 fill:#ffffff,stroke:#444444,color:#444444
+
+
+        46["<div style='font-weight: bold'>TopicCommand</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module tools)]</div><div style='font-size: 80%; margin-top:10px'>Topic<br />create/alter/list/describe/delete<br />CLI (main at line 84).</div>"]
+        style 46 fill:#ffffff,stroke:#444444,color:#444444
+        47["<div style='font-weight: bold'>ConsoleProducer / ConsoleConsumer</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module tools, consumer)]</div><div style='font-size: 80%; margin-top:10px'>Interactive console producer<br />and consumer CLIs.</div>"]
+        style 47 fill:#ffffff,stroke:#444444,color:#444444
+        48["<div style='font-weight: bold'>ProducerPerformance</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module tools)]</div><div style='font-size: 80%; margin-top:10px'>Throughput benchmark CLI for<br />producers.</div>"]
+        style 48 fill:#ffffff,stroke:#444444,color:#444444
+        49["<div style='font-weight: bold'>ReassignPartitionsCommand</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module tools, reassign)]</div><div style='font-size: 80%; margin-top:10px'>Partition reassignment<br />planning and execution<br />(largest file 1590 lines).</div>"]
+        style 49 fill:#ffffff,stroke:#444444,color:#444444
+        50["<div style='font-weight: bold'>MetadataShell</div><div style='font-size: 70%; margin-top: 0px'>[Component: Java (module shell)]</div><div style='font-size: 80%; margin-top:10px'>Interactive KRaft metadata<br />shell: ls/get/log over the<br />metadata log (main at line<br />202).</div>"]
+        style 50 fill:#ffffff,stroke:#444444,color:#444444
+      end
+
+
+      25["<div style='font-weight: bold'>Clients Library (Java)</div><div style='font-size: 70%; margin-top: 0px'>[Container: Java (module clients, 387364 lines / 1879 files)]</div><div style='font-size: 80%; margin-top:10px'>Link-time client library<br />embedded in applications:<br />producer, consumer, admin<br />plus common protocol/network.</div>"]
+      style 25 fill:#ffffff,stroke:#444444,color:#444444
+    end
+
+
+    46-. "<div>Topic operations via the<br />admin API</div><div style='font-size: 70%'></div>" .->25
+
+
+  end

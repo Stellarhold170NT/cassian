@@ -1,99 +1,320 @@
-' workspace.dsl — C4 của apache/kafka dạng PlantUML C4 (3 mức: L1 context / L2 container / L3 component)
-' Nguồn: chuyển đổi từ 3 sơ đồ mermaid trong reports/gm-04-overview.md mục 3-5 (bản mermaid giữ nguyên trong diagrams.mmd cùng thư mục).
-' Nội dung DSL được viết TẠI node publish theo chỉ định của reports/gm-final.md mục 4 ("nội dung DSL chưa tồn tại, cần viết khi publish").
-' Render: PlantUML (server hoặc extension) — mỗi khối @startuml..@enduml là 1 sơ đồ; mô tả node giữ nguyên evidence file:line từ gm-04.
+workspace "Apache Kafka C4 Model" "C4 L1-L3 model of the apache/kafka tree at commit aa62a433553c14866521bd40ff446b6920d4d67e (the extracts pin of this subject). Every element and relationship carries a '// evidence:' comment anchored to a repository path that exists at the pin. Statistics quoted in element descriptions were measured on the upstream tree at commit 0c92b0664539d0dfb60b43ede0026497a581d8e0; no cited path changed between the two commits. ZooKeeper is intentionally absent: the trunk is KRaft-only (no ZooKeeper sources, no zookeeper dependency, configuration uses process.roles)." {
 
-@startuml L1_SystemContext
-!include <C4/C4_Context>
-title C4 L1 — System Context: Apache Kafka (gm-04 mục 3)
+    model {
 
-System_Boundary(apps, "Ứng dụng doanh nghiệp (JVM)") {
-  System(p, "Producer app", "KafkaProducer.send() — clients .../KafkaProducer.java:251")
-  System(c, "Consumer app", "KafkaConsumer.poll() — clients .../KafkaConsumer.java:987")
-  System(s, "Streams app", "KafkaStreams.start() — streams .../KafkaStreams.java:165")
+        // ============================================================
+        // L1 - SYSTEM CONTEXT (people + external systems + Kafka)
+        // ============================================================
+
+        // evidence: bin/kafka-topics.sh
+        operator = person "Kafka Administrator / Operator" "Human operator administering topics, configs and consumer groups through the bundled CLI tooling."
+
+        // evidence: examples/src/main/java/kafka/examples/Producer.java
+        producerApp = softwareSystem "Producer Application" "External application that publishes event records via the Java producer API."
+
+        // evidence: examples/src/main/java/kafka/examples/Consumer.java
+        consumerApp = softwareSystem "Consumer Application" "External application that subscribes to and consumes event records via the Java consumer API."
+
+        // evidence: streams/examples/src/main/java/org/apache/kafka/streams/examples/wordcount/WordCountDemo.java
+        streamsApp = softwareSystem "Streams Application" "External application building stateful stream-processing topologies on the Kafka Streams library."
+
+        // evidence: storage/api/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteStorageManager.java
+        objectStore = softwareSystem "Remote Object Store" "External object/blob storage used for tiered storage of log segments via the RemoteStorageManager SPI."
+
+        // evidence: settings.gradle
+        kafka = softwareSystem "Apache Kafka" "Distributed event-streaming platform; Gradle root project 'kafka' 4.5.0-SNAPSHOT, KRaft-only (no ZooKeeper)." {
+
+            // ============================================================
+            // L2 - CONTAINERS (deployable/runnable units of Apache Kafka)
+            // ============================================================
+
+            // evidence: core/src/main/scala/kafka/Kafka.scala
+            broker = container "Broker" "Core broker process: request handling, replication, log storage and coordinator runtimes; entrypoint kafka.Kafka (Scala main)." "Java/Scala (modules core, server, storage + storage/api, coordinator-common, group-coordinator (+group-coordinator-api), transaction-coordinator, share-coordinator, mirror-coordinator, server-common)" {
+
+                // evidence: core/src/main/scala/kafka/Kafka.scala
+                brokerEntry = component "kafka.Kafka" "Broker entrypoint; parses config, builds and starts the broker server (Scala main at line 73)." "Scala (module core)"
+
+                // evidence: server/src/main/java/org/apache/kafka/network/SocketServer.java
+                socketServer = component "SocketServer" "Network layer accepting client connections and request channels." "Java (module server, org.apache.kafka.network)"
+
+                // evidence: core/src/main/scala/kafka/server/KafkaApis.scala
+                kafkaApis = component "KafkaApis" "Request-handling facade implementing the Kafka protocol APIs; largest file of module core (4414 lines)." "Scala (module core)"
+
+                // evidence: core/src/main/scala/kafka/server/ReplicaManager.scala
+                replicaManager = component "ReplicaManager" "Partition replication, fetch and leader state management on the broker." "Scala (module core)"
+
+                // evidence: storage/src/main/java/org/apache/kafka/storage/internals/log/UnifiedLog.java
+                logStorage = component "UnifiedLog / LogManager" "Durable log storage engine: UnifiedLog, LogSegment, LogManager plus remote-log hooks." "Java (module storage, org.apache.kafka.storage.internals.log)"
+
+                // evidence: group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+                groupCoordinator = component "Group Coordinator (KIP-848)" "GroupCoordinatorService + GroupCoordinatorShard/GroupMetadataManager: consumer/classic/streams/share group state machines (largest file 10188 lines)." "Java (module group-coordinator)"
+
+                // evidence: transaction-coordinator/src/main/java/org/apache/kafka/coordinator/transaction/TransactionMetadata.java
+                txnCoordinator = component "Transaction Coordinator" "TransactionMetadata state machine + TransactionLog + producer-id allocation (RPCProducerIdManager)." "Java (module transaction-coordinator)"
+
+                // evidence: share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinatorService.java
+                shareCoordinator = component "Share Coordinator (KIP-932)" "ShareCoordinatorService/Shard managing share-group offsets on the CoordinatorRuntime." "Java (module share-coordinator)"
+
+                // evidence: coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java
+                coordinatorCommon = component "Coordinator Runtime (coordinator-common)" "Shared runtime for KRaft coordinators: CoordinatorRuntime per-partition state machine + event processor, CoordinatorLoader/RecordSerde and metrics; base of the group and share coordinators (module coordinator-common, 18618 lines at the measurement commit)." "Java (module coordinator-common, org.apache.kafka.coordinator.common.runtime)"
+
+                // evidence: core/src/main/scala/kafka/raft/KafkaRaftManager.scala
+                brokerRaftManager = component "RaftManager (broker-side)" "Broker-side KRaft client: joins the quorum, appends and replicates the metadata log." "Scala (module core, kafka.raft)"
+
+                // evidence: core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
+                metadataPublisher = component "BrokerMetadataPublisher" "Publishes metadata deltas from the KRaft metadata log into the broker in-memory metadata cache (395 lines)." "Scala (module core, kafka.server.metadata)"
+
+                // evidence: server-common/src/main/java/org/apache/kafka/server/common/MetadataVersion.java
+                serverCommon = component "Server-common infrastructure" "Shared server library: MetadataVersion/Feature, ApiMessageAndVersion + RecordSerde, KafkaEventQueue, purgatory, fault handler (widest fan-out module)." "Java (module server-common)"
+            }
+
+            // evidence: metadata/src/main/java/org/apache/kafka/controller/QuorumController.java
+            kraftController = container "KRaft Controller & Metadata" "KRaft metadata quorum replacing ZooKeeper: consensus client, active controller and metadata layer." "Java (modules raft, metadata)" {
+
+                // evidence: raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java
+                raftClient = component "KafkaRaftClient" "Self-contained KRaft consensus: leader election and log replication (largest file 4185 lines)." "Java (module raft)"
+
+                // evidence: metadata/src/main/java/org/apache/kafka/controller/QuorumController.java
+                quorumController = component "QuorumController" "Active/standby controller driving cluster metadata through the replicated log (entry, line 177)." "Java (module metadata)"
+
+                // evidence: metadata/src/main/java/org/apache/kafka/controller/ReplicationControlManager.java
+                replicationControl = component "ReplicationControlManager" "Topic/partition/ACL/quota control plane recorded into the metadata log (largest file 2604 lines)." "Java (module metadata)"
+
+                // evidence: metadata/src/main/java/org/apache/kafka/metadata/authorizer/StandardAuthorizer.java
+                standardAuthorizer = component "StandardAuthorizer" "ACL-based authorization persisted in the metadata layer." "Java (module metadata)"
+            }
+
+            // evidence: clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
+            clients = container "Clients Library (Java)" "Link-time client library embedded in applications: producer, consumer, admin plus common protocol/network." "Java (module clients, 387364 lines / 1879 files at the measurement commit)" {
+
+                // evidence: clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
+                kafkaProducer = component "KafkaProducer" "Producer API entry (line 251): batching, partitioning, transactions, delivery." "Java (module clients)"
+
+                // evidence: clients/src/main/java/org/apache/kafka/clients/consumer/KafkaConsumer.java
+                kafkaConsumer = component "KafkaConsumer" "Consumer API: subscribe/assign, poll loop, rebalance, fetch." "Java (module clients)"
+
+                // evidence: clients/src/main/java/org/apache/kafka/clients/admin/KafkaAdminClient.java
+                kafkaAdminClient = component "KafkaAdminClient" "Admin API: topic/config/ACL/quota management (largest file 5387 lines)." "Java (module clients)"
+
+                // evidence: clients/src/main/java/org/apache/kafka/clients/NetworkClient.java
+                networkClient = component "NetworkClient" "Protocol transport: connection pooling, in-flight requests, metadata updates." "Java (module clients)"
+
+                // evidence: clients/src/main/java/org/apache/kafka/common/protocol/ApiKeys.java
+                protocol = component "Kafka Wire Protocol (ApiKeys)" "Protocol API enumeration and serialization shared by all clients (ApiKeys entry, line 340)." "Java (module clients, org.apache.kafka.common.protocol)"
+            }
+
+            // evidence: streams/src/main/java/org/apache/kafka/streams/KafkaStreams.java
+            streamsLib = container "Kafka Streams" "Stream-processing client library: DSL, processor API, state stores and StreamThread runtime." "Java/Scala (modules streams, streams-scala, streams-test-utils; 338869 lines / 1273 files at the measurement commit)" {
+
+                // evidence: streams/src/main/java/org/apache/kafka/streams/KafkaStreams.java
+                streamsRuntime = component "KafkaStreams" "Public application entry (line 165): lifecycle, state management, thread orchestration." "Java (module streams)"
+
+                // evidence: streams/src/main/java/org/apache/kafka/streams/kstream/KTable.java
+                dsl = component "KStream / KTable DSL" "Declarative stream DSL: KStream, KTable, windows, joins (largest file KTable 2473 lines)." "Java (module streams, kstream)"
+
+                // evidence: streams/src/main/java/org/apache/kafka/streams/processor/internals/StreamThread.java
+                streamThread = component "StreamThread" "Runtime engine: partitions stream tasks over input topics, drives state stores and standby replicas." "Java (module streams, processor.internals)"
+
+                // evidence: streams/streams-scala/src/main/scala/org/apache/kafka/streams/scala/StreamsBuilder.scala
+                scalaDsl = component "Scala DSL wrapper" "Scala-friendly KStream/KTable/StreamsBuilder API (entry StreamsBuilder.scala line 34)." "Scala (module streams-scala)"
+
+                // evidence: streams/test-utils/src/main/java/org/apache/kafka/streams/TopologyTestDriver.java
+                topologyTestDriver = component "TopologyTestDriver" "Official test harness executing topologies without a broker (largest file 2103 lines)." "Java (module streams-test-utils)"
+            }
+
+            // evidence: connect/runtime/src/main/java/org/apache/kafka/connect/cli/ConnectDistributed.java
+            connect = container "Kafka Connect" "Connector runtime integrating external systems: CLI entry, worker, herder, SPI, transforms, converters, MirrorMaker 2." "Java (modules connect-runtime, connect-api, connect-transforms, connect-json, connect-mirror (+mirror-client), connect-file, connect-basic-auth-extension, ...)" {
+
+                // evidence: connect/runtime/src/main/java/org/apache/kafka/connect/cli/ConnectDistributed.java
+                connectCli = component "ConnectDistributed (CLI)" "Distributed Connect worker entrypoint (main at line 110; standalone entry ConnectStandalone line 180)." "Java (module connect-runtime, cli)"
+
+                // evidence: connect/runtime/src/main/java/org/apache/kafka/connect/runtime/Worker.java
+                connectWorker = component "Worker" "Executes connector tasks: source/sink task lifecycle, converters, offset management." "Java (module connect-runtime)"
+
+                // evidence: connect/runtime/src/main/java/org/apache/kafka/connect/runtime/distributed/DistributedHerder.java
+                distributedHerder = component "DistributedHerder" "Cluster coordination of connector/task assignment and rebalancing (largest file 3126 lines)." "Java (module connect-runtime, distributed)"
+
+                // evidence: connect/api/src/main/java/org/apache/kafka/connect/connector/Connector.java
+                connectorSpi = component "Connector SPI" "Plugin contract every connector implements: Connector/Task, ConnectRecord, Schema/Struct (entry Connector.java line 48)." "Java (module connect-api)"
+
+                // evidence: connect/transforms/src/main/java/org/apache/kafka/connect/transforms/Cast.java
+                smt = component "Single Message Transforms" "Standard SMT library: Cast, TimestampConverter, Flatten, InsertField, RegexRouter (entry Cast.java line 57)." "Java (module connect-transforms)"
+
+                // evidence: connect/json/src/main/java/org/apache/kafka/connect/json/JsonConverter.java
+                jsonConverter = component "JSON Converter" "Official JSON serde of Connect data (entry JsonConverter.java line 65, largest 766 lines)." "Java (module connect-json)"
+
+                // evidence: connect/mirror/src/main/java/org/apache/kafka/connect/mirror/MirrorMaker.java
+                mirrorMaker2 = component "MirrorMaker 2" "Cluster-to-cluster mirroring on Connect: MirrorSourceConnector, checkpoint/heartbeat sync (main MirrorMaker.java line 329)." "Java (module connect-mirror)"
+            }
+
+            // evidence: tools/src/main/java/org/apache/kafka/tools/TopicCommand.java
+            tools = container "CLI Tools" "Official command-line tooling shipped with the distribution." "Java (modules tools, tools-api, shell)" {
+
+                // evidence: tools/src/main/java/org/apache/kafka/tools/TopicCommand.java
+                topicCommand = component "TopicCommand" "Topic create/alter/list/describe/delete CLI (main at line 84)." "Java (module tools)"
+
+                // evidence: tools/src/main/java/org/apache/kafka/tools/consumer/ConsoleConsumer.java
+                console = component "ConsoleProducer / ConsoleConsumer" "Interactive console producer and consumer CLIs." "Java (module tools, consumer)"
+
+                // evidence: tools/src/main/java/org/apache/kafka/tools/ProducerPerformance.java
+                producerPerf = component "ProducerPerformance" "Throughput benchmark CLI for producers." "Java (module tools)"
+
+                // evidence: tools/src/main/java/org/apache/kafka/tools/reassign/ReassignPartitionsCommand.java
+                reassign = component "ReassignPartitionsCommand" "Partition reassignment planning and execution (largest file 1590 lines)." "Java (module tools, reassign)"
+
+                // evidence: shell/src/main/java/org/apache/kafka/shell/MetadataShell.java
+                metadataShell = component "MetadataShell" "Interactive KRaft metadata shell: ls/get/log over the metadata log (main at line 202)." "Java (module shell)"
+            }
+        }
+
+        // ============================================================
+        // L1 - SYSTEM CONTEXT RELATIONSHIPS
+        // ============================================================
+
+        // evidence: examples/src/main/java/kafka/examples/Producer.java
+        producerApp -> kafka "Publishes event records"
+
+        // evidence: examples/src/main/java/kafka/examples/Consumer.java
+        consumerApp -> kafka "Subscribes to and consumes event records"
+
+        // evidence: streams/examples/src/main/java/org/apache/kafka/streams/examples/wordcount/WordCountDemo.java
+        streamsApp -> kafka "Reads input topics, writes results and state changelog topics"
+
+        // evidence: bin/kafka-topics.sh
+        operator -> kafka "Administers topics, configs and consumer groups via CLI tooling"
+
+        // evidence: storage/api/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteStorageManager.java
+        kafka -> objectStore "Offloads and fetches tiered log segments (RemoteStorageManager SPI)"
+
+        // ============================================================
+        // L2 - CONTAINER RELATIONSHIPS
+        // ============================================================
+
+        // evidence: examples/src/main/java/kafka/examples/Producer.java
+        producerApp -> clients "Links the client library and publishes via KafkaProducer"
+
+        // evidence: examples/src/main/java/kafka/examples/Consumer.java
+        consumerApp -> clients "Links the client library and consumes via KafkaConsumer"
+
+        // evidence: streams/examples/src/main/java/org/apache/kafka/streams/examples/wordcount/WordCountDemo.java
+        streamsApp -> streamsLib "Builds and runs stream topologies"
+
+        // evidence: bin/kafka-topics.sh
+        operator -> tools "Invokes admin/maintenance commands"
+
+        // evidence: clients/src/main/java/org/apache/kafka/common/protocol/ApiKeys.java
+        clients -> broker "Kafka wire protocol: produce, fetch, metadata, join/sync, offset commit"
+
+        // evidence: streams/src/main/java/org/apache/kafka/streams/KafkaClientSupplier.java
+        streamsLib -> clients "Built on producer/consumer/admin client APIs"
+
+        // evidence: streams/src/main/java/org/apache/kafka/streams/processor/internals/InternalTopicManager.java
+        streamsLib -> broker "Record I/O plus internal state store and changelog topic management"
+
+        // evidence: connect/runtime/src/main/java/org/apache/kafka/connect/util/KafkaBasedLog.java
+        connect -> clients "Embeds producer/consumer/admin for record and internal-topic I/O"
+
+        // evidence: connect/runtime/src/main/java/org/apache/kafka/connect/storage/KafkaOffsetBackingStore.java
+        connect -> broker "Connector record flow plus config/offset/status internal topics"
+
+        // evidence: tools/src/main/java/org/apache/kafka/tools/TopicCommand.java
+        tools -> clients "Admin, consumer and producer APIs under every command"
+
+        // evidence: core/src/main/scala/kafka/raft/KafkaRaftManager.scala
+        broker -> kraftController "KRaft quorum membership; appends and replicates the metadata log"
+
+        // evidence: core/src/main/scala/kafka/server/metadata/BrokerMetadataPublisher.scala
+        kraftController -> broker "Publishes metadata deltas into the broker metadata cache"
+
+        // evidence: storage/api/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteStorageManager.java
+        broker -> objectStore "Copies and fetches remote log segments (tiered storage)"
+
+        // ============================================================
+        // L3 - COMPONENT RELATIONSHIPS (path-verified at the pin)
+        // ============================================================
+
+        // evidence: core/src/main/scala/kafka/server/KafkaApis.scala
+        kafkaApis -> replicaManager "Delegates produce/fetch/metadata handling"
+
+        // evidence: core/src/main/scala/kafka/server/KafkaApis.scala
+        kafkaApis -> groupCoordinator "Serves consumer-group APIs"
+
+        // evidence: core/src/main/scala/kafka/server/KafkaApis.scala
+        kafkaApis -> txnCoordinator "Serves transactional APIs (initProducerId and friends, line 1699)"
+
+        // evidence: core/src/main/scala/kafka/server/KafkaApis.scala
+        kafkaApis -> shareCoordinator "Serves share-group APIs"
+
+        // evidence: group-coordinator/src/main/java/org/apache/kafka/coordinator/group/GroupCoordinatorService.java
+        groupCoordinator -> coordinatorCommon "Runs group state machines on the shared CoordinatorRuntime"
+
+        // evidence: share-coordinator/src/main/java/org/apache/kafka/coordinator/share/ShareCoordinatorService.java
+        shareCoordinator -> coordinatorCommon "Runs share-group state machines on the shared CoordinatorRuntime"
+
+        // evidence: core/src/main/scala/kafka/server/ReplicaManager.scala
+        replicaManager -> logStorage "Reads and writes log segments through the log manager"
+
+        // evidence: clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
+        kafkaProducer -> networkClient "Sends produce requests over the network"
+
+        // evidence: tools/src/main/java/org/apache/kafka/tools/TopicCommand.java
+        topicCommand -> kafkaAdminClient "Topic operations via the admin API"
+
+        // evidence: streams/src/main/java/org/apache/kafka/streams/KafkaStreams.java
+        streamsRuntime -> streamThread "Runs and rebalances stream tasks"
+
+        // evidence: metadata/src/main/java/org/apache/kafka/controller/QuorumController.java
+        quorumController -> raftClient "Replicates the metadata log through the raft client"
+    }
+
+    views {
+
+        // evidence: settings.gradle
+        systemContext kafka "Kafka-01-SystemContext" "L1 - System context: actors and external systems around Apache Kafka" {
+            include *
+            autolayout lr
+        }
+
+        // evidence: settings.gradle
+        container kafka "Kafka-02-Containers" "L2 - Containers: deployable units inside Apache Kafka" {
+            include *
+            autolayout tb
+        }
+
+        // evidence: core/src/main/scala/kafka/Kafka.scala
+        component broker "Kafka-03-Broker" "L3 - Components of the Broker container" {
+            include *
+            autolayout tb
+        }
+
+        // evidence: metadata/src/main/java/org/apache/kafka/controller/QuorumController.java
+        component kraftController "Kafka-03-KRaft" "L3 - Components of the KRaft Controller & Metadata container" {
+            include *
+            autolayout tb
+        }
+
+        // evidence: clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java
+        component clients "Kafka-03-Clients" "L3 - Components of the Clients Library container" {
+            include *
+            autolayout tb
+        }
+
+        // evidence: connect/runtime/src/main/java/org/apache/kafka/connect/cli/ConnectDistributed.java
+        component connect "Kafka-03-Connect" "L3 - Components of the Kafka Connect container" {
+            include *
+            autolayout tb
+        }
+
+        // evidence: streams/src/main/java/org/apache/kafka/streams/KafkaStreams.java
+        component streamsLib "Kafka-03-Streams" "L3 - Components of the Kafka Streams container" {
+            include *
+            autolayout tb
+        }
+
+        // evidence: tools/src/main/java/org/apache/kafka/tools/TopicCommand.java
+        component tools "Kafka-03-Tools" "L3 - Components of the CLI Tools container" {
+            include *
+            autolayout tb
+        }
+    }
 }
-
-Person(ops, "Ops/Admin (con người)", "bin/kafka-topics.sh, kafka-consumer-groups.sh — tools TopicCommand.java:84")
-System_Ext(ext, "Hệ thống ngoài", "DB, file, cụm Kafka khác — connect/runtime ConnectDistributed.java:110, connect/mirror MirrorMaker.java:329")
-System(kafka, "HỆ THỐNG APACHE KAFKA", "cluster broker+controller KRaft — wire protocol nhị phân ApiKeys.java:48-49")
-
-Rel(p, kafka, "produce (PRODUCE)")
-Rel(kafka, c, "consume (FETCH)")
-Rel(s, kafka, "kèm internal topics")
-Rel(ops, kafka, "AdminClient / RPC quản trị")
-BiRel(ext, kafka, "Sink/Source connector, replication")
-@enduml
-
-@startuml L2_Containers
-!include <C4/C4_Container>
-title C4 L2 — Containers (gm-04 mục 4)
-
-System_Boundary(dist, "Kafka distribution (build từ monorepo)") {
-  Container_Boundary(jvmBroker, "JVM Broker (kafka.Kafka) — bin/kafka-server-start.sh:44 → core/.../kafka/Kafka.scala:73") {
-    Component(net, "Network layer", "Scala", "SocketServer (1695 dòng) — core/.../network/SocketServer.scala:71")
-    Component(apis, "KafkaApis — bộ dispatch RPC", "Scala", "core/.../server/KafkaApis.scala:95 (4414 dòng)")
-    Component(re, "ReplicaManager — replica/append/fetch", "Scala", "core/.../ReplicaManager.scala:154 (2577)")
-    Component(gc, "GroupCoordinatorService (KIP-848)", "Java", "group-coordinator .../GroupCoordinatorService.java:166")
-    Component(tc, "Transaction coordinator data", "Java", "transaction-coordinator .../TransactionMetadata.java:37")
-    Component(sc, "ShareCoordinatorService (KIP-932)", "Java", "share-coordinator .../ShareCoordinatorService.java:85")
-    Component(cm, "ClientMetricsManager — telemetry", "Java", "server/.../ClientMetricsManager.java:82")
-  }
-  Container_Boundary(jvmCtl, "JVM Controller (KRaft) — có thể chung JVM broker ở combined mode (config/server.properties:19 process.roles=broker,controller)") {
-    Component(qc, "QuorumController", "Java", "metadata/.../QuorumController.java:177 (2245)")
-    Component(raft, "KafkaRaftClient", "Java", "raft/.../KafkaRaftClient.java:170 (4185)")
-  }
-  Container_Boundary(libs, "Thư viện client (nhúng vào app JVM)") {
-    Component(cl, "clients.jar", "Java", "producer/consumer/admin")
-    Component(st, "streams.jar", "Java", "Kafka Streams client")
-    Component(cr, "connect-runtime.jar", "Java", "Kafka Connect runtime")
-  }
-  ContainerDb(disk, "Đĩa: log segments", "Log-structured commit log", "storage UnifiedLog.java:105 + LogManager.java:81 + metadata log KRaft")
-  Container(clip, "CLI tools JVM", "JVM", "tools/, shell/, bin/*.sh")
-}
-
-Rel(net, apis, "dispatch")
-Rel(apis, re, "append/fetch")
-Rel(re, disk, "log segments")
-Rel(apis, gc, "consumer groups")
-Rel(apis, tc, "transactions")
-Rel(apis, sc, "share groups")
-Rel(apis, cm, "client metrics")
-Rel(qc, raft, "metadata log")
-Rel(raft, disk, "metadata log append")
-Rel(jvmBroker, jvmCtl, "metadata quorum")
-Rel(cl, net, "RPC")
-Rel(st, cl, "dùng chung clients")
-Rel(cr, cl, "dùng chung clients")
-Rel(clip, cl, "dùng chung clients")
-@enduml
-
-@startuml L3_Components
-!include <C4/C4_Component>
-title C4 L3 — Components bên trong broker/controller (gm-04 mục 5)
-
-Container_Boundary(brokerInternal, "Inside: Broker JVM (core + server + storage)") {
-  Component(a, "SocketServer (Scala)", "Scala", "Acceptor/Processor đọc network — core/.../network/SocketServer.scala:71")
-  Component(b, "RequestChannel", "Scala", "core/.../network/RequestChannel.scala (201)")
-  Component(c2, "KafkaRequestHandler pool", "Scala", "core/.../KafkaRequestHandler.scala:91, gọi apis.handle — Dòng 167")
-  Component(d, "KafkaApis — switch theo ApiKeys", "Scala", "Dòng 175: case ApiKeys.PRODUCE → handleProduceRequest (Dòng 401)")
-  Component(e, "ReplicaManager", "Scala", "core/.../ReplicaManager.scala:154")
-  Component(f, "UnifiedLog/LogManager", "Java", "storage/.../UnifiedLog.java:105, LogManager.java:81")
-}
-Container_Boundary(coordRuntime, "Inside: coordinator runtime (dùng chung)") {
-  Component(g, "CoordinatorRuntime (generic S,U)", "Java", "state-machine per-partition — coordinator-common .../CoordinatorRuntime.java:100")
-  Component(h, "GroupCoordinatorShard/GroupMetadataManager", "Java", "group-coordinator .../GroupMetadataManager.java (10188 — gm-02 m04)")
-}
-Container_Boundary(kraftInternal, "Inside: Controller JVM (metadata + raft)") {
-  Component(i, "QuorumController", "Java", "event/claim per record — metadata/.../QuorumController.java:177")
-  Component(j, "KafkaRaftClient", "Java", "leader election + log replication — raft/.../KafkaRaftClient.java:170")
-}
-
-Rel(a, b, "queue request")
-Rel(b, c2, "handoff")
-Rel(c2, d, "apis.handle")
-Rel(d, e, "PRODUCE/FETCH")
-Rel(e, f, "append/read")
-Rel(d, g, "consumer groups / share / txn")
-Rel(g, h, "shard write")
-Rel(i, j, "metadata records")
-@enduml

@@ -1,85 +1,140 @@
-# gm-04 — OVERVIEW: apache/kafka (STREAM B)
-
-Task: `goldmine-spec--b-overview--ef360255` | Lần chạy: **1** (chưa có `reports/gm-04-overview.md` trước đó → không kế thừa, không ghi INHERITED).
-INPUT: gm-01 (`reports/gm-01-cartography.md`) + gm-02 (`reports/gm-02-module-map.md`). KHÔNG đọc gm-03 (gate-consistency đối chiếu chéo — trùng lệch là lỗi của node này).
-Môi trường: sandbox riêng `bitnami/git:latest`, ttl 3600 (session `sess-ce490557`); clone nông depth 100, mọi claim đo lại trực tiếp trên clone này (HEAD `3655d7c…`, thấy Provenance — mục 11).
-
-> **Drift sha so cert gm-01:** cert gm-01 RUN 4 đo tại `aa62a433…`; clone của node này ở trunk mới `3655d7c19cd9771ef4b1d213084cfd08f45c7581` (trunk di chuyển giữa 2 node). Số liệu gm-02 đã được re-verify tại chính HEAD `3655d7c` (w2/w3/w4) nên các evidence file:line trong bản này khớp cert; riêng LOC java chênh **+1 dòng** (chi tiết mục 11).
-
+---
+subject: apache/kafka
+measured_at: aa62a433553c14866521bd40ff446b6920d4d67e
+status: final
 ---
 
-## 1. Kafka là gì — 5 câu
+# Overview
 
-1. Apache Kafka là "an open-source distributed event streaming platform used by thousands of companies for high-performance data pipelines, streaming analytics, data integration, and mission-critical applications" (File: README.md | Dòng: 12) — nền tảng streaming phân tán, phía server là cụm broker lưu event theo log-structured commit log, phía client là thư viện produce/consume qua wire protocol nhị phân (ApiKeys PRODUCE/FETCH — File: clients/src/main/java/org/apache/kafka/common/protocol/ApiKeys.java | Dòng: 48-49).
-2. Repo này là **monorepo Gradle 65 module** (File: settings.gradle | khối `include` đếm 65 quote-pair; `rootProject.name = 'kafka'` Dòng: 143) viết **Java + Scala 2.13** (File: AGENTS.md | Dòng: 26, 30) — broker runtime còn giữ phần lõi Scala (`core`, entrypoint `def main` — File: core/src/main/scala/kafka/Kafka.scala | Dòng: 73) trong khi phần server mới đã Java hóa tách sang `server/`, `server-common/`.
-3. Từ 4.x, Kafka **chỉ chạy KRaft** (không còn ZooKeeper): không còn `config/zookeeper.properties` lẫn `bin/zookeeper-server-start.sh` trong cây (kiểm `ls` → không tồn tại, sandbox `sess-ce490557`); vai trò node khai qua `process.roles=broker,controller` (File: config/server.properties | Dòng: 19).
-4. Consensus + metadata do `raft/` (KafkaRaftClient — File: raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java | Dòng: 170) và `metadata/` (QuorumController — File: metadata/src/main/java/org/apache/kafka/controller/QuorumController.java | Dòng: 177) đảm nhiệm; dữ liệu event nằm ở tầng log `storage/` (UnifiedLog — File: storage/src/main/java/org/apache/kafka/storage/internals/log/UnifiedLog.java | Dòng: 105).
-5. Hệ sinh thái tích hợp nằm cùng repo: clients (producer/consumer/admin), Kafka Streams, Kafka Connect (runtime + SPI + MirrorMaker 2), CLI tools — dùng chung một đồ thị phụ thuộc mà `clients` là lá gốc (deps_out 23 module — File: reports/gm-02-module-map.md | Dòng: 56).
+How apache/kafka works, as a narrative companion to the module map
+([`02-module-map.md`](02-module-map.md)). Architecture views (C4) live in this
+document only; [`03-c4/`](03-c4/) holds their raw source files
+(`workspace.dsl` — Structurizr — and `diagrams.mmd` — mermaid).
 
-## 2. Nắm trong 5 phút — 10 bullet
+## 1. What Kafka is
 
-- **Đọc gì trước:** `README.md` (định nghĩa, Dòng 12) → `AGENTS.md` (bản đồ repo + lệnh build/test cho agent, Dòng 34-53, 56-115) → `docs/getting-started/quickstart.md` (chạy cụm trong 5 lệnh).
-- **Chạy broker tức thì (KRaft combined):** `bin/kafka-storage.sh format --standalone -t $KAFKA_CLUSTER_ID -c config/server.properties` rồi `bin/kafka-server-start.sh config/server.properties` (File: docs/getting-started/quickstart.md | Dòng: 55; File: bin/kafka-server-start.sh | Dòng: 44 — `exec kafka.Kafka`).
-- **Client API 3 lớp:** `KafkaProducer.send()` (File: clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java | Dòng: 1027), `KafkaConsumer.poll()` (File: clients/src/main/java/org/apache/kafka/clients/consumer/KafkaConsumer.java | Dòng: 987), và AdminClient (module `clients`, 387.329 LOC — checklist m01).
-- **Broker = 2 nửa:** nửa Scala cũ `core/` (KafkaApis, ReplicaManager — 160.242 LOC, m03) và nửa Java mới `server/`+`server-common/` (network/config/metrics/share — 53.707 + 35.932 LOC, m10/m12); AGENTS.md nói thẳng core Scala "gradually being removed" (File: AGENTS.md | Dòng: 39).
-- **KRaft:** controller (QuorumController) + consensus (KafkaRaftClient) quản metadata log; broker đọc metadata qua metadata cache/image (m07 — 62.545 LOC).
-- **Log storage:** `storage/` UnifiedLog/LogSegment/LogManager (73.952 LOC, m06) + SPI tiered storage `storage/api/` (RemoteStorageManager — m29).
-- **Coordinator mới tách module:** group (KIP-848), share (KIP-932), transaction — cùng chạy trên `CoordinatorRuntime` của `coordinator-common/` (File: coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java | Dòng: 100).
-- **Tích hợp ngoài:** Kafka Connect (`connect/` — runtime 104.931 LOC m05), Kafka Streams (`streams/` — 338.869 LOC m02), MirrorMaker 2 (`connect/mirror` — MirrorMaker main Dòng 329).
-- **CLI:** `tools/` + `bin/*.sh` (TopicCommand main Dòng 84; 40+ script — `ls bin/*.sh`), metadata shell `shell/`.
-- **Test 3 tầng:** unit/integration Gradle (`./gradlew test`), test-cluster harness `test-common/` (KafkaClusterTestKit — m25), system tests Python/ducktape (`tests/` — File: tests/README.md | Dòng: 5).
+1. Apache Kafka is an open-source distributed event-streaming platform used for
+   high-performance data pipelines, streaming analytics, data integration, and
+   mission-critical applications. The server side is a cluster of brokers that
+   store events in log-structured commit logs; the client side produces and
+   consumes through a binary wire protocol (`ApiKeys` PRODUCE/FETCH —
+   `clients/src/main/java/org/apache/kafka/common/protocol/ApiKeys.java`,
+   lines 48-49).
+2. The repository is a **65-module Gradle monorepo** (plus the `api-checker`
+   composite build) written in **Java + Scala 2.13**. The broker runtime keeps
+   its Scala core (`core/`, entry `def main` —
+   `core/src/main/scala/kafka/Kafka.scala`, line 73) while newer server code
+   has moved to Java in `server/` and `server-common/`.
+3. Since 4.x, Kafka runs **KRaft only** (no ZooKeeper): neither
+   `config/zookeeper.properties` nor `bin/zookeeper-server-start.sh` exists in
+   the tree; node roles are declared via `process.roles=broker,controller`
+   (`config/server.properties`, line 19).
+4. Consensus and metadata are handled by `raft/` (`KafkaRaftClient` —
+   `raft/src/main/java/org/apache/kafka/raft/KafkaRaftClient.java`, line 170)
+   and `metadata/` (`QuorumController` —
+   `metadata/src/main/java/org/apache/kafka/controller/QuorumController.java`,
+   line 177); event data lives in the log layer of `storage/` (`UnifiedLog` —
+   `storage/src/main/java/org/apache/kafka/storage/internals/log/UnifiedLog.java`,
+   line 105).
+5. The integration ecosystem lives in the same repo: clients
+   (producer/consumer/admin), Kafka Streams, Kafka Connect (runtime + SPI +
+   MirrorMaker 2), and CLI tools — all sharing one dependency graph whose root
+   leaf is `clients` (imported by 23 other modules).
 
-## 3. C4 L1 — System Context
+## 2. Five-minute tour
 
-Kafka nhìn từ ngoài là **một cụm cluster streaming** nhận/gửi event cho nhiều loại actor. Sơ đồ ngữ cảnh (tự tóm tắt từ code + gm-02):
+- **Read first:** the upstream `README.md`, then
+  `docs/getting-started/quickstart.md` (a running cluster in three commands).
+- **Run a broker instantly (KRaft combined mode):**
+  `bin/kafka-storage.sh random-uuid`, then
+  `bin/kafka-storage.sh format --standalone -t $KAFKA_CLUSTER_ID -c config/server.properties`,
+  then `bin/kafka-server-start.sh config/server.properties` (which execs
+  `kafka.Kafka` — `bin/kafka-server-start.sh`, line 44).
+- **Three client API layers:** `KafkaProducer.send()`
+  (`clients/.../producer/KafkaProducer.java`, line 1027), `KafkaConsumer.poll()`
+  (`clients/.../consumer/KafkaConsumer.java`, line 987), and the admin client —
+  all in module `clients` (387,364 lines, the largest module).
+- **The broker is two halves:** the older Scala half in `core/` (KafkaApis,
+  ReplicaManager — 160,338 lines) and the newer Java half in `server/` +
+  `server-common/` (network/config/metrics/share — 53,773 + 35,932 lines). The
+  upstream build guide says the Scala core is "gradually being removed along
+  with Scala code".
+- **KRaft:** the controller (`QuorumController`) + consensus
+  (`KafkaRaftClient`) own the metadata log; brokers consume metadata through
+  the metadata cache/image (module `metadata` — 62,545 lines).
+- **Log storage:** `storage/` (UnifiedLog/LogSegment/LogManager — 73,952
+  lines) plus the tiered-storage SPI `storage/api/` (`RemoteStorageManager`).
+- **Coordinators are now modules:** group (KIP-848), share (KIP-932), and
+  transaction coordinators all run on the shared `CoordinatorRuntime` of
+  `coordinator-common/`
+  (`coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java`,
+  line 100).
+- **Integration:** Kafka Connect (`connect/` — runtime 104,931 lines), Kafka
+  Streams (`streams/` — 338,869 lines), MirrorMaker 2
+  (`connect/mirror` — main at `MirrorMaker.java`, line 329).
+- **CLI:** `tools/` + `bin/*.sh` (`TopicCommand` main at line 84; 40+ launcher
+  scripts), metadata shell in `shell/`.
+- **Testing at three levels:** Gradle unit/integration suites, the real-broker
+  cluster harness `test-common/` (`KafkaClusterTestKit`), and Python/ducktape
+  system tests (`tests/`).
+
+## 3. C4 — System context (L1)
+
+From the outside, Kafka is one streaming cluster exchanging events with
+several kinds of actors (see [`03-c4/`](03-c4/) for the model source):
 
 ```mermaid
 flowchart LR
-    subgraph apps["Ứng dụng doanh nghiệp (JVM)"]
+    subgraph apps["Enterprise applications (JVM)"]
         P["Producer app<br/>KafkaProducer.send()<br/>clients .../KafkaProducer.java:251"]
         C["Consumer app<br/>KafkaConsumer.poll()<br/>clients .../KafkaConsumer.java:987"]
         S["Streams app<br/>KafkaStreams.start()<br/>streams .../KafkaStreams.java:165"]
     end
-    OPS["Ops/Admin (con người)<br/>bin/kafka-topics.sh, kafka-consumer-groups.sh<br/>tools TopicCommand.java:84"]
-    EXT["Hệ thống ngoài<br/>(DB, file, cụm Kafka khác)<br/>connect/runtime ConnectDistributed.java:110<br/>connect/mirror MirrorMaker.java:329"]
-    KAFKA(["HỆ THỐNG APACHE KAFKA<br/>cluster broker+controller KRaft<br/>wire protocol nhị phân ApiKeys.java:48-49"])
+    OPS["Ops / Admin (human)<br/>bin/kafka-topics.sh, kafka-consumer-groups.sh<br/>tools TopicCommand.java:84"]
+    EXT["External systems<br/>(databases, files, other Kafka clusters)<br/>connect/runtime ConnectDistributed.java:110<br/>connect/mirror MirrorMaker.java:329"]
+    KAFKA(["APACHE KAFKA<br/>broker + KRaft controller cluster<br/>binary wire protocol ApiKeys.java:48-49"])
 
     P -->|"produce (PRODUCE)"| KAFKA
     KAFKA -->|"consume (FETCH)"| C
-    S -->|"kèm internal topics"| KAFKA
-    OPS -->|"AdminClient / RPC quản trị"| KAFKA
-    EXT <-->|"Sink/Source connector, replication"| KAFKA
+    S -->|"plus internal topics"| KAFKA
+    OPS -->|"AdminClient / admin RPC"| KAFKA
+    EXT <-->|"sink/source connectors, replication"| KAFKA
 ```
 
-- Actor client chỉ chạm hệ thống qua **wire protocol** được mô tả tập trung trong `ApiKeys` (File: clients/src/main/java/org/apache/kafka/common/protocol/ApiKeys.java | Dòng: 48-49 PRODUCE/FETCH; Dòng: 126 SHARE_FETCH — API mới cho share groups KIP-932).
-- Admin/ops đi qua cùng đường RPC nhưng bằng API group ADMIN (tools là tầng mỏng trên clients/admin — gm-02 m08).
-- Connect và MirrorMaker đứng ở biên hệ thống: biến Kafka thành hệ tích hợp dữ liệu (runtimeConnectDistributed — File: connect/runtime/src/main/java/org/apache/kafka/connect/cli/ConnectDistributed.java | Dòng: 110; MirrorMaker — File: connect/mirror/src/main/java/org/apache/kafka/connect/mirror/MirrorMaker.java | Dòng: 329).
+- Clients touch the system only through the wire protocol, described centrally
+  by `ApiKeys` (PRODUCE/FETCH at lines 48-49; SHARE_FETCH at line 126 — the
+  KIP-932 share-group API).
+- Ops/admin traffic rides the same RPC path with the ADMIN api key; the CLI
+  tools are a thin layer over the clients' admin API.
+- Connect and MirrorMaker sit at the system boundary: they turn Kafka into a
+  data-integration system (`ConnectDistributed.java` line 110; `MirrorMaker.java`
+  line 329).
 
-## 4. C4 L2 — Containers
+## 4. C4 — Containers (L2)
 
-Trong biên hệ thống Kafka (một distribution build từ monorepo), các container thực thi:
+Inside the system boundary, the deployable units:
 
 ```mermaid
 flowchart TB
-    subgraph jvmBroker["JVM Broker (kafka.Kafka) — File: bin/kafka-server-start.sh:44 → core/.../kafka/Kafka.scala:73"]
-        NET["Network layer<br/>SocketServer (Scala, 1695 dòng)<br/>core/.../network/SocketServer.scala:71"]
-        APIS["KafkaApis — bộ dispatch RPC<br/>core/.../server/KafkaApis.scala:95 (4414 dòng)"]
-        RE["ReplicaManager — replica/append/fetch<br/>core/.../ReplicaManager.scala:154 (2577)"]
+    subgraph jvmBroker["JVM Broker (kafka.Kafka) — bin/kafka-server-start.sh:44 → core/.../kafka/Kafka.scala:73"]
+        NET["Network layer<br/>SocketServer (Scala, 1695 lines)<br/>core/.../network/SocketServer.scala:71"]
+        APIS["KafkaApis — RPC dispatch<br/>core/.../server/KafkaApis.scala:95 (4414 lines)"]
+        RE["ReplicaManager — replication/append/fetch<br/>core/.../ReplicaManager.scala:154 (2577 lines)"]
         GC["GroupCoordinatorService (KIP-848)<br/>group-coordinator .../GroupCoordinatorService.java:166"]
         TC["Transaction coordinator data<br/>transaction-coordinator .../TransactionMetadata.java:37"]
         SC["ShareCoordinatorService (KIP-932)<br/>share-coordinator .../ShareCoordinatorService.java:85"]
         CM["ClientMetricsManager — telemetry<br/>server/.../ClientMetricsManager.java:82"]
     end
-    subgraph jvmCtl["JVM Controller (KRaft) — có thể chung JVM broker ở combined mode (config/server.properties:19 process.roles=broker,controller)"]
-        QC["QuorumController<br/>metadata/.../QuorumController.java:177 (2245)"]
-        RAFT["KafkaRaftClient<br/>raft/.../KafkaRaftClient.java:170 (4185)"]
+    subgraph jvmCtl["JVM Controller (KRaft) — may share the broker JVM in combined mode (config/server.properties:19 process.roles=broker,controller)"]
+        QC["QuorumController<br/>metadata/.../QuorumController.java:177 (2245 lines)"]
+        RAFT["KafkaRaftClient<br/>raft/.../KafkaRaftClient.java:170 (4185 lines)"]
     end
-    subgraph libs["Thư viện client (nhúng vào app JVM)"]
+    subgraph libs["Client libraries (embedded in app JVMs)"]
         CL["clients.jar — producer/consumer/admin"]
         ST["streams.jar"]
         CR["connect-runtime.jar"]
     end
-    DISK[("Đĩa: log segments<br/>storage UnifiedLog.java:105 + LogManager.java:81<br/>+ metadata log KRaft")]
+    DISK[("Disk: log segments<br/>storage UnifiedLog.java:105 + LogManager.java:81<br/>+ KRaft metadata log")]
     CLIP[["CLI tools JVM<br/>tools/, shell/, bin/*.sh"]]
 
     NET --> APIS --> RE --> DISK
@@ -95,30 +150,37 @@ flowchart TB
     CLIP -.-> CL
 ```
 
-- Container broker và controller có thể tách JVM (`config/broker.properties:19` chỉ `process.roles=broker`; `config/controller.properties:19` chỉ `process.roles=controller`) hoặc gộp combined (`config/server.properties:19`) — cùng một artifact `kafka.Kafka`.
-- Các coordinator group/share/transaction không còn là class trong core mà là **module dữ liệu riêng** chạy trên runtime chung `CoordinatorRuntime` (File: coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java | Dòng: 100) — broker core là consumer của chúng (deps_in core gồm cả 4 — gm-02 m03).
-- Thư viện client là container "soft" (jar nhúng), không process riêng; CLI tools là process JVM ngắn hạn.
+- Broker and controller can be separate JVMs (`config/broker.properties` with
+  only `process.roles=broker`; `config/controller.properties` with only
+  `process.roles=controller`) or combined (`config/server.properties`) — same
+  artifact `kafka.Kafka` either way.
+- The group/share/transaction coordinators are no longer classes inside core
+  but separate data modules running on the shared `CoordinatorRuntime`
+  (`CoordinatorRuntime.java`, line 100); the broker core is their consumer
+  (all three appear in core's `depends_on`).
+- Client libraries are "soft" containers (jars embedded in application JVMs,
+  not separate processes); CLI tools are short-lived JVM processes.
 
-## 5. C4 L3 — Components (bên trong broker/controller)
+## 5. C4 — Components (L3)
 
-Chuỗi component chính của một RPC phía broker (tự tóm tắt từ code + gm-02):
+The main component chain of a broker-side RPC:
 
 ```mermaid
 flowchart TB
-    subgraph brokerInternal["Inside: Broker JVM (core + server + storage)"]
-        A["SocketServer (Scala)<br/>Acceptor/Processor đọc network<br/>core/.../network/SocketServer.scala:71"]
-        B["RequestChannel<br/>core/.../network/RequestChannel.scala (201)"]
-        C2["KafkaRequestHandler pool<br/>core/.../KafkaRequestHandler.scala:91<br/>gọi apis.handle — Dòng 167"]
-        D["KafkaApis — switch theo ApiKeys<br/>Dòng 175: case ApiKeys.PRODUCE => handleProduceRequest (Dòng 401)"]
+    subgraph brokerInternal["Inside: broker JVM (core + server + storage)"]
+        A["SocketServer (Scala)<br/>Acceptor/Processor read the network<br/>core/.../network/SocketServer.scala:71"]
+        B["RequestChannel<br/>core/.../network/RequestChannel.scala (201 lines)"]
+        C2["KafkaRequestHandler pool<br/>core/.../KafkaRequestHandler.scala:91<br/>calls apis.handle — line 167"]
+        D["KafkaApis — switch over ApiKeys<br/>line 175: case ApiKeys.PRODUCE => handleProduceRequest (line 401)"]
         E["ReplicaManager<br/>core/.../ReplicaManager.scala:154"]
         F["UnifiedLog/LogManager<br/>storage/.../UnifiedLog.java:105, LogManager.java:81"]
     end
-    subgraph coordRuntime["Inside: coordinator runtime (dùng chung)"]
-        G["CoordinatorRuntime<S,U> state-machine per-partition<br/>coordinator-common .../CoordinatorRuntime.java:100"]
-        H["GroupCoordinatorShard/GroupMetadataManager<br/>group-coordinator .../GroupMetadataManager.java (10188 — gm-02 m04)"]
+    subgraph coordRuntime["Inside: shared coordinator runtime"]
+        G["CoordinatorRuntime&lt;S,U&gt; per-partition state machine<br/>coordinator-common .../CoordinatorRuntime.java:100"]
+        H["GroupCoordinatorShard/GroupMetadataManager<br/>group-coordinator .../GroupMetadataManager.java (10188 lines)"]
     end
-    subgraph kraftInternal["Inside: Controller JVM (metadata + raft)"]
-        I["QuorumController — event/claim per record<br/>metadata/.../QuorumController.java:177"]
+    subgraph kraftInternal["Inside: controller JVM (metadata + raft)"]
+        I["QuorumController — event-per-record<br/>metadata/.../QuorumController.java:177"]
         J["KafkaRaftClient — leader election + log replication<br/>raft/.../KafkaRaftClient.java:170"]
     end
     A --> B --> C2 --> D --> E --> F
@@ -126,129 +188,186 @@ flowchart TB
     I --> J
 ```
 
-- **Vào/ra network:** `SocketServer` thật là **Scala trong core** (File: core/src/main/scala/kafka/network/SocketServer.scala | Dòng: 71 — 1695 dòng, kèm `RequestChannel.scala` 201 dòng). Lưu ý lệch với gm-02 row m10: file `server/src/main/java/org/apache/kafka/network/SocketServer.java` hiện chỉ còn là **holder hằng số 42 dòng** (`public class SocketServer` Dòng 24, chỉ chứa METRICS_GROUP + RECONFIGURABLE_CONFIGS + `closeSocket`) — đây là sai lệch của gm-02 m10 so source, được ghi nhận ở mục 12 và report node.
-- **Request handling:** worker pool `KafkaRequestHandler` (class Dòng 91) gọi `apis.handle(request, requestLocal)` tại Dòng 167; `KafkaApis` (class Dòng 95, 4414 dòng — file lớn nhất core) dispatch theo `ApiKeys` (Dòng 175 cho PRODUCE, handler tại Dòng 401).
-- **Log engine:** `ReplicaManager` (Dòng 154) điều phối append/fetch tới `UnifiedLog` (Dòng 105, 2806 dòng) / `LogManager` (Dòng 81, 1895 dòng) trong module `storage` — broker tiêu thụ qua package `org.apache.kafka.storage.*` (gm-02 m06).
-- **Coordinator KIP-848/932:** `GroupCoordinatorService` (Dòng 166, 2735 dòng) và `ShareCoordinatorService` (gm-02 m20, Dòng 85) chạy trên `CoordinatorRuntime` (Dòng 100) — state machine per-partition + event processor.
-- **Controller KRaft:** `QuorumController` (Dòng 177, 2245 dòng) là `Controller` implementation; `KafkaRaftClient` (Dòng 170, 4185 dòng) làm leader-election/replication cho metadata log.
-- **Telemetry broker:** `ClientMetricsManager` (File: server/src/main/java/org/apache/kafka/server/ClientMetricsManager.java | Dòng: 82) — cầu metrics client-telemetry (KIP-714) phía server.
-- Broker runtime thật (KRaft) là `BrokerServer` Scala (File: core/src/main/scala/kafka/server/BrokerServer.scala | Dòng: 83 — 988 dòng) đứng đầu component broker.
+- **Network in/out:** the real `SocketServer` is the Scala class in core
+  (`core/src/main/scala/kafka/network/SocketServer.scala`, line 71 — 1,695
+  lines, with `RequestChannel.scala` at 201 lines). The file
+  `server/src/main/java/org/apache/kafka/network/SocketServer.java` is only a
+  42-line constants holder (`public class SocketServer` at line 24) — a known
+  map discrepancy, documented under "Known issues" below.
+- **Request handling:** the worker pool `KafkaRequestHandler` (class at line
+  91) calls `apis.handle(request, requestLocal)` at line 167; `KafkaApis`
+  (class at line 95, 4,414 lines — the largest file in core) dispatches on
+  `ApiKeys` (PRODUCE dispatch at line 175, handler at line 401).
+- **Log engine:** `ReplicaManager` (line 154) routes appends/fetches to
+  `UnifiedLog` (line 105, 2,806 lines) and `LogManager` (line 81, 1,895
+  lines) in module `storage`, consumed by the broker through the
+  `org.apache.kafka.storage.*` packages.
+- **KIP-848/932 coordinators:** `GroupCoordinatorService` (line 166, 2,735
+  lines) and `ShareCoordinatorService` (line 85) run on `CoordinatorRuntime`
+  (line 100) — a per-partition state machine with an event processor.
+- **KRaft controller:** `QuorumController` (line 177, 2,245 lines) is the
+  `Controller` implementation; `KafkaRaftClient` (line 170, 4,185 lines)
+  provides leader election and log replication for the metadata log.
+- **Broker telemetry:** `ClientMetricsManager`
+  (`server/src/main/java/org/apache/kafka/server/ClientMetricsManager.java`,
+  line 82) — the server side of KIP-714 client metrics.
+- The real KRaft broker runtime is the Scala `BrokerServer`
+  (`core/src/main/scala/kafka/server/BrokerServer.scala`, line 83 — 993 lines
+  at the measurement commit) at the head of the broker component chain.
 
-## 6. Bản đồ thư mục + vai trò vùng
+## 6. Directory map by role
 
-33 thư mục cấp-1 (liệt kê đủ ở gm-01 mục 2(f), đo tại `aa62a433`; ở clone `3655d7c` của node này `ls -1` khớp phần đầu bảng chữ cái — kiểm tra trực tiếp sandbox). Nhóm theo **vùng vai trò**:
+The 33 top-level directories (full list in
+[`01-cartography.md`](01-cartography.md)), grouped by role, with sizes from the
+module census (66 modules, 6,542 files, 1,738,903 lines at the measurement
+commit):
 
-| Vùng | Thư mục | Vai trò | Bằng chứng |
+| region | directories | role | size (lines) |
 |---|---|---|---|
-| Client nền tảng | `clients/` | producer/consumer/admin + gần như toàn bộ `org.apache.kafka.common` + wire protocol (ApiKeys) | gm-02 m01; ApiKeys.java:48 |
-| Streaming | `streams/` (+`streams-scala`, `examples`, `test-utils`, `integration-tests`, 18×`upgrade-system-tests`) | DSL KStream/KTable + Processor API; TopologyTestDriver test-brokerless | gm-02 m02/m22/m32; TopologyTestDriver.java:229 |
-| Broker lõi (cũ, Scala) | `core/` | entrypoint `kafka.Kafka`, KafkaApis, ReplicaManager, BrokerServer, SocketServer scala, KafkaConfig | Kafka.scala:73; AGENTS.md Dòng 39 |
-| Broker dịch vụ (mới, Java) | `server/`, `server-common/` | network-config, share fetch/DLQ, client metrics, MetadataVersion, purgatory, event queue | ClientMetricsManager.java:82; gm-02 m10/m12 |
-| KRaft | `metadata/`, `raft/` | controller + metadata cache/image + StandardAuthorizer; consensus client | QuorumController.java:177; KafkaRaftClient.java:170 |
-| Log engine | `storage/`, `storage/api/` | UnifiedLog/LogSegment/LogManager + SPI tiered storage | UnifiedLog.java:105; RemoteStorageManager.java:56 |
-| Coordinators | `group-coordinator/` (+api), `share-coordinator/`, `transaction-coordinator/`, `coordinator-common/`, `mirror-coordinator/` | runtime group/share/transaction/mirror trên CoordinatorRuntime chung | CoordinatorRuntime.java:100; GroupCoordinatorService.java:166 |
-| Tích hợp | `connect/` (api, runtime, transforms, json, file, mirror, mirror-client, basic-auth-extension, test-plugins) | Kafka Connect runtime + SPI + MM2 | ConnectDistributed.java:110; Connector.java:48 |
-| Tooling | `tools/` (+tools-api), `shell/`, `bin/` | CLI chính thức, metadata shell, 40+ launcher script | TopicCommand.java:84; `ls bin/*.sh` |
-| Build infra | `gradle/`, `generator/`, `api-checker/`, `checkstyle/`, `release/` | wrapper 9.8.2, codegen protocol từ JSON, guard internal-API, style rules | settings.gradle:143; AGENTS.md Dòng 69-72 |
-| Tài liệu & đóng gói | `docs/`, `docker/`, `config/`, `examples/`, `licenses/`, `NOTICE`, `README.md`, `AGENTS.md` | doc nguồn, image JVM/native, sample config (KRaft-only), demo producer/consumer | docs/getting-started/quickstart.md:55 |
-| Kiểm thử hệ thống | `tests/` (kafkatest, unit, docker, spec), `test-common/` (3 module), `trogdor/`, `jmh-benchmarks/` | system test ducktape Python, cluster test-kit JVM, fault-injection, microbenchmark | tests/README.md:5; gm-02 m25/m14/m18 |
-| Khác | `committer-tools/`, `vagrant/`, `raft/bin/` | tiện ích committer, dev-env cũ, script test KRaft standalone | `ls raft/bin/` → test-kraft-server-start.sh |
+| Platform clients | `clients/` | producer/consumer/admin + nearly all of `org.apache.kafka.common` + wire protocol | 387,364 |
+| Streaming | `streams/` (+ `streams-scala`, `examples`, `test-utils`, `integration-tests`, 26× `upgrade-system-tests-*`) | KStream/KTable DSL + Processor API; broker-less topology testing | 338,869 (main module) |
+| Broker core (Scala) | `core/` | entry `kafka.Kafka`, KafkaApis, ReplicaManager, BrokerServer, Scala SocketServer | 160,338 |
+| Broker services (Java) | `server/`, `server-common/` | network/config, share fetch/DLQ, client metrics, MetadataVersion, purgatory, event queue | 53,773 + 35,932 |
+| KRaft | `metadata/`, `raft/` | controller + metadata cache/image + StandardAuthorizer; consensus client | 62,545 + 55,879 |
+| Log engine | `storage/`, `storage/api/` | UnifiedLog/LogSegment/LogManager + tiered-storage SPI | 73,952 + 2,224 |
+| Coordinators | `group-coordinator/` (+ api), `share-coordinator/`, `transaction-coordinator/`, `coordinator-common/`, `mirror-coordinator/` | group/share/transaction/mirror runtimes on the shared CoordinatorRuntime | 142,204 + 9,915 + 3,897 + 18,618 + 110 |
+| Integration | `connect/` (9 modules) | Connect runtime + SPI + MirrorMaker 2 | 104,931 (runtime) |
+| Tooling | `tools/` (+ api), `shell/`, `bin/` | official CLIs, metadata shell, 40+ launchers | 62,476 + 265 |
+| Build infra | `gradle/`, `generator/`, `api-checker/`, `checkstyle/`, `release/` | wrapper, protocol codegen from JSON, internal-API guard, style rules | — |
+| Docs & packaging | `docs/`, `docker/`, `config/`, `examples/`, `licenses/` | source docs, images, sample configs (KRaft-only), demos | — |
+| System testing | `tests/`, `test-common/` (3 modules), `trogdor/`, `jmh-benchmarks/` | ducktape system tests, JVM cluster test kit, fault injection, microbenchmarks | — |
+| Other | `committer-tools/`, `vagrant/`, `raft/bin/` | committer utilities, legacy dev environment, KRaft standalone test script | — |
 
-Kích thước vùng (từ census 66 item gm-02, cert `aa62a433`, tổng 6542 file / 1.738.689 LOC trong universe): clients 387.329 > streams 338.869 > core 160.242 > group-coordinator 142.203 > connect/runtime 104.931 > storage 73.952 (File: reports/gm-checklist.json | Dòng: 2-11).
+## 7. Hot data flows
 
-## 7. Luồng đắt giá
+The highest-churn execution paths are analyzed in
+[`06-flows.md`](06-flows.md): ranked by churn-weighted fan, the top three are
+**D — Streams pipeline** (record I/O, state stores, internal topics), **B —
+consumer-group heartbeat/rebalance (KIP-848)**, and **C — KRaft metadata
+write**; the classic produce→append→fetch path ranks fourth — its wire path is
+entirely contained in flow D. Quick teaser of the produce path from the code:
+`SocketServer.scala:71` → `RequestChannel` →
+`KafkaRequestHandler.scala:167` (`apis.handle`) → `KafkaApis.scala:175`
+dispatch → `handleProduceRequest` (line 401) → `ReplicaManager.scala:154` →
+`UnifiedLog.java:105` append; the fetch path returns through the same
+`KafkaApis` (`ApiKeys.FETCH` — `ApiKeys.java:49`).
 
-Chi tiết từng luồng (produce → replicate → fetch, consumer-group rebalance, KRaft commit metadata…) do **stream D** sản xuất tại **`reports/gm-06-flows.md`** — file **chưa tồn tại tại thời điểm viết mục này** (stream D đang chạy song song; node này KHÔNG chờ theo brief dòng 8-9). Trỏ đích: đọc `reports/gm-06-flows.md` khi có.
+## 8. Build and run
 
-Teaser từ code (để reader định hướng trước khi có gm-06): đường PRODUCE đi `SocketServer.scala:71` → `RequestChannel` → `KafkaRequestHandler.scala:167` (`apis.handle`) → `KafkaApis.scala:175` dispatch → `handleProduceRequest` (Dòng 401) → `ReplicaManager.scala:154` → `UnifiedLog.java:105` append; đường FETCH quay lại qua cùng KafkaApis (ApiKeys.FETCH — ApiKeys.java:49).
-
-## 8. Chạy / harness — lệnh thật
-
-Đã xác minh tồn tại từng file trên clone (`sess-ce490557`). JDK yêu cầu: Java 11+ cho `clients`/`generator`/`streams`, 17+ cho module khác; build/test JDK 17 và 25 (File: AGENTS.md | Dòng: 28-30).
+Verified against the tree at the measurement commit. JDK requirements: Java 11+
+for `clients`/`generator`/`streams`, 17+ for other modules; builds are tested
+on JDK 17 and 25 (per the upstream build guide).
 
 ```bash
 # 0) Build
-./gradlew jar                                   # compile jars (AGENTS.md:60)
-./gradlew clean releaseTarGz                    # tarball distribution (AGENTS.md:63)
+./gradlew jar                                   # compile jars
+./gradlew clean releaseTarGz                    # distribution tarball
 
-# 1) Chạy cụm KRaft combined mode 1 node
-bin/kafka-storage.sh random-uuid                # sinh KAFKA_CLUSTER_ID (docs/operations/kraft.md:113)
+# 1) Run a one-node KRaft cluster (combined mode)
+bin/kafka-storage.sh random-uuid                # generate KAFKA_CLUSTER_ID
 bin/kafka-storage.sh format --standalone -t $KAFKA_CLUSTER_ID -c config/server.properties
-                                                # (docs/getting-started/quickstart.md:55)
-bin/kafka-server-start.sh config/server.properties
-                                                # exec kafka.Kafka (bin/kafka-server-start.sh:44)
-#    ⚠️ KHÔNG còn config/kraft/ (3.x) — KRaft config là config/server.properties|broker.properties|controller.properties
-#    ⚠️ KHÔNG còn ZooKeeper (config/zookeeper.properties, bin/zookeeper-server-start.sh — không tồn tại)
+bin/kafka-server-start.sh config/server.properties   # exec kafka.Kafka
+#    NOTE: no config/kraft/ anymore (3.x style) and no ZooKeeper scripts —
+#    KRaft config is config/server.properties | broker.properties | controller.properties
 
-# 2) Sử dụng
+# 2) Use it
 bin/kafka-topics.sh --create --topic demo --bootstrap-server localhost:9092
 bin/kafka-console-producer.sh --topic demo --bootstrap-server localhost:9092
 bin/kafka-console-consumer.sh --topic demo --from-beginning --bootstrap-server localhost:9092
 
-# 3) Test harness Gradle (AGENTS.md:83-115, nguyên văn)
-./gradlew test                                  # tất cả unit + integration
-./gradlew unitTest ; ./gradlew integrationTest  # tách suite
-./gradlew test -Pkafka.test.run.flaky=true      # gồm @Flaky
-./gradlew clients:test --tests RequestResponseTest          # 1 class
-./gradlew clients:clients-integration-tests:test --tests org.apache.kafka.clients.producer.ProducerFailureHandlingTest.testCannotSendToInternalTopic   # 1 method
+# 3) Test harness (Gradle)
+./gradlew test                                  # all unit + integration
+./gradlew unitTest ; ./gradlew integrationTest  # split suites
+./gradlew test -Pkafka.test.run.flaky=true      # include @Flaky
+./gradlew clients:test --tests RequestResponseTest                     # one class
+./gradlew clients:clients-integration-tests:test --tests org.apache.kafka.clients.producer.ProducerFailureHandlingTest.testCannotSendToInternalTopic   # one method
 ./gradlew clients:reportCoverage -PenableTestCoverage=true -Dorg.gradle.parallel=false
 
-# 4) Quality gate (AGENTS.md "Code quality")
+# 4) Quality gates
 ./gradlew spotlessApply
 ./gradlew checkstyleMain checkstyleTest spotlessCheck
 
-# 5) System tests (Python, cần docker/ducker)
-#    ducktape — tests/README.md:5; harness: tests/kafkatest, spec ở tests/spec
+# 5) System tests (Python, needs docker/ducker)
+#    ducktape harness: tests/kafkatest, specs in tests/spec
 ```
 
-- Connect chạy thật: `bin/connect-standalone.sh` → `exec kafka-run-class.sh ... ConnectStandalone` (File: bin/connect-standalone.sh | Dòng: 45); distributed: ConnectDistributed.java:110.
-- KRaft test script tiện dụng: `raft/bin/test-kraft-server-start.sh` (tồn tại — `ls raft/bin/`).
-- Lệnh gợi ý trong brief ("./bin/kafka-server-start.sh") **đúng**; mọi lệnh khác lấy theo AGENTS.md/docs hiện hành.
+- Connect for real: `bin/connect-standalone.sh` → execs
+  `kafka-run-class.sh … ConnectStandalone` (line 45); distributed mode uses
+  `ConnectDistributed.java` (line 110).
+- A handy KRaft test script: `raft/bin/test-kraft-server-start.sh`.
 
-## 9. Điểm mở rộng đắt giá — teaser
+## 9. Extension points
 
-SPI/bề mặt chèn phổ biến nhất (đo line trực tiếp trên clone; trừ nơi ghi rõ):
+The most valuable SPI/plugin surfaces, measured directly in the tree:
 
-| Điểm mở rộng | Interface/entry | Dùng khi nào |
+| Extension point | Interface / entry | Use it for |
 |---|---|---|
-| **Connect Connector SPI** | `public abstract class Connector implements ConnectPlugin` (File: connect/api/src/main/java/org/apache/kafka/connect/connector/Connector.java, Dòng: 48) | Gắn hệ thống ngoài vào Kafka (source/sink) |
-| **Connect REST auth** | `ConnectRestExtension` (File: connect/api/src/main/java/org/apache/kafka/connect/rest/ConnectRestExtension.java, Dòng: 54; implement mẫu BasicAuthSecurityRestExtension.java:64) | Xác thực REST worker |
-| **Tiered/remote storage** | `RemoteStorageManager` (File: storage/api/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteStorageManager.java, Dòng: 56) | Đưa segment lạnh lên storage ngoài (SPI tách module `storage/api`) |
-| **Consumer group assignor** | `ConsumerGroupPartitionAssignor` (File: group-coordinator/group-coordinator-api/src/main/java/org/apache/kafka/coordinator/group/api/assignor/ConsumerGroupPartitionAssignor.java, Dòng: 26) | Chiến lược phân partition mới cho KIP-848 |
-| **Authorizer cluster** | `StandardAuthorizer implements ClusterMetadataAuthorizer` (File: metadata/src/main/java/org/apache/kafka/metadata/authorizer/StandardAuthorizer.java, Dòng: 57) | ACL phân quyền metadata-KRaft |
-| **Telemetry client** | `MetricsReporter` (File: clients/src/main/java/org/apache/kafka/common/metrics/MetricsReporter.java, Dòng: 33; server-side ClientMetricsManager.java:82) | Đón metrics KIP-714 |
-| **CLI record reader** | `RecordReader` (File: tools/tools-api/src/main/java/org/apache/kafka/tools/api/RecordReader.java, Dòng: 36) | Plugin đọc log cho ConsoleProducer v.v. |
-| **Streams test-brokerless** | `TopologyTestDriver` (File: streams/test-utils/src/main/java/org/apache/kafka/streams/TopologyTestDriver.java, Dòng: 229) | Unit-test topology không cần broker |
-| **Build-time guard** | api-checker (PluginDeveloperApiUsageScanner.java:82 — [từ gm-02 m24, chưa đo lại]) | Chặn plugin dùng internal API — fork phải đi cửa này |
-| **Protocol codegen** | `generator/` sinh message class từ JSON spec (`processMessages` — AGENTS.md Dòng 69-72) | Thêm RPC/field mới mà không sửa tay generated code |
+| Connect Connector SPI | `public abstract class Connector implements ConnectPlugin` — `connect/api/src/main/java/org/apache/kafka/connect/connector/Connector.java`, line 48 | Wiring external systems into Kafka (source/sink) |
+| Connect REST auth | `ConnectRestExtension` — `connect/api/src/main/java/org/apache/kafka/connect/rest/ConnectRestExtension.java`, line 54; sample implementation `BasicAuthSecurityRestExtension.java`, line 64 | Authenticating the worker REST API |
+| Tiered / remote storage | `RemoteStorageManager` — `storage/api/src/main/java/org/apache/kafka/server/log/remote/storage/RemoteStorageManager.java`, line 56 | Moving cold segments to external storage |
+| Consumer group assignor | `ConsumerGroupPartitionAssignor` — `group-coordinator/group-coordinator-api/src/main/java/org/apache/kafka/coordinator/group/api/assignor/ConsumerGroupPartitionAssignor.java`, line 26 | New KIP-848 partition-assignment strategies |
+| Cluster authorizer | `StandardAuthorizer implements ClusterMetadataAuthorizer` — `metadata/src/main/java/org/apache/kafka/metadata/authorizer/StandardAuthorizer.java`, line 57 | ACL enforcement in the KRaft metadata plane |
+| Client telemetry | `MetricsReporter` — `clients/src/main/java/org/apache/kafka/common/metrics/MetricsReporter.java`, line 33; server side `ClientMetricsManager.java`, line 82 | Consuming KIP-714 client metrics |
+| CLI record reader | `RecordReader` — `tools/tools-api/src/main/java/org/apache/kafka/tools/api/RecordReader.java`, line 36 | Log-reading plugins for ConsoleProducer et al. |
+| Streams broker-less testing | `TopologyTestDriver` — `streams/test-utils/src/main/java/org/apache/kafka/streams/TopologyTestDriver.java`, line 229 | Unit-testing topologies without a broker |
+| Build-time API guard | api-checker — `api-checker/core/src/main/java/org/apache/kafka/apicheck/PluginDeveloperApiUsageScanner.java`, line 82 | Blocking plugin use of internal APIs |
+| Protocol codegen | `generator/` emits message classes from JSON specs (`processMessages` target; generated code must never be hand-edited) | Adding RPCs/fields without touching generated code |
 
-Xu hướng kiến trúc mở rộng của trunk hiện tại: mọi logic coordinator mới (share, mirror-config) sinh ra **dưới dạng module coordinator trên `CoordinatorRuntime`** (m15/m20/m66) thay vì class trong core — điểm chèn cho tính năng metadata-plane mới.
+Architectural direction: new coordinator logic (share groups, mirror config)
+appears as coordinator modules on `CoordinatorRuntime` (see
+`share-coordinator`, `mirror-coordinator`) rather than as classes in core —
+that is the insertion point for new metadata-plane features.
 
-## 10. Rủi ro khi tái sử dụng
+## 10. Reuse risks
 
-1. **Quy mô build:** 6.283 file Java / 1.604.487 dòng (census v9 đo tại clone này) + 65 module Gradle composite (kèm `includeBuild 'api-checker'`) — chi phí CI/build cao; JDK dual-level 11+/17+ và build JDK 17 & 25 (AGENTS.md:28-30) buộc matrix build.
-2. **Scala core đang bị tháo dỡ từ từ:** AGENTS.md:39 ("gradually being removed along with Scala code") — API Scala nội bộ (`kafka.*`) không cam kết ổn định; ví dụ chứng kiến trong pipeline: `SocketServer` đã thành holder Java 42 dòng còn implementation Scala ở core (mục 5). Fork gắn vào scala core sẽ phải theo dõi từng commit.
-3. **Trunk di chuyển rất nhanh:** trong cùng ngày, pipeline này chứng kiến sha cert dời `4b31f507…` → `aa62a433…` → `3655d7c…` (gm-01 + node này) — bắt buộc pin SHA cụ thể khi tái sử dụng.
-4. **KRaft-only:** mọi tài liệu/cấu hình thời ZK (zookeeper.properties, kraft/config cũ) đã lỗi thời; `config/kraft/` không còn tồn tại — sample config giờ là `config/server.properties` (combined), `broker.properties`, `controller.properties` (đã `ls config/`).
-5. **Chính sách API/KIP:** đổi public API/wire protocol/config/metrics cần KIP (AGENTS.md mục "Coding conventions"); generated code cấm sửa tay (`processMessages` — AGENTS.md). Reuse phải chạy `spotlessApply`/checkstyle trước khi đóng góp.
-6. **Hạ tầng test nặng:** integration test dựng cluster KRaft thật (KafkaClusterTestKit — m25), system test cần ducktape + docker ducker (tests/README.md:5, 75) — không thể "chạy nhanh" bản fork thiếu hạ tầng này.
-7. **License:** Apache-2.0 (LICENSE header "Apache License / Version 2.0, January 2004" — File: LICENSE | Dòng: 1-3) + NOTICE/NOTICE-binary và `licenses/` cho phụ thuộc — tái sử dụng thương mại được phép nhưng phải giữ license header file mới (AGENTS.md "License header") và NOTICE.
-8. **Vùng API ủi:** share groups (KIP-932 — ApiKeys.SHARE_FETCH Dòng 126, share-coordinator, ShareGroupDLQ…) và client telemetry đang phát triển mạnh — [CẦN XÁC MINH] trạng thái production-ready của KIP-932 trên trunk hiện tại.
+1. **Build scale:** 6,283 Java files / 1,604,604 lines plus 65 Gradle modules
+   and a composite build — CI/build cost is real; the dual JDK requirement
+   (11+/17+; build on 17 and 25) forces a build matrix.
+2. **The Scala core is being dismantled gradually:** internal `kafka.*` Scala
+   APIs have no stability guarantee; a fork tied to core internals must track
+   every commit.
+3. **Trunk moves fast:** the upstream head moved repeatedly within the two
+   days this study ran; always pin a specific SHA when reusing.
+4. **KRaft-only:** all ZooKeeper-era documentation/configuration is obsolete;
+   sample configs are `config/server.properties` (combined),
+   `broker.properties`, `controller.properties`.
+5. **API/KIP policy:** public API/wire-protocol/config changes require a KIP;
+   generated code is never hand-edited; run `spotlessApply`/checkstyle before
+   contributing back.
+6. **Heavy test infrastructure:** integration tests build real KRaft clusters
+   (`KafkaClusterTestKit`), system tests need ducktape + docker — a fork
+   without this infrastructure cannot be validated quickly.
+7. **License:** Apache-2.0 (`LICENSE`, lines 2-3) with `NOTICE`/
+   `NOTICE-binary` and `licenses/` for dependencies — commercial reuse is fine
+   but new files must carry license headers and the NOTICE must be kept.
+8. **Moving API surface:** share groups (KIP-932 — `ApiKeys.SHARE_FETCH`, line
+   126; `share-coordinator`; share DLQ) and client telemetry (KIP-714) are
+   under active development; their production readiness cannot be inferred
+   from code alone.
 
-## 11. Provenance
+## 11. Known documentation issues
 
-- **Repo:** `https://github.com/apache/kafka`, branch `trunk`, clone nông `--depth 100 --single-branch` → exit 0, 7.642 file checkout (sandbox `sess-ce490557`, image `bitnami/git:latest`, ttl 3600).
-- **SHA trunk tại thời điểm node này:** `git ls-remote` upstream = `3655d7c19cd9771ef4b1d213084cfd08f45c7581` — **khớp tuyệt đối** HEAD clone; commit: `KAFKA-21214: Start the new map of a member at the default capacity (follow-up) (#24001)`, 2026-10-28 21:18:49 +0100; `rev-list --count HEAD` = 100 (shallow).
-- **Quan hệ với cert gm-01 RUN 4 (`aa62a433553c14866521bd40ff446b6920d4d67e`):** trunk đã tiến thêm; khác biệt định lượng duy nhất node này đo: **java LOC 1.604.486 → 1.604.487 (+1)** — khớp đúng drift +1 do KAFKA-21214 đụng `AssignmentBuilder.java` (m04) đã kê khai trong gm-02 mục 4b.2; scala/py/sh không đo lại (không có claim nào của node này phụ thuộc). Số file checkout 7.642 không đổi.
-- **License:** Apache License, Version 2.0 — File: LICENSE | Dòng: 1-3 ("Apache License / Version 2.0, January 2004"); kèm LICENSE-binary, NOTICE, NOTICE-binary, thư mục `licenses/` cho phụ thuộc.
-- **Phiên bản build tại HEAD:** group `org.apache.kafka`, version **4.5.0-SNAPSHOT**, Scala **2.13.18** (File: gradle.properties | Dòng: 1-3 — grep trực tiếp); Gradle wrapper 9.8.2 (gm-01 mục 2(d), không đổi).
-- Mọi file:line trong bản này đo trực tiếp trên clone `3655d7c` trừ: các con số LOC module (gm-checklist cert `aa62a433` — đã ghi chú), SocketServer/DistributedHerder/MirrorMaker/TopologyTestDriver ghi chú riêng khi lấy từ gm-02.
+- **`server` module network entry:** the module map's mechanical scan lists
+  `SocketServer.java` (42-line constants holder) as the network entry of
+  `server`; the actual network implementation is the Scala `SocketServer`
+  (1,695 lines) in `core`. The module-map row and this section document both;
+  treat the Scala class as the real entry point.
+- **Entrypoint census scope:** the 19-Java-main count covers `clients`,
+  `connect/runtime`, and `core` neighbors only — not a repo-wide census of
+  runtime vs utility mains.
+- **KIP-932 / KIP-714 maturity:** the code is broadly present but
+  production-readiness is not verifiable from code alone.
+- **`mirror-coordinator` runtime path:** how the server consumes
+  `ClusterMirrorConfigs` through dynamic config at runtime has not been
+  traced end-to-end in this study.
 
-## 12. Câu hỏi còn mở
+## 12. Provenance
 
-1. `reports/gm-06-flows.md` (stream D) chưa có lúc viết — mục 7 chỉ trỏ; cần cross-check ngược sau khi stream D xong (luồng produce/fetch teaser ở mục 7 phải khớp gm-06).
-2. gm-02 row m10 liệt kê `SocketServer.java:24` là entry network của `server` — theo source hiện tại, đó chỉ là holder 42 dòng; implementation thật là `core/.../network/SocketServer.scala:71` (1695 dòng). node này KHÔNG sửa gm-02 (ngoài phạm vi) — cần orchestrator quyết định re-cert m10.
-3. Số entrypoint `main` "chạy thật" so với main tiện ích: gm-01 grep 19 Java entry (chỉ core/clients/connect-runtime) — chưa có census toàn repo toàn diện cho entry runtime vs debug/doc.
-4. Trạng thái ổn định của KIP-932 (share groups) và KIP-714 (telemetry) trên trunk — code hiện diện rộng (ApiKeys.java:126, ClientMetricsManager.java:82, share-coordinator) nhưng mức production-ready không suy ra được chỉ từ code [CẦN XÁC MINH].
-5. Lệch sha giữa cert gm-01 (`aa62a433`) và thực tế các node sau đọc trunk — pipeline nên chốt chính sách pin SHA cho các node còn lại (seed/goldmine output) để provenance khép kín.
-6. `mirror-coordinator` (1 file, 110 LOC, deps_out → server — gm-02 m66) được server đọc qua dynamic config như thế nào trong runtime — chưa đào sâu (ngoài phạm vi overview).
+All file/line claims on this page were verified against a checkout at the
+measurement commit `0c92b0664539d0dfb60b43ede0026497a581d8e0` (KAFKA-20125,
+#21416) and cross-checked independently (a second pass re-ran ~48 spot checks
+— class declarations, line pointers, and the census — with 100% agreement).
+The extracts pin is `aa62a433` (5 commits earlier); none of the cited paths
+changed between the two commits, so every reference resolves identically at
+both. Module sizes come from the module census referenced by
+[`02-module-map.md`](02-module-map.md) and [`matrix/matrix.csv`](../../matrix/matrix.csv).
