@@ -1,0 +1,7 @@
+extends: existence
+message: "Do not collect caveats in a Limitations section — state each limitation as a fact next to the claim it qualifies."
+level: error
+ignorecase: true
+scope: heading
+tokens:
+  - '^\s*Limitations\s*$'

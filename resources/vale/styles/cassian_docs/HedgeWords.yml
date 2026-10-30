@@ -1,0 +1,14 @@
+extends: substitution
+message: "Google style guide: avoid vague intensifiers — '%s' weakens the statement."
+level: suggestion
+ignorecase: true
+swap:
+  very: ""
+  extremely: ""
+  highly: ""
+  basically: ""
+  literally: ""
+  obviously: ""
+  simply: ""
+  just: ""
+  actually: ""

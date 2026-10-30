@@ -16,7 +16,8 @@ merged into a single score (they have different units):
 
 - **churn** — the number of times a file was touched across the most recent ≤100
   upstream commits (`git log --format= --name-only | sort | uniq -c | sort -rn`
-  on a depth-100 trunk checkout). Ranking key for this document.
+  on a depth-100 trunk checkout). Ranking key for this document; a relative
+  signal over the window, not lifetime history.
 - **fan** — Σ depends_on + Σ depended_by of the modules a flow passes through
   (from [`matrix/matrix.csv`](../../matrix/matrix.csv)). Shown as the blast
   radius: how many modules feel an API change on that path.
@@ -26,7 +27,9 @@ merged into a single score (they have different units):
 extract-pin window; dependency edges come from the module map measured at
 `0c92b0664539d0dfb60b43ede0026497a581d8e0` (KAFKA-20125). None of the files
 cited below changed between the extracts pin `aa62a433` and the measurement
-cert, so every file/line reference resolves identically at both commits.
+cert, so every file/line reference resolves identically at both commits. Treat
+file paths as the durable reference and line numbers as pin-specific positions.
+API names reflect the current code — older documents may use superseded names.
 
 ## Module churn (100-commit window)
 
@@ -217,16 +220,3 @@ sequenceDiagram
   `DelayedShareFetchTest`, 4+4 touches). The API surface is fresh: `ApiKeys`
   still reserves its slot at line 126 (`clients/.../protocol/ApiKeys.java`).
 
-## Limitations
-
-- The churn window covers only the **last ≤100 commits** (shallow clone).
-  Absolute churn numbers would differ with a longer window; the module ranking
-  (clients #1, streams #2, metadata #4, group-coordinator #5) is a relative
-  signal, not lifetime history.
-- Line numbers were verified against the tracing tree and hold at both the
-  extracts pin and the measurement cert (no cited file changed in between).
-  Upstream trunk keeps moving; treat file paths as the durable reference and
-  line numbers as the pin-specific position.
-- API names reflect the current code (e.g. `AsyncKafkaConsumer`,
-  `ConsumerHeartbeatRequestManager`, `GroupCoordinatorShard.consumerGroupHeartbeat`,
-  `runtime.scheduleWriteOperation`) — older documents may use superseded names.

@@ -1,0 +1,7 @@
+extends: existence
+message: "Vietnamese text found — documentation prose must be English-only (%s)."
+level: error
+ignorecase: false
+scope: text
+tokens:
+  - '[\x{1EA0}-\x{1EF9}\x{0110}\x{0111}]'

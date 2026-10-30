@@ -1,0 +1,7 @@
+extends: existence
+message: "Pipeline codename '%s' — use subject-facing wording instead."
+level: suggestion
+ignorecase: true
+scope: text
+tokens:
+  - 'goldmine'

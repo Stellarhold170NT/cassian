@@ -1,0 +1,5 @@
+{
+  "name": "cassian_base",
+  "description": "Hard invariants for every cassian markdown file: English-only prose and no pipeline-internal tokens.",
+  "author": "cassian"
+}

@@ -1,0 +1,15 @@
+extends: substitution
+message: "EGM plain-English rule: replace promotional wording '%s' with a precise statement."
+level: error
+ignorecase: true
+swap:
+  seamless: coherent
+  seamlessly: cleanly
+  blazingly: quickly
+  effortless: simple
+  effortlessly: easily
+  magically: automatically
+  state-of-the-art: modern
+  cutting-edge: recent
+  world-class: strong
+  best-in-class: leading

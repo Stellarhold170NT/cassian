@@ -1,0 +1,6 @@
+extends: occurrence
+message: "Google style: keep sentences short — this one has more than 45 words."
+level: suggestion
+scope: sentence
+token: '[^\s]+'
+max: 45

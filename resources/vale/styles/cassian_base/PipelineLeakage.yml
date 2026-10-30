@@ -1,0 +1,16 @@
+extends: existence
+message: "Pipeline-internal token leaked into documentation: '%s'."
+level: error
+ignorecase: false
+scope: text
+tokens:
+  - 'job-[0-9a-f]{8}'
+  - 'sess-[0-9a-f]{6}'
+  - 'session-[0-9a-f]{6}'
+  - 'ghp_[A-Za-z0-9]{20,}'
+  - 'LẦN CHẠY'
+  - 'INHERITED'
+  - 'joinPolicy'
+  - 'gm-checklist'
+  - 'fresh_reset'
+  - 'node_review_'
