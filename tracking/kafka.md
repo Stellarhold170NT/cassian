@@ -2,7 +2,7 @@
 
 | project | pinned_sha | head_now | state | last-check (UTC) |
 |---|---|---|---|---|
-| kafka | aa62a433553c14866521bd40ff446b6920d4d67e | 14ee92ca1ecf469eb8f006abf7b75453513cac49 | STALE | 2026-10-29T21:10:00Z |
+| kafka | aa62a433553c14866521bd40ff446b6920d4d67e | 14ee92ca1ecf469eb8f006abf7b75453513cac49 | STALE | 2026-10-29T23:57:00Z |
 
 - Source of the pin: `docs/kafka/index.md` front matter (`measured_at`) — the
   commit of upstream `trunk` the subject was frozen against: "KAFKA-20866:

@@ -58,6 +58,11 @@ Rank by churn (descending); fan listed separately as blast radius:
 | 4 | A — Produce → append → ISR replicate → consumer fetch | clients, server, core, storage | **3114** | 60 |
 | 5 | E — Share-group fetch/ack (KIP-932) | clients, server, core, share-coordinator, coordinator-common | **2926** | 68 |
 
+Re-running the same churn commands on the statistics-commit tree shifts
+module totals by a handful of touches (clients +2, core +3, server +2,
+server-common +2) and keeps every rank unchanged, including A in fourth
+and E in fifth.
+
 **Why the top three are expensive:**
 
 - **D** — `streams` churn is #2 of the whole repo (1,298 touches) and
@@ -113,7 +118,7 @@ sequenceDiagram
 | 6 | `streams/src/main/java/org/apache/kafka/streams/processor/internals/PartitionGroup.java` | 244 (`StampedRecord nextRecord(final RecordInfo info, final long wallClockTime)`) | pick record from the co-partitioned queue |
 | 7 | `streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorNode.java` | 174 (`public void process(final Record<KIn, VIn> record)`) | execute the processor node |
 | 8 | `streams/src/main/java/org/apache/kafka/streams/processor/internals/ProcessorContextImpl.java` | 188 (forward), 136 (collector.send); `SinkNode.java` 77 (process), 96 (collector.send) | forward node → sink node |
-| 9 | `streams/src/main/java/org/apache/kafka/streams/processor/internals/RecordCollectorImpl.java` | 189/267 (send), 273 (`streamsProducer.send(serializedRecord, callback)`) | serialize and push to the changelog producer |
+| 9 | `streams/src/main/java/org/apache/kafka/streams/processor/internals/RecordCollectorImpl.java` | 189/267 (send), 273 (`streamsProducer.send(serializedRecord, callback)`) | serialize and push to the changelog producer (the send callback is an inline lambda in the source) |
 | 10 | `streams/src/main/java/org/apache/kafka/streams/processor/internals/StoreChangelogReader.java` | 494 (`public long restore(final Map<TaskId, Task> tasks)`), 709 (`stateManager.restore(storeMetadata, records, optionalLag)`) | restore state stores from changelogs — the top-churn file |
 | 11 | StreamTask.java | 526 (`public void postCommit(final boolean enforceCheckpoint)`) | checkpoint commit after a batch |
 
@@ -196,7 +201,7 @@ sequenceDiagram
 ## Flows A and E (lower churn)
 
 - **A — produce → append → ISR replicate → consumer fetch** (churn 3114): the
-  brief's canonical example path. Its wire path is entirely contained in flow D
+  canonical Kafka produce-to-fetch path. Its wire path is entirely contained in flow D
   (steps 3 and 9 traverse the same fetch/produce machinery), and its module
   churn is lower than D's because `streams` alone churned twice as much as
   `server` + `core` + `storage` combined minus clients. Trace (abridged):

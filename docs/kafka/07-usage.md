@@ -67,6 +67,7 @@ Evidence:
 - `clients/src/main/java/org/apache/kafka/clients/producer/RecordMetadata.java:71` — `public long offset()`
 - `clients/src/main/java/org/apache/kafka/clients/producer/KafkaProducer.java:1422` — `public void flush()`
 - `clients/src/main/java/org/apache/kafka/clients/producer/Producer.java:42` — `public interface Producer<K, V> extends Closeable`
+- `clients/src/main/java/org/apache/kafka/common/serialization/StringSerializer.java:33` — `public class StringSerializer implements Serializer<String> {` (no-arg constructor, as used in the example)
 
 ### UC2 — consume topic `orders` with batch polls
 
@@ -340,6 +341,7 @@ Evidence:
 - `storage/src/main/java/org/apache/kafka/storage/internals/log/UnifiedLog.java:506` — `public long highWatermark()`
 - `UnifiedLog.java:2142` — `public long logEndOffset()`
 - `FetchDataInfo.java:28` — `public final LogOffsetMetadata fetchOffsetMetadata` (field used in the example)
+- `storage/src/main/java/org/apache/kafka/storage/internals/log/LogOffsetMetadata.java:33` — `public final long messageOffset;` (read via `committed.fetchOffsetMetadata.messageOffset` in the example)
 
 ### UC3 — package a fetch result (FetchDataInfo + LogOffsetMetadata) for tests
 
@@ -400,7 +402,7 @@ TOPIC/LITERAL `ResourcePattern`, call `authorize`, and get a
 
 ```java
 import org.apache.kafka.common.acl.AclOperation;
-import org.apache.kafka.common.protocol.SecurityProtocol;
+import org.apache.kafka.common.security.auth.SecurityProtocol;
 import org.apache.kafka.common.resource.PatternType;
 import org.apache.kafka.common.resource.ResourcePattern;
 import org.apache.kafka.common.resource.ResourceType;
@@ -524,6 +526,7 @@ Evidence:
 - `KRaftMetadataCache.java:336` — `public Set<String> getAllTopics()`
 - `KRaftMetadataCache.java:341` — `public Uuid getTopicId(String topicName)`
 - `KRaftMetadataCache.java:347` — `public Optional<String> getTopicName(Uuid topicId)`
+- `clients/src/main/java/org/apache/kafka/common/Uuid.java:36` — `public class Uuid implements Comparable<Uuid> {` (return type of `getTopicId`)
 
 **Dependencies to pull in.** `metadata` + `clients` (resource/ACL types, Uuid),
 `server-common` (KRaftVersion), `raft`. depended_by (9 modules): core, server,

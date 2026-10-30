@@ -70,7 +70,7 @@ document only; [`03-c4/`](03-c4/) holds their raw source files
   (`coordinator-common/src/main/java/org/apache/kafka/coordinator/common/runtime/CoordinatorRuntime.java`,
   line 100).
 - **Integration:** Kafka Connect (`connect/` — runtime 104,931 lines), Kafka
-  Streams (`streams/` — 338,869 lines), MirrorMaker 2
+  Streams (`streams/` — 338,869 lines, approximate), MirrorMaker 2
   (`connect/mirror` — main at `MirrorMaker.java`, line 329).
 - **CLI:** `tools/` + `bin/*.sh` (`TopicCommand` main at line 84; 40+ launcher
   scripts), metadata shell in `shell/`.
@@ -225,7 +225,7 @@ commit):
 | region | directories | role | size (lines) |
 |---|---|---|---|
 | Platform clients | `clients/` | producer/consumer/admin + nearly all of `org.apache.kafka.common` + wire protocol | 387,364 |
-| Streaming | `streams/` (+ `streams-scala`, `examples`, `test-utils`, `integration-tests`, 26× `upgrade-system-tests-*`) | KStream/KTable DSL + Processor API; broker-less topology testing | 338,869 (main module) |
+| Streaming | `streams/` (+ `streams-scala`, `examples`, `test-utils`, `integration-tests`, 26× `upgrade-system-tests-*`) | KStream/KTable DSL + Processor API; broker-less topology testing | 338,869 (main module; approximate, see the module map's size note) |
 | Broker core (Scala) | `core/` | entry `kafka.Kafka`, KafkaApis, ReplicaManager, BrokerServer, Scala SocketServer | 160,338 |
 | Broker services (Java) | `server/`, `server-common/` | network/config, share fetch/DLQ, client metrics, MetadataVersion, purgatory, event queue | 53,773 + 35,932 |
 | KRaft | `metadata/`, `raft/` | controller + metadata cache/image + StandardAuthorizer; consensus client | 62,545 + 55,879 |

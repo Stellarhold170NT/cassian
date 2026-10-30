@@ -32,9 +32,9 @@ back to an unrated module.
 | largest file | `server-common/src/main/java/org/apache/kafka/server/share/persister/PersisterStateManager.java` (1,842 lines) | |
 | import profile (src/main) | 175 `common` / 30 `server` / 16 `clients` statements | stable across trees |
 
-Every number reproduces exactly across three independent trees
-(`aa62a433…`, `6014921…`, `0c92b066…`) — the module is stable across upstream
-drift and the 5★ rating is re-affirmed.
+Every number reproduces exactly across four independent trees
+(`aa62a433…`, `6014921…`, `0c92b066…`, `14ee92ca…`) — the module is stable
+across upstream drift and the 5★ rating is re-affirmed.
 
 ## 3. Key discovery: no module owns a build file anymore
 
@@ -101,7 +101,7 @@ is stated.
   ```
   Record the pin in the cut metadata; gates compare against this tree. Accept
   a newer pin only if gates G2–G4 reproduce the certified numbers (already
-  proven stable across three trees). Otherwise stop and re-certify first.
+  proven stable across four trees). Otherwise stop and re-certify first.
 - **1) Clone and checkout the pin:**
   ```bash
   git clone --quiet --depth 100 --single-branch -b trunk https://github.com/apache/kafka /workspace/kafka
@@ -177,3 +177,37 @@ three upstream trees with zero numeric discrepancies:
 6. **Target repo is not empty** — the `modules/kafka/` harvest and `README.md`
    already exist; the cut must publish to its own seed branch without touching
    either.
+
+## 9. Re-verification at a fourth tree
+
+The section-7 battery was re-run unchanged against trunk pin
+`14ee92ca1ecf469eb8f006abf7b75453513cac49` ("KAFKA-21230: Pause task executors
+on byte limit (#23984)") — the fourth measured tree. The drift window explains
+the result mechanically: trunk advanced exactly one commit past `0c92b066`
+(`git rev-list --count 0c92b066..HEAD` = 1), and that commit touches no file
+under `server-common/` (`git log --oneline 0c92b066..HEAD -- server-common`
+is empty). All 18 quantities reproduce identically:
+
+| quantity | trees `aa62a433` / `6014921` / `0c92b066` | tree `14ee92ca` |
+|---|---|---|
+| java+scala files | 211 / 211 / 211 | 211 |
+| census lines | 35932 / 35932 / 35932 | 35932 |
+| testFixtures lines | 872 / 872 / 872 | 872 |
+| git-tracked `server-common` files | — / 212 / 212 | 212 |
+| ratio T/A | 0.4507 across all three | 0.4507 (16195/35932) |
+| public-method count | 825 / 825 / 825 | 825 |
+| sanity `KafkaProducer.java` line count | 26 / 22 (local tree drift) / 26 | 26 |
+| import profile (main) | — / 175/30/16 / 175/30/16 | 175/30/16 |
+| depends_on (`clients`) | 1 module / 16 statements / 16 statements | 16 statements |
+| dependency spot (metadata/storage/raft/shell/server) | — / 79/45/38/1/70 / same | 79/45/38/1/70 |
+| `:server-common` block span | — / 2410–2477 / 2410–2477 | 2410–2477 |
+| build/settings/dependencies line counts | — / 4451/144/240 / same | 4451/144/240 |
+| `settings.gradle` include line | — / 98 / 98 | 98 |
+| `gradle.properties` group/version/scala | — / 16-18 / 16-18 | 16-18 |
+| wrapper | — / 9.8.2 / 9.8.2 | 9.8.2 |
+| checkstyle `import-control-server-common.xml` | — / present / present | present |
+| entry `MetadataVersion.java:47` | `public enum MetadataVersion {` | same |
+| largest file `PersisterStateManager` | 1842 / 1842 / 1842 | 1842 |
+
+Risk 2's caveat (re-derive the block span with grep at the actual cut pin) and
+the fail-closed pin policy stay in force unchanged.

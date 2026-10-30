@@ -191,3 +191,30 @@ Fail-closed: any gate failure → no push, report blocked with raw output.
    server-common additionally consumes `clients` as an `api` dependency, so its
    cut expects the clients cut (or the published `kafka-clients` artifact) as
    input.
+
+## 8. Re-verification at a later upstream pin
+
+After this plan was written, the cheap gates were re-run unchanged against a
+newer trunk pin, `14ee92ca1ecf469eb8f006abf7b75453513cac49` ("KAFKA-21230:
+Pause task executors on byte limit (#23984)", one commit after the statistics
+tree `0c92b066`). `git diff --stat 0c92b066..HEAD -- clients` is empty — no
+`clients/` file changed between the two trees — so the numbers below were
+re-measured on a tree where the module is byte-identical to the certified one.
+
+| gate | expected (section 6) | re-measured at `14ee92ca` | result |
+|---|---|---|---|
+| G2 census | files=1879 ∧ loc=387364 | 1879 / 387364 | match |
+| G3 ratio | 0.4805 (T/A) | T=186128, A=387364 → 0.4805 | match |
+| G4 public-method count | ≈6928 ± drift | 6928 | match |
+| G5 dependencies | ∅ (leaf) | package roots `clients`(683)/`common`(5038)/`server`(5) — all owned by clients | match |
+| testFixtures lines | 7880 | 7880 | match |
+| entry | `KafkaProducer.java:251` | 251, verbatim | match |
+| file breakdown | src/main 1562 · src/test 497 · testFixtures 35 tracked (487+35 java); message JSON 204+6 | identical | match |
+| build anchors | `:generator` 2019 · `:test-common-util` 1731 · `:clients` 2038 · `:clients:clients-integration-tests` 2246; settings include 76; 4451/144/240 lines; wrapper 9.8.2 | identical | match |
+| license | LICENSE + NOTICE present | present | match |
+
+The earlier public-method reference of 7,031 (at the extracts pin `aa62a433`)
+differs by tree drift only — 6,928 reproduces exactly on two independent trees
+— and both sit far above the ≥200 threshold. Risk 1 and risk 2 keep their full
+force: the block-line coincidence holds at this pin, not forever, and the
+re-derivation step in section 5 stays mandatory at the actual cut pin.

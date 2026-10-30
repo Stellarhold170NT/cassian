@@ -132,3 +132,11 @@ sizes, extract locations) are in [`matrix/matrix.csv`](../../matrix/matrix.csv).
 universe (statistics measured as noted above). Every module is extracted
 verbatim under `modules/kafka/<module>/` with a `PROVENANCE.md` recording the
 upstream pin, path, license, and measured size.
+
+**Measurement-scope note (m02).** The `m02 streams` size (338,869 lines) comes
+from the module census but could not be reproduced by either independent
+measurement scope at the statistics commit (source-only: 1,270 files /
+338,649 lines; all files: 1,273 / 338,913 lines). Treat that one cell as
+approximate pending a census re-certification; the other sizes come from the
+same census and were machine-checked against the rating records and extract
+provenance.
