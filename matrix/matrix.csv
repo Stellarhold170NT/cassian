@@ -72,3 +72,4 @@ m04,cmd/csweb,cmd/csweb,286,1,index;regexp,,modules/codesearch/cmd/csweb,yes,doc
 m05,index,index,4366,5,sparse,cmd/cindex;cmd/csearch;cmd/csweb,modules/codesearch/index,yes,docs/codesearch/02-module-map.md#m05-index
 m06,regexp,regexp,1417,4,sparse,cmd/cgrep;cmd/csearch;cmd/csweb,modules/codesearch/regexp,yes,docs/codesearch/02-module-map.md#m06-regexp
 m07,sparse,sparse,65,1,,index;regexp,modules/codesearch/sparse,yes,docs/codesearch/02-module-map.md#m07-sparse
+m01,com.google.common.jimfs,jimfs/src/main/java/com/google/common/jimfs,12468,5,,,modules/jimfs/com.google.common.jimfs,yes,docs/jimfs/02-module-map.md#m01-comgooglecommonjimfs
