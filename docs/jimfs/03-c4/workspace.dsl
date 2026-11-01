@@ -1,7 +1,7 @@
-// JimFS - C4 model (goldmine-jimfs, stream A / gm-03)
-// Source of truth: google/jimfs @ PIN 8fa098e0715aa492914285312c07e151d2aace4d (branch master)
+// JimFS - C4 model
+// Source of truth: google/jimfs @ 8fa098e0715aa492914285312c07e151d2aace4d (branch master)
 // Every element/relationship below carries a "// evidence:" pointer verified on a shallow
-// clone of that PIN. Paths are repo-relative; main-package files live in
+// clone of that commit. Paths are repo-relative; main-package files live in
 // jimfs/src/main/java/com/google/common/jimfs/ (one flat package, 62 files).
 
 workspace "JimFS" "C4 model of google/jimfs - an in-memory implementation of the Java java.nio.file (NIO2) file system API, shipped as com.google.jimfs:jimfs." {
@@ -87,10 +87,10 @@ workspace "JimFS" "C4 model of google/jimfs - an in-memory implementation of the
       }
     }
 
-    // evidence: SystemJimfsFileSystemProvider.java:63 (extends java.nio.file.FileSystemProvider); gm-02 deps_out: 188 plain + 23 static java.nio.file imports
+    // evidence: SystemJimfsFileSystemProvider.java:63 (extends java.nio.file.FileSystemProvider); measured import counts: 188 plain + 23 static java.nio.file imports
     jdk = softwareSystem "JDK java.nio.file (NIO2)" "JDK NIO2 API and FileSystemProvider SPI that JimFS implements and plugs into"
 
-    // evidence: jimfs/pom.xml:41-42 (dependency com.google.guava:guava); gm-02: 176 cross-boundary Guava imports
+    // evidence: jimfs/pom.xml:41-42 (dependency com.google.guava:guava); measured import counts: 176 cross-boundary Guava imports
     guava = softwareSystem "Guava" "Google core libraries used across the implementation"
 
     // evidence: PathNormalization.java:21 (import com.ibm.icu.lang.UCharacter), :71-72 (CASE_FOLD_UNICODE javadoc + enum constant), :80 (requires ICU4J guard)
@@ -104,9 +104,9 @@ workspace "JimFS" "C4 model of google/jimfs - an in-memory implementation of the
     app -> jimfs "Reads and writes files through the returned java.nio.file.FileSystem"
     // evidence: SystemJimfsFileSystemProvider.java:62 (@AutoService(FileSystemProvider.class) - ServiceLoader metadata generated at build)
     jdk -> jimfs "Discovers the system FileSystemProvider via ServiceLoader"
-    // evidence: gm-02 deps_out (188 plain + 23 static java.nio.file imports); JimfsFileSystem.java:284 (returns JDK WatchService)
+    // evidence: measured import counts (188 plain + 23 static java.nio.file imports); JimfsFileSystem.java:284 (returns JDK WatchService)
     jimfs -> jdk "Implements NIO2 API and SPI types (FileSystem, FileSystemProvider, WatchService, channels)"
-    // evidence: jimfs/pom.xml:41-42; gm-02 deps_out (176 cross-boundary Guava imports)
+    // evidence: jimfs/pom.xml:41-42; measured import counts (176 cross-boundary Guava imports)
     jimfs -> guava "Uses Guava base and collections"
     // evidence: PathNormalization.java:21/:71-72/:80
     jimfs -> icu "Optional Unicode case folding (CASE_FOLD_UNICODE)"
