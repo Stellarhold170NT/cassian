@@ -65,3 +65,10 @@ m63,streams/upgrade-system-tests-20,streams/upgrade-system-tests-20/src,221,1,st
 m64,streams/upgrade-system-tests-21,streams/upgrade-system-tests-21/src,221,1,streams;clients,,modules/kafka/streams/upgrade-system-tests-21,yes,docs/kafka/02-module-map.md#streams-upgrade-system-tests-family
 m65,streams/upgrade-system-tests-0110,streams/upgrade-system-tests-0110/src,180,1,streams;clients,,modules/kafka/streams/upgrade-system-tests-0110,yes,docs/kafka/02-module-map.md#streams-upgrade-system-tests-family
 m66,mirror-coordinator,mirror-coordinator/src,110,1,clients,server,modules/kafka/mirror-coordinator,yes,docs/kafka/02-module-map.md#m66-mirror-coordinator
+m01,cmd/cgrep,cmd/cgrep,79,1,regexp,,modules/codesearch/cmd/cgrep,yes,docs/codesearch/02-module-map.md#m01-cmd-cgrep
+m02,cmd/cindex,cmd/cindex,195,1,index,,modules/codesearch/cmd/cindex,yes,docs/codesearch/02-module-map.md#m02-cmd-cindex
+m03,cmd/csearch,cmd/csearch,200,1,index;regexp,,modules/codesearch/cmd/csearch,yes,docs/codesearch/02-module-map.md#m03-cmd-csearch
+m04,cmd/csweb,cmd/csweb,286,1,index;regexp,,modules/codesearch/cmd/csweb,yes,docs/codesearch/02-module-map.md#m04-cmd-csweb
+m05,index,index,4366,5,sparse,cmd/cindex;cmd/csearch;cmd/csweb,modules/codesearch/index,yes,docs/codesearch/02-module-map.md#m05-index
+m06,regexp,regexp,1417,4,sparse,cmd/cgrep;cmd/csearch;cmd/csweb,modules/codesearch/regexp,yes,docs/codesearch/02-module-map.md#m06-regexp
+m07,sparse,sparse,65,1,,index;regexp,modules/codesearch/sparse,yes,docs/codesearch/02-module-map.md#m07-sparse

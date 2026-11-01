@@ -1,0 +1,180 @@
+%% diagrams.mmd — Mermaid fallback (L1/L2/L3) for the C4 model of google/codesearch
+%% Upstream tree: github.com/google/codesearch @ 74a12a911a79b901d1158c48d011b2da1b090fc9 (master)
+%% Source of truth for the model: workspace.dsl (same directory) — the two files model
+%% the same elements and edges 1:1. Diagrams are separated by --- per Mermaid
+%% multi-diagram docs. Every element and edge is followed by a %% evidence: line with a
+%% grep-verified file:line in the pinned tree. Elements without evidence are not modeled.
+
+flowchart LR
+
+    developer(["Person: Developer"])
+    webUser(["Person: Web User"])
+    codeSearch["Software System: Code Search (cindex / csearch / cgrep / csweb)"]
+    fileSystem["External System: Local File System (source trees)"]
+    indexFile["External System: Trigram Index File ($CSEARCHINDEX or $HOME/.csearchindex)"]
+    zipArchives["External System: Zip Archives"]
+
+    developer -->|CLI: build + search| codeSearch
+    %% evidence: cmd/cindex/cindex.go:19; cmd/csearch/csearch.go:21; cmd/cgrep/cgrep.go:17
+    webUser -->|HTTP localhost:2473| codeSearch
+    %% evidence: cmd/csweb/web.go:36
+    codeSearch -->|read source files to index and grep| fileSystem
+    %% evidence: cmd/cindex/cindex.go:142; cmd/csearch/csearch.go:153; cmd/csweb/web.go:113; cmd/cgrep/cgrep.go:70
+    codeSearch -->|write/merge + open/query index| indexFile
+    %% evidence: cmd/cindex/cindex.go:166,170; cmd/csearch/csearch.go:112; cmd/csweb/web.go:78; index/read.go:667
+    codeSearch -->|search .zip members| zipArchives
+    %% evidence: cmd/csearch/csearch.go:163; cmd/csweb/web.go:123
+
+    classDef person fill:#08427b,stroke:#052e56,color:#fff;
+    classDef system fill:#1168bd,stroke:#0b4884,color:#fff;
+    classDef external fill:#999999,stroke:#8a8a8a,color:#fff;
+    class developer,webUser person;
+    class codeSearch system;
+    class fileSystem,indexFile,zipArchives external;
+
+---
+
+flowchart TB
+
+    developer(["Person: Developer"])
+    webUser(["Person: Web User"])
+    fileSystem["External System: Local File System"]
+    indexFile["External System: Trigram Index File"]
+    zipArchives["External System: Zip Archives"]
+
+    subgraph codeSearch["Software System: Code Search"]
+        cindex["Container: cindex (Go CLI) - builds/updates trigram index"]
+        csearch["Container: csearch (Go CLI) - grep over the index"]
+        cgrep["Container: cgrep (Go CLI) - index-free grep"]
+        csweb["Container: csweb (Go + net/http + go:embed) - web UI on localhost:2473"]
+        indexEngine["Container: index engine (Go library) - trigram index read/write/merge/query"]
+        regexpEngine["Container: regexp engine (Go library) - byte-program DFA + Grep driver"]
+        sparseSet["Container: sparse set (Go library) - O(1) uint32 set"]
+    end
+
+    developer -->|CLI| cindex
+    %% evidence: cmd/cindex/cindex.go:19
+    developer -->|CLI| csearch
+    %% evidence: cmd/csearch/csearch.go:21
+    developer -->|CLI| cgrep
+    %% evidence: cmd/cgrep/cgrep.go:17
+    webUser -->|HTTP| csweb
+    %% evidence: cmd/csweb/web.go:36
+
+    cindex -->|Create/AddRoots/AddFile/Flush/Merge| indexEngine
+    %% evidence: cmd/cindex/cindex.go:16,139,157,166,170
+    cindex -->|filepath.Walk| fileSystem
+    %% evidence: cmd/cindex/cindex.go:142
+    cindex -->|rename merged index over master| indexFile
+    %% evidence: cmd/cindex/cindex.go:170; index/read.go:666-668
+
+    csearch -->|RegexpQuery + Open + PostingQuery| indexEngine
+    %% evidence: cmd/csearch/csearch.go:17,107,112,116-118
+    csearch -->|regexp.Grep over candidates| regexpEngine
+    %% evidence: cmd/csearch/csearch.go:18,64,150,180,187
+    csearch -->|os.Open matched files| fileSystem
+    %% evidence: cmd/csearch/csearch.go:153
+    csearch -->|zip.OpenReader| zipArchives
+    %% evidence: cmd/csearch/csearch.go:163
+
+    csweb -->|RegexpQuery + Open + PostingQuery| indexEngine
+    %% evidence: cmd/csweb/web.go:24,72,78,80
+    csweb -->|regexp.Grep HTML output| regexpEngine
+    %% evidence: cmd/csweb/web.go:25,49
+    csweb -->|os.Open files| fileSystem
+    %% evidence: cmd/csweb/web.go:113
+    csweb -->|zip.OpenReader| zipArchives
+    %% evidence: cmd/csweb/web.go:123
+
+    cgrep -->|regexp.Grep stdin/files| regexpEngine
+    %% evidence: cmd/cgrep/cgrep.go:14,70
+
+    indexEngine -->|sparse.NewSet trigram set| sparseSet
+    %% evidence: index/write.go:19,72
+    regexpEngine -->|sparse.Set instruction queues| sparseSet
+    %% evidence: regexp/match.go:20,34,151,161,191
+    indexEngine -->|mmap read / buffered write / merge| indexFile
+    %% evidence: index/read.go:197; index/write.go:70; index/merge.go:51
+
+---
+
+flowchart TB
+
+    subgraph indexEngine["Container: index engine"]
+        indexWriter["Component: IndexWriter - external-memory builder, 64MB flush chunks"]
+        indexReader["Component: Index reader - mmap Open + posting queries"]
+        regexpQueryPlanner["Component: RegexpQuery planner - regexp to conservative trigram Query"]
+        indexMerger["Component: Index merger - Merge(dst, src1, src2)"]
+        pathCodec["Component: Path codec - prefix-compressed names"]
+        deltaCodec["Component: Delta codec - gamma-coded deltas"]
+        indexChecker["Component: Index checker - Check integrity"]
+        mmapWrapper["Component: mmap wrapper - mmap_linux/bsd/windows"]
+    end
+
+    sparseSetExt["Container: sparse set"]
+    indexFileExt["External System: Trigram Index File"]
+
+    indexWriter -->|NewPathWriter / Path.Write| pathCodec
+    %% evidence: index/write.go:49,81,287,388
+    indexWriter -->|deltaWriter| deltaCodec
+    %% evidence: index/write.go:832
+    indexWriter -->|sparse.NewSet 1<<24| sparseSetExt
+    %% evidence: index/write.go:72
+    indexMerger -->|names.Path| pathCodec
+    %% evidence: index/merge.go:60-61
+    indexReader -->|mmap| mmapWrapper
+    %% evidence: index/read.go:197
+    indexReader -->|PostingQuery interprets Query| regexpQueryPlanner
+    %% evidence: index/read.go:561; index/regexp.go:333
+    indexEngine -->|read/write/merge index file| indexFileExt
+    %% evidence: index/read.go:197; index/write.go:70; index/merge.go:51
+
+---
+
+flowchart TB
+
+    subgraph regexpEngine["Container: regexp engine"]
+        regexpApi["Component: Regexp API - Compile(expr)"]
+        byteProgCompiler["Component: Byte-program compiler - toByteProg"]
+        dfaMatcher["Component: DFA matcher - dstate cache, match/matchString"]
+        grepDriver["Component: Grep driver - line-oriented grep, HTML, flags L/C/N/H/V"]
+        syntaxUtils["Component: Syntax utilities - cleanClass/appendRange/progString"]
+    end
+
+    sparseSetExt2["Container: sparse set"]
+
+    regexpApi -->|toByteProg| byteProgCompiler
+    %% evidence: regexp/regexp.go:40
+    regexpApi -->|r.m.init| dfaMatcher
+    %% evidence: regexp/regexp.go:47
+    dfaMatcher -->|sparse.Set queues| sparseSetExt2
+    %% evidence: regexp/match.go:34,151,161,191
+    grepDriver -->|per-line matching via Regexp matcher| dfaMatcher
+    %% evidence: regexp/match.go:356; regexp/regexp.go:47
+
+---
+
+flowchart TB
+
+    subgraph cswebContainer["Container: csweb"]
+        httpServer["Component: HTTP server bootstrap - routes /, /_static/, /show/, listen localhost:2473"]
+        homeHandler["Component: home handler (search) - q + f, index query, HTML grep"]
+        showHandler["Component: show handler (viewer) - line-numbered file/dir HTML"]
+        staticAssets["Component: static assets - go:embed _static viewer.js/viewer.css"]
+    end
+
+    indexEngineExt["Container: index engine"]
+    regexpEngineExt["Container: regexp engine"]
+    fileSystemExt["External System: Local File System"]
+    zipArchivesExt["External System: Zip Archives"]
+
+    homeHandler -->|RegexpQuery + Open + PostingQuery| indexEngineExt
+    %% evidence: cmd/csweb/web.go:72,78,80
+    homeHandler -->|regexp.Grep HTML:true| regexpEngineExt
+    %% evidence: cmd/csweb/web.go:49
+    homeHandler -->|os.Open| fileSystemExt
+    %% evidence: cmd/csweb/web.go:113
+    homeHandler -->|zip.OpenReader| zipArchivesExt
+    %% evidence: cmd/csweb/web.go:123
+    httpServer -->|serve /_static/ from embedded FS| staticAssets
+    %% evidence: cmd/csweb/web.go:34,39
