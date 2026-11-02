@@ -1,0 +1,304 @@
+%% diagrams.mmd — Mermaid fallback (L1/L2/L3) for the C4 model of google/mtail
+%% Subject: mtail | PIN: 4c7e0e1174ac1ead032efe28d86428bbbe0ae145 (branch main)
+%% Source of truth for the model: reports/mtail/workspace.dsl (Structurizr DSL).
+%% NOTE: not validated with structurizr-cli (no java/structurizr-cli in sandbox) —
+%% validate: SKIPPED (tool missing). Diagrams separated by --- per Mermaid multi-diagram docs.
+%% Every element and edge is followed by a %% evidence: line with a grep-verified file:line
+%% in the pinned clone. Elements without evidence are not modeled.
+
+flowchart LR
+
+    operator(["Person: Operator"])
+    mtailSystem["Software System: mtail (extract metrics from logs via .mtail programs)"]
+    scraper["External System: Prometheus-compatible scraper"]
+    pushTargets["External System: Push TSDB targets (Graphite/StatsD/CollectD)"]
+    logSources["External System: Log Sources (files, fifos, sockets, stdin)"]
+    programFiles["External System: Program Files (.mtail sources)"]
+
+    operator -->|CLI: run mtail| mtailSystem
+    %% evidence: cmd/mtail/main.go:41,44,89,102
+    scraper -->|HTTP pull /metrics + debug pages| mtailSystem
+    %% evidence: internal/mtail/mtail.go:107,117,119,120,123
+    mtailSystem -->|tail files/fifos/sockets/stdin| logSources
+    %% evidence: internal/tailer/tail.go:186,289; internal/tailer/logstream/logstream.go:75-112
+    mtailSystem -->|load .mtail programs; reload on SIGHUP| programFiles
+    %% evidence: internal/runtime/runtime.go:49,104,319-331,334
+    mtailSystem -->|push metrics per interval| pushTargets
+    %% evidence: internal/exporter/export.go:115-123,212-216,234
+
+    classDef person fill:#08427b,stroke:#052e56,color:#fff;
+    classDef system fill:#1168bd,stroke:#0b4884,color:#fff;
+    classDef external fill:#999999,stroke:#8a8a8a,color:#fff;
+    class operator person;
+    class mtailSystem system;
+    class scraper,pushTargets,logSources,programFiles external;
+
+---
+
+flowchart TB
+
+    operator(["Person: Operator"])
+    scraper["External System: Prometheus-compatible scraper"]
+    pushTargets["External System: Push TSDB targets"]
+    logSources["External System: Log Sources"]
+    programFiles["External System: Program Files"]
+
+    subgraph mtailSystem["Software System: mtail"]
+        mtailCli["Container: mtail (cmd/mtail, Go CLI) - entry binary, ~40 flags, one_shot dump"]
+        mdot["Container: mdot (cmd/mdot, Go CLI) - .mtail program to graphviz dot/SVG"]
+        mgen["Container: mgen (cmd/mgen, Go CLI) - random program generator for fuzzing"]
+        mfmt["Container: mfmt (cmd/mfmt, Go CLI) - program formatter"]
+        server["Container: mtail server (internal/mtail, Go library) - orchestration hub + HTTP status"]
+        runtimeC["Container: program runtime (internal/runtime, Go library) - loads/compiles/runs programs"]
+        compiler["Container: compiler (internal/runtime/compiler, Go library) - programs to bytecode"]
+        vm["Container: bytecode VM (internal/runtime/vm, Go library) - interprets code.Object"]
+        bytecode["Container: bytecode (internal/runtime/code, Go library) - Opcode/Instr/Object contract"]
+        tailer["Container: tailer (internal/tailer, Go library) - glob polling, spawns LogStreams"]
+        logstream["Container: logstream (internal/tailer/logstream, Go library) - pathname to LogLine stream"]
+        exporter["Container: exporter (internal/exporter, Go library) - Prometheus/varz/push export"]
+        metricsStore["Container: metrics store (internal/metrics, Go library) - central Store"]
+        datum["Container: metric datum (internal/metrics/datum, Go library) - Datum value types"]
+        logline["Container: logline (internal/logline, Go library) - LogLine struct"]
+        waker["Container: waker (internal/waker, Go library) - Waker interface"]
+        testutil["Container: testutil (internal/testutil, Go test library) - shared test helpers"]
+        golden["Container: golden (internal/mtail/golden, Go test library) - golden-file reader"]
+    end
+
+    operator -->|CLI| mtailCli
+    %% evidence: cmd/mtail/main.go:102
+    operator -->|CLI| mdot
+    %% evidence: cmd/mdot/main.go:134,154
+    operator -->|CLI| mgen
+    %% evidence: cmd/mgen/main.go:4,144
+    operator -->|CLI| mfmt
+    %% evidence: cmd/mfmt/main.go:25
+    scraper -->|HTTP| server
+    %% evidence: internal/mtail/mtail.go:107,117,119,120,123
+
+    mtailCli -->|mtail.New + m.Run| server
+    %% evidence: cmd/mtail/main.go:20,232,238
+    mtailCli -->|exporter.Option mapping| exporter
+    %% evidence: cmd/mtail/main.go:18,50-51
+    mtailCli -->|metrics.NewStore| metricsStore
+    %% evidence: cmd/mtail/main.go:19
+    mtailCli -->|waker.Option mapping| waker
+    %% evidence: cmd/mtail/main.go:21
+    mdot -->|mtail.FaviconHandler| server
+    %% evidence: cmd/mdot/main.go:32
+    mdot -->|Parse/Check/Walk| compiler
+    %% evidence: cmd/mdot/main.go:33-35,139,143,149
+    mgen -->|parser.Dictionary| compiler
+    %% evidence: cmd/mgen/main.go:12,139
+    mfmt -->|Parse/Check/Unparse| compiler
+    %% evidence: cmd/mfmt/main.go:16-17,36,40,44
+
+    server -->|initRuntime: runtime.New| runtimeC
+    %% evidence: internal/mtail/mtail.go:20,65-66
+    server -->|initExporter: exporter.New| exporter
+    %% evidence: internal/mtail/mtail.go:17,71-72
+    server -->|initTailer: tailer.New| tailer
+    %% evidence: internal/mtail/mtail.go:21,90-91
+    server -->|holds *metrics.Store| metricsStore
+    %% evidence: internal/mtail/mtail.go:19,178
+    server -->|lines chan| logline
+    %% evidence: internal/mtail/mtail.go:18,179
+    server -->|test helpers| datum
+    %% evidence: internal/mtail/testing.go:17
+    server -->|TestServer helpers| testutil
+    %% evidence: internal/mtail/testing.go:18
+    server -->|poll waker option| waker
+    %% evidence: internal/mtail/options.go:17, testing.go:19
+
+    runtimeC -->|compiler.New| compiler
+    %% evidence: internal/runtime/runtime.go:25,270
+    runtimeC -->|vm.New| vm
+    %% evidence: internal/runtime/runtime.go:26,167
+    runtimeC -->|store *metrics.Store| metricsStore
+    %% evidence: internal/runtime/runtime.go:24,250
+    runtimeC -->|lines channel| logline
+    %% evidence: internal/runtime/runtime.go:23,250
+
+    compiler -->|metrics.NewMetric| metricsStore
+    %% evidence: codegen.go:13, checker.go:13, parser.go:15, sexp.go:11, unparser.go:11, ast.go:10
+    compiler -->|datum constructors| datum
+    %% evidence: codegen.go:14
+    compiler -->|produces *code.Object| bytecode
+    %% evidence: compiler.go:11, codegen.go:15
+
+    vm -->|ProcessLogLine| logline
+    %% evidence: vm.go:24,962
+    vm -->|updates *metrics.Metric| metricsStore
+    %% evidence: vm.go:25
+    vm -->|datum updates| datum
+    %% evidence: vm.go:26
+    vm -->|fetch-decode-execute| bytecode
+    %% evidence: vm.go:27,993
+
+    bytecode -->|Object.Metrics| metricsStore
+    %% evidence: object.go:9,13
+
+    tailer -->|TailPath spawns LogStream| logstream
+    %% evidence: tail.go:21,256-286
+    tailer -->|lines channel| logline
+    %% evidence: tail.go:20
+    tailer -->|poll waker| waker
+    %% evidence: tail.go:22
+    tailer -->|AddPattern + pollLogPattern| logSources
+    %% evidence: tail.go:186,289
+
+    logstream -->|emits LogLine| logline
+    %% evidence: logstream.go:21
+    logstream -->|Wake when idle| waker
+    %% evidence: logstream.go:22
+    logstream -->|file/fifo/socket/stdin readers| logSources
+    %% evidence: logstream.go:75-112
+
+    exporter -->|reads Store| metricsStore
+    %% evidence: export.go:22,91; prometheus.go:31,36
+    exporter -->|datum formatting| datum
+    %% evidence: prometheus.go:14, graphite.go:16
+    exporter -->|metric push| pushTargets
+    %% evidence: export.go:115-123,234
+
+    metricsStore -->|Metric values are Datum| datum
+    %% evidence: metric.go:18
+    testutil -->|OpenLogFile| logline
+    %% evidence: lines.go:10
+    golden -->|MetricSlice| metricsStore
+    %% evidence: reader.go:16
+    golden -->|datum constructors| datum
+    %% evidence: reader.go:17
+    runtimeC -->|reads .mtail sources| programFiles
+    %% evidence: runtime.go:49,104,319-331
+
+    classDef person fill:#08427b,stroke:#052e56,color:#fff;
+    classDef systembox fill:#1168bd,stroke:#0b4884,color:#fff;
+    classDef external fill:#999999,stroke:#8a8a8a,color:#fff;
+    classDef container fill:#438dd5,stroke:#3c7fc0,color:#fff;
+    class operator person;
+    class scraper,pushTargets,logSources,programFiles external;
+    class mtailCli,mdot,mgen,mfmt,server,runtimeC,compiler,vm,bytecode,tailer,logstream,exporter,metricsStore,datum,logline,waker,testutil,golden container;
+
+---
+
+flowchart TB
+
+    subgraph compiler["Container: compiler (internal/runtime/compiler)"]
+        compPipeline["Component: Compiler pipeline - Compile() phases"]
+        compParser["Component: Parser - Parse to ast.Node (goyacc)"]
+        compAst["Component: AST - Node tree + Walk visitor"]
+        compChecker["Component: Type checker - Check typed AST"]
+        compCodegen["Component: Code generator - CodeGen to code.Object"]
+        compOpt["Component: Optimiser - Optimise (run twice)"]
+        compSymbol["Component: Symbol table - Symbol entries"]
+        compTypes["Component: Type algebra - Type interface"]
+        compPosition["Component: Positions - Position struct"]
+        compErrors["Component: Compile errors - ErrorList"]
+    end
+
+    compPipeline -->|parser.Parse| compParser
+    %% evidence: compiler.go:94
+    compPipeline -->|opt.Optimise x2| compOpt
+    %% evidence: compiler.go:104,125
+    compPipeline -->|checker.Check| compChecker
+    %% evidence: compiler.go:114
+    compPipeline -->|codegen.CodeGen| compCodegen
+    %% evidence: compiler.go:136
+    compParser -->|returns ast.Node| compAst
+    %% evidence: parser/driver.go:27,34
+    compParser -->|token positions| compPosition
+    %% evidence: parser/lexer.go:16, tokens.go:9
+    compParser -->|error accumulation| compErrors
+    %% evidence: parser/driver.go:28
+    compChecker -->|walks AST| compAst
+    %% evidence: checker/checker.go:14
+    compChecker -->|symbol resolution| compSymbol
+    %% evidence: checker/checker.go:17
+    compChecker -->|type assignment| compTypes
+    %% evidence: checker/checker.go:18
+    compCodegen -->|reads symbol table| compSymbol
+    %% evidence: codegen/codegen.go:20
+    compCodegen -->|reads types| compTypes
+    %% evidence: codegen/codegen.go:21
+    compCodegen -->|source lines| compPosition
+    %% evidence: codegen/codegen.go:19
+    compOpt -->|rewrites nodes| compAst
+    %% evidence: opt/opt.go:10
+    compAst -->|node symbols| compSymbol
+    %% evidence: ast/ast.go:12
+    compAst -->|node types| compTypes
+    %% evidence: ast/ast.go:13
+    compAst -->|node positions| compPosition
+    %% evidence: ast/ast.go:11
+    compSymbol -->|symbols carry types| compTypes
+    %% evidence: symbol/symtab.go:11
+    compErrors -->|errors reference positions| compPosition
+    %% evidence: errors/errors.go:10
+
+    classDef container fill:#438dd5,stroke:#3c7fc0,color:#fff;
+    classDef component fill:#85bbf0,stroke:#5d82a8,color:#000;
+    class compPipeline,compParser,compAst,compChecker,compCodegen,compOpt,compSymbol,compTypes,compPosition,compErrors component;
+
+---
+
+flowchart TB
+
+    subgraph server["Container: mtail server (internal/mtail)"]
+        srvCore["Component: Server core - struct/New/Run"]
+        srvWiring["Component: Sub-system init - initRuntime/initExporter/initTailer/initHTTPServer"]
+        srvOptions["Component: Option layer - Option interface + SetOption"]
+        srvHttp["Component: HTTP status server - /, /metrics, /debug/vars, /progz, zpages"]
+        srvTest["Component: TestServer harness - integration test wrapper"]
+    end
+    runtimeC["Container: program runtime"]
+    exporter["Container: exporter"]
+    tailer["Container: tailer"]
+
+    srvCore -->|New calls init steps| srvWiring
+    %% evidence: mtail.go:209,213,216,220
+    srvWiring -->|runtime.New| runtimeC
+    %% evidence: mtail.go:66
+    srvWiring -->|exporter.New| exporter
+    %% evidence: mtail.go:72
+    srvWiring -->|tailer.New| tailer
+    %% evidence: mtail.go:91
+    srvOptions -->|SetOption| srvCore
+    %% evidence: mtail.go:227; options.go:22
+
+    classDef container fill:#438dd5,stroke:#3c7fc0,color:#fff;
+    classDef component fill:#85bbf0,stroke:#5d82a8,color:#000;
+    class srvCore,srvWiring,srvOptions,srvHttp,srvTest component;
+    class runtimeC,exporter,tailer container;
+
+---
+
+flowchart TB
+
+    subgraph runtimeC["Container: program runtime (internal/runtime)"]
+        rtLoader["Component: Program loader - LoadAllPrograms/LoadProgram"]
+        rtBridge["Component: Compile-and-run bridge - CompileAndRun"]
+        rtHandles["Component: VM handle registry - handles map + UnloadProgram"]
+        rtReload["Component: Reload controller - SIGHUP goroutine"]
+        rtStatus["Component: Prog status page - ProgzHandler"]
+        rtOptions["Component: Runtime options - CompileOnly/Dump*/..."]
+    end
+    compiler["Container: compiler"]
+    vm["Container: bytecode VM"]
+
+    rtLoader -->|LoadProgram calls CompileAndRun| rtBridge
+    %% evidence: runtime.go:126
+    rtReload -->|LoadAllPrograms| rtLoader
+    %% evidence: runtime.go:327,334
+    rtBridge -->|r.c.Compile| compiler
+    %% evidence: runtime.go:158
+    rtBridge -->|vm.New| vm
+    %% evidence: runtime.go:167
+    rtBridge -->|registers vmHandle| rtHandles
+    %% evidence: runtime.go:200
+    rtOptions -->|dumpBytecode read in CompileAndRun| rtBridge
+    %% evidence: runtime.go:172; options.go:58
+
+    classDef container fill:#438dd5,stroke:#3c7fc0,color:#fff;
+    classDef component fill:#85bbf0,stroke:#5d82a8,color:#000;
+    class rtLoader,rtBridge,rtHandles,rtReload,rtStatus,rtOptions component;
+    class compiler,vm container;
