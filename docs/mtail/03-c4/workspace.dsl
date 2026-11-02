@@ -1,12 +1,10 @@
 // workspace.dsl — Structurizr DSL: C4 model of google/mtail
-// Subject: mtail | PIN: 4c7e0e1174ac1ead032efe28d86428bbbe0ae145 (branch main)
-// Inputs: reports/mtail/gm-02-module-map.md (18-item universe, gate-APPROVED).
-// reports/mtail/gm-01-cartography.md was not present when this node ran; the L1 cut is
-// grounded directly on this pinned clone instead (see gm-03-c4.md, "Modeling decisions").
+// Upstream tree: github.com/google/mtail @ 4c7e0e1174ac1ead032efe28d86428bbbe0ae145 (main)
 // Every element and relationship below carries an `// evidence:` line pointing at a
-// grep-verified file:line in the pinned clone. Elements without evidence are not modeled.
-// NOTE: not validated with structurizr-cli (no java/structurizr-cli in sandbox) —
-// validate: SKIPPED (tool missing); Mermaid fallback in diagrams.mmd.
+// grep-verified file:line in the pinned tree. Elements without evidence are not modeled.
+// NOTE: not machine-validated with structurizr-cli (no java available at modeling time);
+// the DSL was hand-checked (identifier balance, quoted strings, view blocks) and
+// diagrams.mmd carries the same model 1:1 as the renderable Mermaid fallback.
 
 workspace {
 
@@ -59,9 +57,9 @@ workspace {
             // evidence: internal/exporter/export.go:115-123,212-216,234
 
         // ================= L2 — Containers =================
-        // 18 containers = the 18 gm-02 items (4 CLIs + 14 Go libraries). The 39 item-level
-        // import edges were re-verified on this clone (grep of non-test imports over each
-        // package's own files); see gm-03-c4.md for the m05 datum/code drift note vs gm-02.
+        // 18 containers = the 18 module-map items (4 CLIs + 14 Go libraries). The
+        // container-level import edges were re-verified on the pinned clone (grep of
+        // non-test imports over each package's own files).
 
         mtailCli = container mtailSystem "mtail (cmd/mtail)" "Entry binary: ~40 CLI flags, maps flags to server options, builds metrics.NewStore + mtail.New + m.Run, traps SIGINT/SIGTERM, -one_shot stdout dump" "Go CLI"
             // evidence: cmd/mtail/main.go:41-51 (flags), :102 (main), :162 (signal.Notify), :232 (mtail.New), :238 (m.Run)

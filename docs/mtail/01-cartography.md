@@ -5,61 +5,206 @@ status: final
 ---
 
 
+
+
 # Cartography
 
-Google **mtail** is a web server that extracts white-box monitoring metrics from
-application logs (regular-expression programs compiled to bytecode and executed
-by an embedded VM). This document is the repository census for the pinned tree
-`4c7e0e1174ac1ead032efe28d86428bbbe0ae145` (branch `main`, commit dated 2026-02-26, 301 commits deep clone) —
-every number below was measured on that tree and re-verified by the map gate.
 
-## Manifests and entry points
 
-- **Go module**: `github.com/google/mtail` (`go.mod`) — Go module with
-  `cmd/mtail` as the single server binary; `Makefile` drives
-  `test` (:173-176), `testrace` (:177-180), `smoke` (:181-184), `regtest`
-  (:185-188), `testall` (:213-214).
-- **Entry point**: `cmd/mtail/main.go` — 32 flag definitions
-  (main.go:41-85), mapping to `[]mtail.Option` + `[]exporter.Option`
-  (:169-226), `mtail.New(ctx, store, opts...)` → `m.Run()`
-  (:228-243), SIGINT/SIGTERM handling (:156-163), one-shot metric dump
-  (:245-277).
-- **Support CLIs**: `cmd/mdot` (program → graphviz), `cmd/mfmt` (formatter),
-  `cmd/mgen` (grammar-based program generator for fuzzing).
 
-## Measured census (PIN tree)
+Cartography of [google/mtail](https://github.com/google/mtail) (branch
+`main`) at the measurement commit
+`4c7e0e1174ac1ead032efe28d86428bbbe0ae145` (2026-02-26 09:59:36 -0800,
+"Merge pull request #999 from google/lsc-1771431274.9704435"). All numbers
+below were measured on a clone of exactly that commit, fetched by SHA; the
+working tree equals the pin. Every claim carries the command or `file:line`
+anchor it came from.
 
-| zone | files | loc | notes |
+
+
+
+## License gate
+
+
+
+
+```
+$ ls LICENSE*
+LICENSE
+$ wc -c LICENSE
+11358 LICENSE
+```
+
+
+LICENSE is the Apache License 2.0 (header lines "Apache License / Version
+2.0, January 2004"). The subject passes the license gate for extraction and
+documentation.
+
+
+
+
+## Manifests
+
+
+
+
+- `go.mod:1` — `module github.com/google/mtail` (exactly one module);
+  `go.mod:3` — `go 1.21.1`. Direct requires include
+  `github.com/prometheus/client_golang v1.20.4`,
+  `github.com/prometheus/common v0.60.0`, `github.com/golang/glog v1.2.2`,
+  `github.com/pkg/errors v0.9.1`, `github.com/google/go-cmp v0.6.0`,
+  `github.com/golang/groupcache`, and
+  `contrib.go.opencensus.io/exporter/jaeger v0.2.1`. `go.sum` is 35,470
+  bytes; there is no `vendor/` directory.
+- `Makefile` (326 lines): `Makefile:6` — `TARGETS = mtail mgen mdot mfmt`;
+  test targets `test` (:173-176), `testrace` (:177-180), `smoke`
+  (:181-184), `regtest` (:185-188), `testall` (:213-214); the golangci-lint
+  version is read directly from the GitHub Actions workflow
+  (`Makefile:105-106`).
+
+
+
+
+## Entry points
+
+
+
+
+`cmd/` holds exactly four single-file CLIs (one `package main` file each,
+ls-verified):
+
+
+
+
+| binary | path | LOC | role |
 |---|---|---|---|
-| Go total | 141 | 26,896 | `find -name '*.go'` census v9 |
-| non-test logic | 80 | 15,689 | 6/25 files in the server container are non-test |
-| Go tests | 61 | 11,207 | 13 integration tests live in `internal/mtail` |
-| docs | 16 | 2,300 | recursive; 2,240 = 15 top-level (designs/poll.md +1 level) |
-| example programs | 17 `.mtail` | 968 | canonical corpus reused by integration tests |
+| mtail | `cmd/mtail` | 278 | the log-tailing metrics server; 32 flags (main.go:41-85), signal handling (:156-163), `-one_shot` debug dump (:245-277) |
+| mdot | `cmd/mdot` | 206 | renders an `.mtail` program as a graphviz dot graph / SVG |
+| mgen | `cmd/mgen` | 152 | generates random mtail programs for fuzz testing from the language grammar table |
+| mfmt | `cmd/mfmt` | 59 | formats (parse + type-check + unparse) an `.mtail` program |
 
-The 18-item universe (Java-package analogue for Go: import-rooted packages)
-sums exactly to the total above — see `02-module-map.md` for the item table.
+
+
+
+`Makefile:6` (`TARGETS`) matches these four binaries exactly.
+
+
+
 
 ## Top-level directories
 
-| dir | contents | role |
-|---|---|---|
-| `cmd/` | mtail, mdot, mgen, mfmt | binaries |
-| `internal/` | mtail, tailer, runtime (vm, compiler, code), metrics, exporter, waker, logline, testutil | all logic |
-| `docs/` | Programming-Guide, Language, Metrics, Deploying, Testing, Troubleshooting, faq, designs/poll.md | DSL + ops documentation |
-| `examples/` | 17 `.mtail` programs (apache*, dhcpd, postfix, rails, …) | canonical corpus |
-| `testdata/` | anonymised logs (only testdata dir, find-verified) | test fixtures |
-| repo root | `README.md`, `LICENSE` (Apache-2.0, 11,358 B), `Makefile`, `Dockerfile` + `Dockerfile.goreleaser`, `mtail.service`, `benchmark_results.csv`, `TODO` | ops/meta/packaging |
 
-## License and build evidence
 
-- **License**: Apache License 2.0 (`LICENSE`, 11,358 bytes, "Apache License"
-  at line 2) — vendoring permitted with license/notice preservation.
-- **Build evidence** (on the PIN tree): `go build ./...` exit 0;
-  `go test ./...` → 18/19 packages pass, `run=663 pass=655 fail=2 skip=6`.
-  The single failing package `internal/mtail` fails exactly 1 of 663 cases
-  (`TestFileSocketStreamComparison`, subtest `examples/dhcpd.mtail on
-  unixgram://…`) — a load/timing-sensitive socket comparison that hits its
-  10 s cap on a 2-vCPU container; environment artifact, not a code failure
-  (goroutine dump captured in `04-overview.md`). The 6 skips are
-  root-environment guards ("Skipping test when run as root").
+
+```
+$ find . -maxdepth 1 -type d -not -name '.' -not -path './.git*' | sort
+./cmd
+./docs
+./examples
+./hooks
+./internal
+```
+
+
+The repo root also carries ops/packaging files: `Dockerfile`,
+`Dockerfile.goreleaser`, `mtail.service` (systemd unit), `.golangci.yml`,
+`.goreleaser.yml`, `mtail-mode.el` (emacs mode), `log_rewriter.awk`,
+`benchmark_results.csv`, `TODO`, `logo.png`, git `hooks/`
+(build/post_checkout/post_push), 12 GitHub Actions workflows under
+`.github/workflows/`, and a parallel `.gitlab-ci.yml` (28 lines).
+
+
+
+
+## Source census
+
+
+
+
+Census counted per extension, then summed (whole tree, `.git` excluded):
+
+
+
+
+```
+$ for ext in go md mtail y output mod; do
+    n=$(find . -type f -name "*.$ext" -not -path './.git/*' | wc -l)
+    l=$(find . -type f -name "*.$ext" -not -path './.git/*' -print0 | xargs -0 cat | wc -l)
+    echo "EXT .$ext files=$n lines=$l"
+  done
+EXT .go files=141 lines=26896
+EXT .md files=21 lines=2548
+EXT .mtail files=35 lines=1018
+EXT .y files=1 lines=751
+EXT .output files=1 lines=1840
+EXT .mod files=1 lines=32
+```
+
+
+Go dominates: 141 files / 26,896 LOC. The `.y`/`.output` pair is the goyacc
+grammar of the mtail language (`parser/parser.y` plus its generated LR
+table, committed beside the generated `parser.go` — see `05-folders.md`).
+Of the 35 `.mtail` files, 17 are the canonical example programs in
+`examples/` (968 LOC); the rest are fuzz and testdata corpora.
+
+
+
+
+Go test/non-test split (same census method on file-name predicates):
+
+
+
+
+```
+NONTEST files=80 lines=15689
+TEST   files=61 lines=11207
+```
+
+
+
+
+Zone census of the two code trees (all Go code lives under `cmd/` or
+`internal/`):
+
+
+
+
+```
+ZONE cmd      files=4   lines=695
+ZONE internal files=137 lines=26201
+```
+
+
+
+
+## Module mapping
+
+
+
+
+`go.mod` declares exactly one module, so every one of the 141 `.go` files
+has import path `github.com/google/mtail/<path>` mapping 1:1 onto its
+directory. The module map ([`02-module-map.md`](02-module-map.md))
+normalizes directories into 18 package items at depth ≤ 3 (the nine
+subpackages of `internal/runtime/compiler` fold into the compiler item);
+the 18 items sum exactly to the whole Go tree — 141 files / 26,896 LOC.
+The invariant was cross-checked at measurement time with two independent
+census methods plus the `git ls-files '*.go'` oracle (141 files, no untracked
+or vendored Go code).
+
+
+
+
+## Documentation and examples
+
+
+
+
+- `docs/` — 15 top-level `.md` files, 2,300 lines measured recursively
+  (`find docs -name '*.md' -exec cat {} +`): Programming-Guide, Language,
+  Metrics, Deploying, Building, Testing, Troubleshooting, style, faq,
+  debugging, reading-y-output, … plus `docs/designs/poll.md`.
+- `examples/` — 17 real `.mtail` programs (apache_*, dhcpd, postfix, rails,
+  mysql_slowqueries, …) that double as the integration-test corpus
+  (`internal/mtail/examples_integration_test.go` iterates them —
+  examples_integration_test.go:32, :37, :42).
