@@ -1,0 +1,53 @@
+#include <pybind11/pybind11.h>
+
+namespace py = pybind11;
+
+// Forward declarations for binding functions
+// keep-sorted start
+void bind_r1interval(py::module& m);
+void bind_r2point(py::module& m);
+void bind_r2rect(py::module& m);
+void bind_s1angle(py::module& m);
+void bind_s1chord_angle(py::module& m);
+void bind_s1interval(py::module& m);
+void bind_s2cap(py::module& m);
+void bind_s2cell(py::module& m);
+void bind_s2cell_id(py::module& m);
+void bind_s2latlng(py::module& m);
+void bind_s2point(py::module& m);
+// keep-sorted end
+
+PYBIND11_MODULE(s2geometry_bindings, m) {
+  m.doc() = "S2 Geometry Python bindings using pybind11";
+
+  // Bind core geometry classes in dependency order.
+  // Each class must be registered before classes that use it as a
+  // parameter or return type.
+
+  // No dependencies
+  bind_r1interval(m);
+  bind_r2point(m);
+  bind_s1interval(m);
+  bind_s2point(m);
+
+  // Deps: r1interval, r2point
+  bind_r2rect(m);
+
+  // Deps: s2point
+  bind_s1angle(m);
+
+  // Deps: s1angle, s2point
+  bind_s1chord_angle(m);
+
+  // Deps: s1angle, s1chord_angle, s2point
+  bind_s2cap(m);
+
+  // Deps: s1angle, s2point
+  bind_s2latlng(m);
+
+  // Deps: s1angle, s2point, s2latlng, r2point, r2rect
+  bind_s2cell_id(m);
+
+  // Deps: r2rect, s1chord_angle, s2cap, s2cell_id, s2latlng, s2point
+  bind_s2cell(m);
+}
