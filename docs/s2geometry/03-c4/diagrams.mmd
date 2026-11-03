@@ -1,0 +1,156 @@
+%% Mermaid fallback rendering of reports/s2geometry/workspace.dsl
+%% Subject: s2geometry | PIN 677c8cebcff11ba11accc0b02005bc214e06e9fd (branch master)
+%% Node: goldmine-s2geometry--a-c4--110dacaf (stream A, C4 L1-L3)
+%% validate: SKIPPED (tool missing) — no java/structurizr-cli in the sandbox
+%%          (which java -> not found; which structurizr-cli -> not found; /usr/lib/jvm absent).
+%% Every element/relationship below mirrors workspace.dsl; evidence locators live in the DSL
+%% and in the element→evidence table of reports/s2geometry/gm-03-c4.md.
+
+---
+title: S2 Geometry — C4 model (L1/L2/L3)
+---
+%% ---------------- L1 — System Context ----------------
+C4Context
+title L1 — System Context: S2 Geometry Library
+
+Person(cppdev, "C++ Developer", "Builds C++ applications on the S2 spherical geometry API")
+Person(pydev, "Python Developer", "Uses the S2 Geometry Python bindings")
+System(s2, "S2 Geometry Library", "C++ library for robust geometry on the surface of a sphere, with Python bindings")
+System_Ext(absl, "Abseil (absl)", "Google open-source C++ common libraries linked into the S2 core")
+System_Ext(openssl, "OpenSSL libcrypto", "Required only to build/run bignum unit tests (test-only)")
+System_Ext(gtest, "GoogleTest", "Unit-test framework of the library")
+System_Ext(pyrt, "Python Runtime", "Interpreter that loads the s2geometry extension module")
+
+Rel(cppdev, s2, "Uses the C++ geometry API")
+Rel(pydev, s2, "Uses the Python bindings module")
+Rel(s2, absl, "Compiled and linked against")
+Rel(s2, openssl, "Runs bignum unit tests against (test-only)")
+Rel(s2, gtest, "Builds and runs its unit tests with")
+Rel(s2, pyrt, "Ships the s2geometry extension module for")
+
+%% ---------------- L2 — Containers ----------------
+C4Container
+title L2 — Containers: 14 pillar file-prefix families of src/s2 + Python bindings (gm-02)
+
+Person(cppdev, "C++ Developer", "C++ API consumer")
+Person(pydev, "Python Developer", "Python bindings consumer")
+System_Ext(absl, "Abseil (absl)", "C++ common libraries")
+System_Ext(pyrt, "Python Runtime", "Python interpreter")
+
+Container_Boundary(s2sys, "S2 Geometry Library") {
+  Container(core, "S2 Core Types", "C++17 (src/s2 flat core)", "S2Polygon, S2Loop, S2Builder, S2Cell, S2Shape, S2Cap, S2LatLng, predicates")
+  Container(pybind, "Python Bindings", "pybind11 + SWIG (src/python)", "s2geometry_bindings module + legacy SWIG interface")
+  Container(cellfam, "Cell Framework", "C++17 (src/s2)", "S2CellId, S2CellUnion, S2CellIndex")
+  Container(builderutil, "Builder Output Layers", "C++17 (src/s2)", "S2Builder layers + snap functions")
+  Container(closest, "Distance Queries", "C++17 (src/s2)", "S2ClosestEdge/Cell/PointQuery + bases")
+  Container(edge, "Edge Geometry", "C++17 (src/s2)", "CrossingSign, distances, S2EdgeCrosser, tessellation")
+  Container(boolean, "Boolean Operations", "C++17 (src/s2)", "Union/intersection/difference engine")
+  Container(encoded, "Encoded Storage", "C++17 (src/s2)", "Decode-on-the-fly vectors and encoded shape index")
+  Container(builder, "Builder Graph & Layer", "C++17 (src/s2)", "S2Builder::Graph + S2Builder::Layer")
+  Container(shape, "Shape Index Abstraction", "C++17 (src/s2)", "S2ShapeIndex abstract base + helpers")
+  Container(mutable, "Mutable Shape Index", "C++17 (src/s2)", "MutableS2ShapeIndex with adaptive clustering")
+  Container(shapeutil, "Shape Utilities", "C++17 (src/s2)", "Edge iteration, crossing pairs, coding factories")
+  Container(region, "Region Covering", "C++17 (src/s2)", "S2RegionCoverer + S2RegionTermIndexer")
+  Container(latlng, "Lat/Lng Regions", "C++17 (src/s2)", "S2LatLngRect + bounder")
+}
+
+Rel(cppdev, core, "Uses")
+Rel(pydev, pybind, "Uses")
+Rel(core, cellfam, "Includes S2CellId headers")
+Rel(core, mutable, "Uses MutableS2ShapeIndex")
+Rel(core, shape, "Includes S2ShapeIndex")
+Rel(core, boolean, "Includes BooleanOperation")
+Rel(boolean, builder, "Builds results via S2Builder")
+Rel(boolean, builderutil, "Uses snap functions")
+Rel(boolean, shape, "Operates on S2ShapeIndex")
+Rel(mutable, shape, "Implements S2ShapeIndex")
+Rel(mutable, cellfam, "Clusters along S2CellId")
+Rel(mutable, shapeutil, "ShapeEdgeId bookkeeping")
+Rel(encoded, shape, "Implements S2ShapeIndex")
+Rel(encoded, mutable, "Shares cell vector machinery")
+Rel(closest, shape, "Queries over S2ShapeIndex")
+Rel(closest, cellfam, "Prunes by cell id/union")
+Rel(closest, region, "Uses S2RegionCoverer")
+Rel(closest, shapeutil, "Edge counting helpers")
+Rel(builderutil, builder, "Implements S2Builder::Layer")
+Rel(builderutil, mutable, "Outputs into MutableS2ShapeIndex")
+Rel(builder, mutable, "Builds from index contents")
+Rel(builder, cellfam, "Snaps by S2CellId")
+Rel(builder, edge, "Detects crossing edges")
+Rel(region, cellfam, "Coverings are S2CellUnion outputs")
+Rel(shapeutil, shape, "Iterates S2ShapeIndex contents")
+Rel(shapeutil, encoded, "Uses encoded string vectors")
+Rel(shape, core, "Stores core S2Shape objects")
+Rel(edge, core, "Built on core predicates")
+Rel(latlng, core, "Implements core S2Region")
+Rel(cellfam, core, "Derives from core S2Region")
+Rel(pybind, core, "Binds core classes")
+Rel(pybind, boolean, "Exposes BooleanOperation")
+Rel(pybind, builderutil, "Exposes builder layers")
+Rel(pybind, cellfam, "Exposes cell types")
+Rel(pybind, edge, "Exposes edge helpers")
+Rel(pybind, region, "Exposes covering/indexer")
+Rel(pybind, latlng, "Exposes lat/lng types")
+Rel(pybind, mutable, "Exposes MutableS2ShapeIndex")
+Rel(pybind, shape, "Exposes S2ShapeIndex")
+Rel(pybind, pyrt, "Loads as extension module")
+
+%% ---------------- L3 — Components (3 main containers) ----------------
+C4Component
+title L3 — Components: S2 Core Types, Mutable Shape Index, Distance Queries
+
+Container_Boundary(coreC, "S2 Core Types (container)") {
+  Component(s2region, "S2Region", "C++17 abstract class", "Abstract region interface")
+  Component(s2polygon, "S2Polygon", "C++17 class", "Multi-loop spherical polygon")
+  Component(s2loop, "S2Loop", "C++17 class", "Simple closed loop of vertices")
+  Component(s2builderC, "S2Builder", "C++17 class", "Snap edges into a graph, emit to layers")
+  Component(s2cell, "S2Cell", "C++17 class", "Concrete cell region")
+  Component(s2shape, "S2Shape", "C++17 abstract class", "Read-only geometry interface")
+  Component(s2cap, "S2Cap", "C++17 class", "Circular cap region")
+  Component(s2latlng, "S2LatLng", "C++17 class", "Latitude/longitude point")
+  Component(s2predicates, "S2Predicates", "C++17 functions", "Exact robust predicates (Sign, OrderedCCW)")
+}
+
+Container_Boundary(mutableC, "Mutable Shape Index (container)") {
+  Component(mIdx, "MutableS2ShapeIndex", "C++17 class", "Adaptively clustered in-memory index")
+  Component(mOpts, "MutableS2ShapeIndex::Options", "C++17 nested class", "Cell size / edge count tuning")
+  Component(mIter, "MutableS2ShapeIndex::Iterator", "C++17 nested class", "Cell iterator")
+  Component(mTracker, "InteriorTracker", "C++17 nested class", "Tracks shape interiors during refinement")
+  Component(mBatch, "MutableS2ShapeIndex::BatchGenerator", "C++17 nested class", "Randomized test batches")
+}
+
+Container_Boundary(closestC, "Distance Queries (container)") {
+  Component(eqBase, "S2ClosestEdgeQueryBase<Distance>", "C++17 template", "Nearest-edge traversal engine")
+  Component(cqBase, "S2ClosestCellQueryBase<Distance>", "C++17 template", "Nearest-cell engine")
+  Component(pqBase, "S2ClosestPointQueryBase<Distance>", "C++17 template", "Nearest-point engine")
+  Component(edgeQuery, "S2ClosestEdgeQuery", "C++17 class", "Concrete edge query (S2MinDistance)")
+  Component(cellQuery, "S2ClosestCellQuery", "C++17 class", "Concrete cell query (S2MinDistance)")
+  Component(pointQuery, "S2ClosestPointQuery", "C++17 class", "Concrete point query (S2MinDistance)")
+}
+
+Container(shapeIdx, "Shape Index Abstraction", "C++17 (src/s2)", "S2ShapeIndex abstract base")
+Container(regionCov, "Region Covering", "C++17 (src/s2)", "S2RegionCoverer")
+Container(cellFam, "Cell Framework", "C++17 (src/s2)", "S2CellId/S2CellUnion")
+Container(edgeGeo, "Edge Geometry", "C++17 (src/s2)", "s2edge_crossings/s2edge_distances")
+
+Rel(s2polygon, s2region, "Implements")
+Rel(s2loop, s2region, "Implements")
+Rel(s2cell, s2region, "Implements")
+Rel(s2cap, s2region, "Implements")
+Rel(s2polygon, s2loop, "Composed of loops")
+Rel(s2polygon, s2builderC, "Convenience construction")
+Rel(s2builderC, s2shape, "Consumes input shapes")
+Rel(s2builderC, cellFam, "Snaps by cell id")
+Rel(s2builderC, edgeGeo, "Crossing detection")
+Rel(edgeGeo, s2predicates, "Calls exact Sign predicates")
+Rel(mIdx, shapeIdx, "Implements S2ShapeIndex")
+Rel(mIdx, cellFam, "Clusters along S2CellId")
+Rel(mIdx, mOpts, "Configured by")
+Rel(mIdx, mIter, "Iterated via")
+Rel(mIdx, mTracker, "Drives during refinement")
+Rel(mBatch, mIdx, "Generates test batches for")
+Rel(edgeQuery, eqBase, "Uses shared base engine")
+Rel(cellQuery, cqBase, "Uses shared base engine")
+Rel(pointQuery, pqBase, "Uses shared base engine")
+Rel(eqBase, regionCov, "Prioritizes cells via S2RegionCoverer")
+Rel(eqBase, shapeIdx, "Traverses S2ShapeIndex")
