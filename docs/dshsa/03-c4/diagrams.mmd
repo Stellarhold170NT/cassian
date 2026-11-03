@@ -1,0 +1,116 @@
+%% diagrams.mmd — Mermaid fallback (C4 L1/L2/L3) for the dsh-superagent subject
+%% Repo: deepseek-ai/dsh-superagent-prototype @ pin 8c32a9dc5d72c033816c6a8110b37f40cf94fba4
+%% validate: SKIPPED — no structurizr-cli/java in the mining sandbox; these diagrams mirror workspace.dsl in this directory
+%% Structurizr source of truth: workspace.dsl (every element/relationship has // evidence: <path>)
+
+%% ───────────────────────── L1 — System Context ─────────────────────────
+flowchart LR
+    op(["Operator<br/>team member; deploys, reviews what needs a person,<br/>edits settings/policy in the panel<br/>evidence: README.md:7,9; src/client/index.tsx:50-57"])
+    rq(["Requester<br/>GitHub or Feishu user allowed by policy;<br/>mentions the agent to ask for work<br/>evidence: src/sources/github.ts:74,79; src/sources/feishu.ts:35"])
+    dsh[["dsh-superagent<br/>proactive coding agent for one GitHub repo,<br/>DSH bundle: listens to GitHub and optionally Feishu,<br/>evaluates under a Policy, opens Tickets,<br/>executes each in its own DSH Session<br/>evidence: package.json:7; README.md:7"]]
+    gh[("GitHub<br/>notifications, issues/PR discussions, CI;<br/>reached via the agent's gh CLI<br/>evidence: src/sources/github.ts:41; src/infra/commands.ts:76")]
+    fs[("Feishu<br/>bot chats and direct messages;<br/>reached via the bot's lark-cli<br/>evidence: src/sources/feishu.ts:35,120")]
+    plt[("DSH platform - DeepSeek Harness<br/>Cordis host, agent sessions, web client,<br/>llm + subprocess services<br/>evidence: src/index.ts:8-10; src/app/sessions.ts:88-93")]
+    op -- "reviews and configures via panel REST<br/>evidence: src/client/api.ts:33-37; src/app/http.ts:1" --> dsh
+    rq -- "work requests arrive as issues/comments/CI or chat messages<br/>evidence: src/sources/github.ts:38-41; src/sources/feishu.ts:35" --> dsh
+    dsh -- "reads events, replies with comments/PRs via gh<br/>evidence: src/sources/github.ts:95; src/infra/commands.ts:76" --> gh
+    dsh -- "reads bot messages, sends replies via lark-cli<br/>evidence: src/infra/commands.ts:1" --> fs
+    dsh -- "runs as plugin; orchestrator + worker sessions; llm calls<br/>evidence: src/executor/dsh.ts:23-24; src/app/role-models.ts:9" --> plt
+
+%% ───────────────────────── L2 — Containers ─────────────────────────
+flowchart TB
+    op2(["Operator<br/>evidence: README.md:7"])
+    rq2(["Requester<br/>evidence: src/sources/github.ts:74,79"])
+    gh2[("GitHub<br/>evidence: src/sources/github.ts:41")]
+    fs2[("Feishu<br/>evidence: src/sources/feishu.ts:35")]
+    plt2[("DSH platform<br/>evidence: src/index.ts:8-10")]
+    subgraph dshsa["dsh-superagent (DSH bundle)"]
+        direction TB
+        shell["Host plugin shell<br/>m07 - 8 files / 544 LOC<br/>apply() mounts Runtime; deployment verify; policy/settings schema<br/>evidence: src/index.ts:10,21; src/deployment.ts:87,114; src/policy.ts:99-105,167"]
+        app["Orchestration app - Runtime<br/>m01 - 38 files / 5292 LOC<br/>composition root; loopback HTTP; sessions; assessor; outbox<br/>evidence: src/app/runtime.ts:55-59; src/app/http.ts:1"]
+        core["Domain core - Engine<br/>m03 - 15 files / 2088 LOC<br/>single transactional entry: intake, evals, tickets, assignments, replies<br/>evidence: src/core/engine.ts:20-24; src/core/ports.ts:17,49,59"]
+        src["Source plugins - GitHub/Feishu watchers<br/>m06 - 16 files / 2059 LOC<br/>SourceKind + SourceRegistry + polling loops<br/>evidence: src/sources/github.ts:38,110-122; src/sources/feishu.ts:31,130-139; src/sources/registry.ts:13"]
+        exe["DSH executor<br/>m04 - 2 files / 838 LOC<br/>worker sessions worker-{ticketId}; WorkerSlots concurrency<br/>evidence: src/executor/dsh.ts:23-24,171,207"]
+        inf["Process infrastructure<br/>m05 - 5 files / 347 LOC<br/>Commands: gh/lark-cli/git; worker env shim; HealthBoard<br/>evidence: src/infra/commands.ts:1,59; src/executor/dsh.ts:11"]
+        panel["Web management panel<br/>m02 - 26 files / 4037 LOC + client.css 382 lines<br/>React panel in DSH web client; same-origin REST<br/>evidence: src/client/index.tsx:50-57; src/client/api.ts:33-37"]
+        db[("State database - SQLite<br/>aggregates, KV, settings history, outbox<br/>evidence: src/app/store.ts:1,2,51; src/app/runtime.ts:57")]
+    end
+    op2 -- "uses panel<br/>evidence: src/client/index.tsx:53-55" --> panel
+    rq2 -- "requests via GitHub/Feishu<br/>evidence: src/sources/github.ts:79" --> src
+    panel -- "same-origin REST to loopback API<br/>evidence: src/client/api.ts:37; src/app/http.ts:1" --> app
+    shell -- "mounts Runtime<br/>evidence: src/index.ts:4,21" --> app
+    shell -- "re-exports core API<br/>evidence: src/index.ts:27" --> core
+    app -- "drives Engine; implements Repositories/Assessor<br/>evidence: src/app/runtime.ts:16; src/app/store.ts:51; src/app/assessment.ts:89" --> core
+    app -- "SourceRegistry + SourceHost service<br/>evidence: src/app/runtime.ts:18,51,59" --> src
+    app -- "constructs DshExecutor<br/>evidence: src/app/runtime.ts:23" --> exe
+    app -- "Commands + HealthBoard<br/>evidence: src/app/runtime.ts:19,37" --> inf
+    app -- "Store reads/writes<br/>evidence: src/app/store.ts:1,51" --> db
+    exe -- "implements Executor port; reports transitions<br/>evidence: src/executor/dsh.ts:7-9,207" --> core
+    exe -- "worker env shim<br/>evidence: src/executor/dsh.ts:11" --> inf
+    exe -- "persistent worker sessions worker-{ticketId}<br/>evidence: src/executor/dsh.ts:23-24,202-204" --> plt2
+    src -- "Triggers + SourceScope<br/>evidence: src/sources/registry.ts:2,13" --> core
+    src -- "gh/lark-cli/git via Commands<br/>evidence: src/sources/github.ts:6; src/infra/commands.ts:1" --> inf
+    src -- "polls; replies via gh<br/>evidence: src/sources/github.ts:38-41,118" --> gh2
+    src -- "polls chats/DMs; replies via lark-cli<br/>evidence: src/sources/feishu.ts:31-38,136" --> fs2
+    panel -- "user error codes<br/>evidence: src/client/api.ts:4" --> core
+    panel -- "source health text<br/>evidence: src/client/locales.ts:6" --> src
+    panel -- "session navigation, deployment facts<br/>evidence: src/client/index.tsx:13" --> shell
+
+%% ───────────────────────── L3 — App components ─────────────────────────
+flowchart TB
+    subgraph appC["Orchestration app - Runtime (m01, 38 files / 5292 LOC)"]
+        direction TB
+        rt["Runtime<br/>composition root; wires all parts; exposes SourceHost<br/>evidence: src/app/runtime.ts:55-59,60-72"]
+        st["Store<br/>SQLite persistence; implements Repositories; migration on open<br/>evidence: src/app/store.ts:1,51,9"]
+        se["Sessions<br/>orchestrator + worker Agent sessions; ordered relay/notice delivery<br/>evidence: src/app/sessions.ts:88-93,104-105"]
+        ma["MasterAssessor<br/>implements Assessor; queues evals per evalId<br/>evidence: src/app/assessment.ts:89; src/core/ports.ts:48-53"]
+        ob["Outbox<br/>implements OutboxPort; receipts pending/sent/dropped<br/>evidence: src/app/outbox.ts:22; src/app/store.ts:17-18"]
+        ef["Effects<br/>queued side effects: launch, deliver, relay, notice, policy-changed<br/>evidence: src/app/effects.ts:11,46; src/executor/dsh.ts:14,160-163"]
+        hr["HttpRoutes<br/>loopback-only management routes, same-origin enforcement<br/>evidence: src/app/http.ts:1,31-40; src/app/runtime.ts:32"]
+        vw["Views<br/>projections: overview, settings, sources, threads, tickets<br/>evidence: src/app/http.ts:25-29"]
+    end
+    rt --> st
+    rt --> se
+    rt --> ma
+    rt --> ob
+    rt --> ef
+    rt -- "registerHttp at startup<br/>evidence: src/app/runtime.ts:32,56" --> hr
+    hr -- "view projections<br/>evidence: src/app/http.ts:25-29" --> vw
+    hr -- "HttpHost.store<br/>evidence: src/app/http.ts:20,32" --> st
+    hr -- "status/notify/delivery<br/>evidence: src/app/http.ts:37" --> se
+    ef -- "ordered relay/notice to main Session<br/>evidence: src/app/sessions.ts:99-105" --> se
+
+%% ───────────────────────── L3 — Core components ─────────────────────────
+flowchart TB
+    subgraph coreC["Domain core - Engine (m03, 15 files / 2088 LOC)"]
+        direction TB
+        en["Engine<br/>single transactional entry point<br/>evidence: src/core/engine.ts:19-24"]
+        it["Intake<br/>receives Triggers, gate + scope<br/>evidence: src/core/intake.ts:16"]
+        ev["Evals<br/>records accept/ignore/unavailable/stop<br/>evidence: src/core/evals.ts:27"]
+        tk["Tickets<br/>lifecycle accept to end; mandate revalidation<br/>evidence: src/core/tickets.ts:29"]
+        asg["Assignments<br/>tracks assignments + WorkerReport<br/>evidence: src/core/assignments.ts:11,30"]
+        rp["Replies<br/>outbound replies; status in outbox<br/>evidence: src/core/replies.ts:18,26"]
+        mp["Model + Ports<br/>Trigger, Ticket, Mandate; Policy, Assessor, Executor, Repositories<br/>evidence: src/core/model.ts:23,126,277; src/core/ports.ts:17,49,59"]
+    end
+    en -- "constructor wiring<br/>evidence: src/core/engine.ts:31-38" --> it
+    en --> ev
+    en --> tk
+    en --> asg
+    en --> rp
+    it -- "typed on Trigger/Thread<br/>evidence: src/core/model.ts:23" --> mp
+    tk -- "typed on Ticket/Mandate<br/>evidence: src/core/model.ts:126,277" --> mp
+
+%% ───────────────────────── L3 — Sources components ─────────────────────────
+flowchart TB
+    subgraph srcC["Source plugins (m06, 16 files / 2059 LOC)"]
+        direction TB
+        kc["SourceKind contract<br/>schema, fields, scope, channel, threadContext, health<br/>evidence: src/sources/kind.ts:85"]
+        rg["SourceRegistry<br/>registers kinds; implements SourceScope; claims health<br/>evidence: src/sources/registry.ts:1,13,23"]
+        gpl["GitHub source plugin<br/>dsh-superagent-github; githubKind; watch loop<br/>evidence: src/sources/github.ts:38,110-122"]
+        fpl["Feishu source plugin<br/>dsh-superagent-feishu; feishuKind; runFeishu loop<br/>evidence: src/sources/feishu.ts:31,130-139"]
+    end
+    gpl -- "registers githubKind via orchestrator SourceHost<br/>evidence: src/sources/github.ts:113" --> rg
+    fpl -- "registers feishuKind via orchestrator SourceHost<br/>evidence: src/sources/feishu.ts:133" --> rg
+    rg -- "manages SourceKind instances<br/>evidence: src/sources/registry.ts:4,23" --> kc
+    gpl -- "implements SourceKind<br/>evidence: src/sources/github.ts:38" --> kc
+    fpl -- "implements SourceKind<br/>evidence: src/sources/feishu.ts:31" --> kc

@@ -196,3 +196,10 @@ m24,@open-design/release,packages/release,333,4,,contracts;daemon;desktop;e2e;ho
 m25,@open-design/registry-protocol,packages/registry-protocol,303,2,,daemon,modules/opendesign/@open-design/registry-protocol,yes,docs/opendesign/02-module-map.md#m25-open-designregistry-protocol
 m26,@open-design/metatool,packages/metatool,259,2,,,modules/opendesign/@open-design/metatool,yes,docs/opendesign/02-module-map.md#m26-open-designmetatool
 m27,@open-design/closure,apps/closure,172,2,standalone,,modules/opendesign/@open-design/closure,yes,docs/opendesign/02-module-map.md#m27-open-designclosure
+m01,dsh-superagent/src/app,src/app,5292,4,core;executor;infra;sources;root,client;executor;root,modules/dshsa/m01,yes,docs/dshsa/02-module-map.md#m01-dsh-superagentsrcapp
+m02,dsh-superagent/src/client,src/client,4037,3,app;core;sources;root,,modules/dshsa/m02,yes,docs/dshsa/02-module-map.md#m02-dsh-superagentsrcclient
+m03,dsh-superagent/src/core,src/core,2088,5,,app;client;executor;sources;root,modules/dshsa/m03,yes,docs/dshsa/02-module-map.md#m03-dsh-superagentsrccore
+m04,dsh-superagent/src/executor,src/executor,838,3,app;core;infra;root,app,modules/dshsa/m04,yes,docs/dshsa/02-module-map.md#m04-dsh-superagentsrcexecutor
+m05,dsh-superagent/src/infra,src/infra,347,4,sources;root,app;executor;sources;root,modules/dshsa/m05,yes,docs/dshsa/02-module-map.md#m05-dsh-superagentsrcinfra
+m06,dsh-superagent/src/sources,src/sources,2059,5,core;infra;root,app;client;infra;root,modules/dshsa/m06,yes,docs/dshsa/02-module-map.md#m06-dsh-superagentsrcsources
+m07,dsh-superagent/src (root modules),src/*.ts,544,4,app;core;infra;sources,app;client;executor;infra;sources,modules/dshsa/m07,yes,docs/dshsa/02-module-map.md#m07-dsh-superagentsrc-root-modules
