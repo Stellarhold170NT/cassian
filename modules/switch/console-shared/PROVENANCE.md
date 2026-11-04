@@ -1,7 +1,7 @@
 # PROVENANCE — modules/switch/console-shared
 
 - upstream: sandbox-quantum/switch (branch main)
-- upstream_sha: 9e0e10325f091a44b21bd6234b9de0699b9497ae
+- upstream_sha: 39a722c5eeecf8479422351fc7ac2a61fe559a66
 - upstream_path: console/apps/switch-console-desktop/src/shared, console/apps/switch-console-desktop/src/preload, console/apps/switch-console-desktop/src/types, console/tooling-e2e, console/apps/switch-console-desktop/tooling, console/apps/switch-console-desktop/scripts, console/apps/switch-console-desktop/electron-builder.config.ts, console/apps/switch-console-desktop/electron-builder.canary.config.ts, console/apps/switch-console-desktop/electron.vite.config.ts, console/apps/switch-console-desktop/drizzle.config.ts, console/apps/switch-console-desktop/vitest.config.ts
 - extracted_at: 2026-11-04T09:48:07Z
 - license: Apache 2.0 License with the modified "Commons Clause" License Condition v1.0 (Copyright (c) 2026 SB Technology, Inc. dba SandboxAQ) - see upstream LICENSE

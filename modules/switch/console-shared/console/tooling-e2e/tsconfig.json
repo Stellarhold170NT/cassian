@@ -22,8 +22,5 @@
   "include": [
     "src/**/*.ts",
     "vitest.config.ts"
-  ],
-  "exclude": [
-    "src/explore/spec"
   ]
 }
