@@ -1,0 +1,225 @@
+import z from 'zod';
+import { definePluginCapability } from '../../../lib/plugins/capability';
+import type { PluginFs } from '../../runtime/fs';
+
+/**
+ * A repository-defined agent the provider can run, discovered locally from its
+ * on-disk credentials/definition files (before gateway reconciliation).
+ */
+export type LocalRepoAgent = {
+  name: string;
+  description: string | null;
+  model: string | null;
+  switchAgentId: string | null;
+  apiEndpoint: string | null;
+};
+
+/**
+ * An agent definition discovered in a working directory, with whether it can join
+ * Switch (`eligible`) and whether it already carries Switch credentials
+ * (`registered`). Used by the Add Agent modal to offer onboarding a directory's
+ * existing agents.
+ */
+export type RepoAgentDefinition = {
+  name: string;
+  description: string | null;
+  model: string | null;
+  eligible: boolean;
+  registered: boolean;
+};
+
+/**
+ * The MCP permission rules that keep a Switch agent connected to the platform:
+ * the `switch` MCP server the session host registers for every managed
+ * session. Used both as `tools` allowlist entries (so an agent that restricts
+ * its tools stays Switch-capable) and as `permissions.allow` entries (so the
+ * Switch tools are auto-approved). Authored once here so every provider's
+ * onboarding path agrees.
+ */
+export const SWITCH_TOOL_RULES = ['mcp__switch'] as const;
+
+/**
+ * Every rule Switch Console has ever authored, including ones it no longer writes.
+ * The paths that strip Switch Console's own contributions back out — the subagent
+ * form's read-back and the teardown that removes Switch settings — match against
+ * this, so a working directory set up by an older Console is still cleaned up
+ * completely instead of keeping a rule that names a server nobody registers.
+ * The `mcp__plugin_switch-connector_*` rules named the retired connector
+ * plugin's MCP servers.
+ */
+export const RECOGNISED_SWITCH_TOOL_RULES: readonly string[] = [
+  ...SWITCH_TOOL_RULES,
+  'mcp__plugin_switch-connector_switch',
+  'mcp__plugin_switch-connector_switch-channel',
+];
+
+/**
+ * Provider-neutral directory (relative to a location's working directory) for
+ * per-agent Switch credentials. One `<name>.json` per agent, keeping the store
+ * out of any single provider's config tree (CHOO-1440). POSIX separator so it is
+ * stable across local and SFTP filesystems.
+ */
+export const SWITCH_AGENT_SETTINGS_DIR = '.switch/agents';
+
+/**
+ * The shape of value a provider applies for one advanced setting at launch:
+ * a string (a server field of type `text`, `textarea` or `select`), a finite
+ * number, a boolean, or a list of strings.
+ */
+export type AdvancedSettingKind = 'text' | 'number' | 'boolean' | 'list';
+
+/**
+ * The advanced settings a provider applies when a session launches, keyed by
+ * the key of the server's advanced configuration field each comes from.
+ *
+ * The fields themselves — label, type, help, choices — are defined only by the
+ * Switch server (`core/switch_core/providers/advanced_fields.py`) and served
+ * to every client; a plugin declares only what it turns into launch inputs, so
+ * a value it does not apply is refused rather than dropped. Empty for a
+ * provider that applies none. The agent's main attributes — name, description,
+ * model, instructions — are not advanced settings.
+ */
+export type AdvancedSettings = Readonly<Record<string, AdvancedSettingKind>>;
+
+/** A renderable input type for an agent attribute field. */
+export type RepoAgentFieldType = 'text' | 'textarea' | 'select' | 'list' | 'number' | 'boolean';
+
+export type RepoAgentFieldOption = { value: string; label: string };
+
+/**
+ * Ties a field to the host's model catalogue (`mcp.launchProfileModels`), for a
+ * setting whose valid values live on the machine the agent runs on rather than
+ * in this descriptor.
+ *
+ * - `model` — the field names a model. What was typed is checked against the
+ *   catalogue and flagged when it is not there.
+ * - `model-variant` — the field's choices are the variants of the model named by
+ *   `modelField`, so choosing a model decides them. A model that declares none
+ *   leaves the field with nothing to offer, which is worth saying rather than
+ *   accepting a value the host will ignore.
+ *
+ * Declared rather than inferred so the renderer stays generic: it knows "this
+ * field is a model" and "this one follows that one", not which providers or
+ * which key names.
+ */
+export type RepoAgentFieldCatalogue =
+  | { kind: 'model' }
+  | { kind: 'model-variant'; modelField: string };
+
+/**
+ * One editable attribute of an agent, as a form renders it: the server's
+ * advanced configuration fields for the agent's provider, and the model. `key`
+ * is the attribute name in the {@link RepoAgentAttributes} map the provider
+ * serializes.
+ */
+export type RepoAgentField = {
+  key: string;
+  label: string;
+  type: RepoAgentFieldType;
+  required?: boolean;
+  /** Fixed once the agent exists (e.g. the name, which is its identity). */
+  immutableOnEdit?: boolean;
+  placeholder?: string;
+  help?: string;
+  /** Choices for `select`. Include an empty-value option to mean "unset". */
+  options?: RepoAgentFieldOption[];
+  /**
+   * Bind this field to the host's model catalogue. The field keeps its declared
+   * `type` as the fallback: when the catalogue cannot be read, it renders as
+   * declared and says why, rather than blocking on values it cannot check.
+   */
+  catalogue?: RepoAgentFieldCatalogue;
+};
+
+/** A single attribute value; shape depends on the field's `type`. */
+export type RepoAgentAttributeValue = string | string[] | number | boolean | null;
+
+/** An agent's attributes, keyed by {@link RepoAgentField.key}: its main
+ * attributes and the advanced settings its provider applies. */
+export type RepoAgentAttributes = Record<string, RepoAgentAttributeValue>;
+
+/**
+ * The definition a session runs as, in the shape the provider's SDK takes it.
+ * Provider-specific; JSON-serialisable, since it travels in the launch spec to
+ * the host that starts the session.
+ */
+export type RepoAgentLaunchDefinition = Record<string, string | string[] | number | boolean>;
+
+/**
+ * How an agent provider creates, runs, and credentials the named agents defined
+ * in a working directory. Switch Console has no notion of "subagents" — it just asks
+ * a provider to create and run an agent with a given name in a directory, and to
+ * support several such agents in one directory. HOW the provider does that (Claude
+ * Code uses subagents; another provider might use something else) is entirely the
+ * provider's business and lives behind this behavior; the main process supplies a
+ * `PluginFs` for the IO and owns the provider-neutral gateway reconciliation.
+ *
+ * `workdirFs` is rooted at the agent's working directory; `homeFs` at the user's
+ * home — definitions may resolve in either scope.
+ */
+export type IRepoAgentsBehavior = {
+  /** Runnable agents, from the working dir's on-disk credentials + definitions. */
+  discoverLocal(workdirFs: PluginFs, homeFs: PluginFs): Promise<LocalRepoAgent[]>;
+  /** Agent definitions in the working dir, for onboarding (project scope). */
+  discoverDefinitions(workdirFs: PluginFs): Promise<RepoAgentDefinition[]>;
+  /** Provider-specific CLI args that run the CLI as the named agent. Pure — the
+   * caller passes them to `buildCommand` as `agentArgs` (not user extra args). */
+  launchArgs(workingDir: string, agentName: string): string[];
+  /** The named agent's Switch credentials as env vars, for the launched session. */
+  readLaunchEnv(workdirFs: PluginFs, agentName: string): Promise<Record<string, string>>;
+  /** The advanced settings a definition carries, in the order it is written. */
+  advancedSettings(): AdvancedSettings;
+  /**
+   * The definition file's exact text for these attributes, without writing it.
+   *
+   * Must be deterministic: the same attributes always produce the same bytes.
+   * The config-file sync tells "someone hand-edited the definition" from "the
+   * config moved on" by comparing the file against what was last generated, so
+   * a render that varied run to run would report every file as hand-edited.
+   */
+  renderDefinition(attributes: RepoAgentAttributes): string;
+  /** The definition file's path, relative to the working directory. */
+  definitionPath(name: string): string;
+  /**
+   * The definition a session runs as, built from these attributes and handed to
+   * the provider's SDK directly, so nothing is read from disk at launch. Pure.
+   */
+  launchDefinition(attributes: RepoAgentAttributes): RepoAgentLaunchDefinition;
+  /** Create or overwrite a named agent's on-disk definition from its attributes
+   * (workdir scope). `attributes.name` selects the agent. */
+  writeDefinition(workdirFs: PluginFs, attributes: RepoAgentAttributes): Promise<void>;
+  /** The current attribute values for an existing agent definition — its
+   * main attributes and {@link advancedSettings} — or null if no definition
+   * exists. */
+  readDefinition(workdirFs: PluginFs, name: string): Promise<RepoAgentAttributes | null>;
+  /** Remove a named agent's provider-specific files — its definition and any
+   * legacy per-agent settings (workdir scope). The provider-neutral Switch
+   * credentials are not this hook's to remove: they are written for every
+   * provider, so they are torn down by the caller for every provider too. */
+  removeLocal(workdirFs: PluginFs, name: string): Promise<void>;
+};
+
+/**
+ * kind: 'definitions' — the provider supports repository-defined named agents
+ *   (e.g. Claude Code implements this with its subagents: `.md` definitions under
+ *   `definitionsDirRelative`, launched with `--agent`/`--settings`).
+ * kind: 'none' — the provider has no repository-agent concept; the UI surfaces
+ *   nothing beyond a single default agent.
+ */
+export const repoAgentsCapability = definePluginCapability<IRepoAgentsBehavior>()(
+  'repo-agents',
+  z.discriminatedUnion('kind', [
+    z.object({
+      kind: z.literal('definitions'),
+      /** Credentials dir, relative to the working dir, e.g. '.claude/switch-subagents'. */
+      dirRelative: z.string(),
+      /** Credentials filename suffix, e.g. '.settings.json'. */
+      settingsSuffix: z.string(),
+      /** Definitions dir, relative to the working dir, e.g. '.claude/agents'. */
+      definitionsDirRelative: z.string(),
+    }),
+    z.object({ kind: z.literal('none') }),
+  ])
+);
+
+export type RepoAgentsDescriptor = (typeof repoAgentsCapability)['_descriptor'];

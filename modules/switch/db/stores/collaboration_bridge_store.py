@@ -1,0 +1,208 @@
+from collections.abc import Collection
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from switch_core.db.models import CollaborationBridge, require_tenant_id
+
+
+class CollaborationBridgeStore:
+    async def create(
+        self, session: AsyncSession, bridge: CollaborationBridge
+    ) -> CollaborationBridge:
+        session.add(bridge)
+        await session.flush()
+        return bridge
+
+    async def get(
+        self, session: AsyncSession, bridge_id: str
+    ) -> CollaborationBridge | None:
+        return await session.get(CollaborationBridge, bridge_id)
+
+    async def get_many(
+        self, session: AsyncSession, bridge_ids: Collection[str]
+    ) -> list[CollaborationBridge]:
+        """The bridges among `bridge_ids` that exist, in one query."""
+        if not bridge_ids:
+            return []
+        result = await session.execute(
+            select(CollaborationBridge).where(CollaborationBridge.id.in_(bridge_ids))
+        )
+        return list(result.scalars().all())
+
+    async def get_all(self, session: AsyncSession) -> list[CollaborationBridge]:
+        result = await session.execute(select(CollaborationBridge))
+        return list(result.scalars().all())
+
+    async def get_active(self, session: AsyncSession) -> list[CollaborationBridge]:
+        result = await session.execute(
+            select(CollaborationBridge).where(CollaborationBridge.status == "active")
+        )
+        return list(result.scalars().all())
+
+    async def get_default(self, session: AsyncSession) -> CollaborationBridge | None:
+        """The bridge new rooms land on when none is named, or None when the
+        bound tenant has not nominated one.
+
+        Scoped explicitly rather than left to row-level security: `is_default`
+        is unique per tenant, not globally
+        (`ix_collaboration_bridges_single_default`), so the moment a second
+        tenant has a default bridge, an unfiltered `one_or_none()` here
+        matches both rows and raises `MultipleResultsFound` — a 500 out of
+        `create_room` and `POST /gateway/collaborations/{id}/default`, for
+        every tenant, not just the one that just onboarded. Filtering here
+        also keeps `set_default` from reading another tenant's default as its
+        own and demoting it (see there)."""
+        result = await session.execute(
+            select(CollaborationBridge).where(
+                CollaborationBridge.tenant_id == require_tenant_id(),
+                CollaborationBridge.is_default.is_(True),
+            )
+        )
+        return result.scalars().one_or_none()
+
+    async def set_default(
+        self, session: AsyncSession, bridge_id: str
+    ) -> CollaborationBridge:
+        """Nominate ``bridge_id`` as the bound tenant's default, demoting
+        whichever bridge held it before. The demotion is flushed first
+        because a partial unique index enforces a single default per tenant —
+        writing the new one while the old is still set would collide.
+
+        ``current`` comes from `get_default`, which is scoped to the bound
+        tenant — load-bearing here, not just for `create_room`: an unscoped
+        `get_default` would read *another* tenant's default as "the current
+        one" whenever the bound tenant had none of its own yet, and this
+        method would then demote a bridge it was never asked about."""
+        bridge = await session.get(CollaborationBridge, bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+
+        current = await self.get_default(session)
+        if current is not None and current.id == bridge_id:
+            return bridge
+        if current is not None:
+            current.is_default = False
+            await session.flush()
+
+        bridge.is_default = True
+        await session.flush()
+        return bridge
+
+    async def update_status(
+        self, session: AsyncSession, bridge_id: str, status: str
+    ) -> None:
+        bridge = await session.get(CollaborationBridge, bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+        bridge.status = status
+        await session.flush()
+
+    async def set_agent_greetings_enabled(
+        self, session: AsyncSession, bridge_id: str, enabled: bool
+    ) -> CollaborationBridge:
+        bridge = await session.get(CollaborationBridge, bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+        bridge.agent_greetings_enabled = enabled
+        await session.flush()
+        return bridge
+
+    async def set_channel_creation_enabled(
+        self, session: AsyncSession, bridge_id: str, enabled: bool
+    ) -> CollaborationBridge:
+        bridge = await session.get(CollaborationBridge, bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+        bridge.channel_creation_enabled = enabled
+        await session.flush()
+        return bridge
+
+    async def set_preconfigured(
+        self, session: AsyncSession, bridge_id: str, preconfigured: bool
+    ) -> CollaborationBridge:
+        bridge = await session.get(CollaborationBridge, bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+        bridge.preconfigured = preconfigured
+        await session.flush()
+        return bridge
+
+    async def merge_connection_config(
+        self, session: AsyncSession, bridge_id: str, changes: dict[str, object]
+    ) -> CollaborationBridge:
+        """Merge `changes` into ``connection_config``, keeping untouched keys.
+
+        Merging rather than replacing means an operator can flip one setting
+        without re-sending the platform's tokens. Reassigns the dict so
+        SQLAlchemy tracks the change. Merged into the row as it is now, under
+        its lock, not as this session first read it: a bridge may have learned
+        and persisted something since."""
+        bridge = await self._locked_for_config_update(session, bridge_id)
+        bridge.connection_config = {**(bridge.connection_config or {}), **changes}
+        await session.flush()
+        return bridge
+
+    async def _locked_for_config_update(
+        self, session: AsyncSession, bridge_id: str
+    ) -> CollaborationBridge:
+        """The bridge row, locked for the rest of this transaction.
+
+        ``connection_config`` is one JSONB value, and the learned parts of it
+        are written by read-modify-write from independent sessions — a Teams
+        bridge persists a channel's team the first time it sees that channel,
+        so a burst of new channels is a burst of concurrent writers. Unlocked,
+        each one reads the blob before the others commit and the last write
+        wins, silently discarding the rest. Measured: eight concurrent writes
+        landed two.
+
+        A dropped `channel_teams` entry is not cosmetic — it is exactly the
+        state that makes Graph refuse that channel's subscription after the
+        next restart, which is the failure the entry exists to prevent.
+        """
+        # `populate_existing`, because a row this session already holds would
+        # otherwise come back as it was first read, lock or no lock.
+        row = await session.execute(
+            select(CollaborationBridge)
+            .where(CollaborationBridge.id == bridge_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        bridge = row.scalar_one_or_none()
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+        return bridge
+
+    async def set_service_url(
+        self, session: AsyncSession, bridge_id: str, service_url: str
+    ) -> None:
+        """Persist a learned outbound serviceUrl into ``connection_config`` so it
+        survives a restart. Reassigns the dict so SQLAlchemy tracks the change."""
+        bridge = await self._locked_for_config_update(session, bridge_id)
+        bridge.connection_config = {
+            **(bridge.connection_config or {}),
+            "service_url": service_url,
+        }
+        await session.flush()
+
+    async def set_channel_team(
+        self, session: AsyncSession, bridge_id: str, channel_id: str, team_id: str
+    ) -> None:
+        """Persist which team a channel belongs to into ``connection_config``.
+
+        Merged into the existing map rather than replacing it, so learning one
+        channel does not forget the rest. Reassigns the dicts so SQLAlchemy
+        tracks the change (a mutated JSONB value is not detected)."""
+        bridge = await self._locked_for_config_update(session, bridge_id)
+        config = dict(bridge.connection_config or {})
+        known = dict(config.get("channel_teams") or {})
+        known[channel_id] = team_id
+        config["channel_teams"] = known
+        bridge.connection_config = config
+        await session.flush()
+
+    async def delete(self, session: AsyncSession, bridge_id: str) -> None:
+        bridge = await session.get(CollaborationBridge, bridge_id)
+        if bridge:
+            await session.delete(bridge)
+            await session.flush()

@@ -1,0 +1,137 @@
+Switch has been deployed to namespace {{ .Release.Namespace }}.
+
+To check pod status:
+  kubectl get pods -n {{ .Release.Namespace }}
+
+To access services via port-forward:
+{{ if .Values.gateway.enabled }}
+  # Gateway (dashboard)
+  kubectl port-forward svc/{{ include "switch.fullname" . }}-gateway 3000:3000 -n {{ .Release.Namespace }}
+{{ end }}
+  # Switch Core (API{{ if not .Values.gateway.enabled }} and dashboard{{ end }})
+  kubectl port-forward svc/{{ include "switch.fullname" . }}-switch-core 8000:8000 -n {{ .Release.Namespace }}
+
+  # Mattermost
+  kubectl port-forward svc/{{ include "switch.fullname" . }}-mattermost 8065:8065 -n {{ .Release.Namespace }}
+
+
+Or use `just pf-all` to forward all services at once.
+{{ if eq .Values.ingress.mode "managed" }}
+This release renders a managed Ingress ({{ include "switch.fullname" . }}-web){{ if .Values.ingress.host }} for host {{ .Values.ingress.host }}{{ end }}.
+Point DNS at your ingress controller to reach the gateway and agent API.
+{{- else }}
+Ingress is in "existing" mode: no Ingress was rendered. Expose the gateway and
+agent API with your own controller (see the chart's samples/ingress.example.yaml)
+or set ingress.mode=managed.
+{{- end }}
+{{- if .Values.switchCore.teamsBridge.enabled }}
+
+── Microsoft Teams bridge ──────────────────────────────────────────────────────
+{{- $teams := .Values.switchCore.teamsBridge }}
+{{- $origin := include "switch.teamsPublicOrigin" . }}
+{{- if and (eq $teams.ingress.mode "dedicated") $teams.ingress.host }}
+A dedicated Ingress ({{ include "switch.fullname" . }}-teams) carries the two
+callback paths on host {{ $teams.ingress.host }}. Point its DNS at your ingress
+controller.
+{{- else if eq $teams.ingress.mode "dedicated" }}
+A dedicated Ingress ({{ include "switch.fullname" . }}-teams) carries the two
+callback paths, with no host rule — so it answers whatever Host header reaches
+it. That is the shape to use behind a CDN or reverse proxy that terminates TLS
+and owns the public name.
+
+Put that proxy in front of this Ingress's load balancer, and make sure it
+forwards query strings, allows POST and does NOT cache: Graph validates a new
+subscription with a POST carrying ?validationToken=, and a stripped or cached
+answer fails the handshake.
+{{- else if eq $teams.ingress.mode "shared" }}
+The two callback paths were added to the managed Ingress on host
+{{ .Values.ingress.host }}.
+{{- else }}
+Routing is set to "external": the chart rendered no route for the Teams paths.
+Add them to your own Ingress, both to {{ include "switch.switchCoreHost" . }}:{{ $teams.port }}
+and NOT to the API port:
+{{- range $path := .Values.ingress.teamsPaths }}
+  {{ $path }}
+{{- end }}
+{{- end }}
+{{ if $origin }}
+Set the bridge's public_base_url to exactly:
+
+  {{ $origin }}
+{{- $tlsHere := ternary $teams.ingress.tls.enabled .Values.ingress.tls.enabled (eq $teams.ingress.mode "dedicated") }}
+{{- if not $tlsHere }}
+
+⚠  https, even though TLS is disabled on this Ingress — Graph refuses a
+   plaintext URL, so that host has to be served over HTTPS by something in
+   front (a CDN, or a load balancer configured by annotation). If nothing is,
+   the bridge will create channels and then silently receive nothing.
+{{- end }}
+{{- else }}
+Set the bridge's public_base_url to the public HTTPS origin Microsoft will call
+— scheme and host only, no path.
+{{- if eq $teams.ingress.mode "external" }}
+
+The chart renders no Ingress in this mode, so it cannot tell you the origin:
+you route the two paths yourself, and the public name is whatever you route
+them from.
+{{- else }}
+
+This Ingress has no host of its own, so the chart cannot tell you: the public
+name belongs to whatever sits in front of it.
+{{- end }}
+{{- end }}
+
+Then verify from OUTSIDE the cluster, which is the part that usually fails:
+
+  curl -i "{{ if $origin }}{{ $origin }}{{ else }}https://<your-public-host>{{ end }}/api/teams/notifications?validationToken=ping"
+
+Expect 200 with `ping` echoed back. A timeout means it is not public; a 404
+means the path is missing or aimed at the API port. `helm test` checks the
+in-cluster half. See docs/bridges/TEAMS_SETUP.md.
+{{- end }}
+{{- if .Values.switchCore.collaborationCallback.enabled }}
+
+── Mattermost button presses ───────────────────────────────────────────────────
+Service {{ include "switch.switchCoreHost" . }} now publishes port {{ .Values.switchCore.collaborationCallback.port }}.
+
+For a Mattermost running inside this cluster, set the bridge's callback_base_url
+to exactly:
+
+  http://{{ include "switch.switchCoreHost" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.switchCore.collaborationCallback.port }}
+
+That is the address the Mattermost *server* calls, not one a browser follows, so
+it stays the cluster-internal name even where Mattermost itself is reached
+publicly. For a Mattermost outside this cluster, route this port to it yourself
+— the chart renders no Ingress — and the address is whatever you route it from.
+
+Either way, that host has to be on the Mattermost server's
+ServiceSettings.AllowedUntrustedInternalConnections: a whitespace-separated list,
+matched against the URL before DNS resolution. Mattermost will not call a private
+address it has not been given, and says so only in its own log.
+
+{{ if .Values.mattermost.enabled -}}
+This release has already put the Service name there for the Mattermost it
+deploys. Any other server needs the entry adding by hand.
+{{- else -}}
+This release deploys no Mattermost, so that entry is yours to add.
+{{- end }}
+
+Leave callback_base_url unset and the bridge draws no buttons at all: its
+requests are answered by typing, which is a reduced service and logs itself.
+Setting an address the server cannot reach is the worse case — the buttons are
+still drawn, and every press fails.
+{{- end }}
+
+⚠  BACK UP YOUR DATA — this chart ships no backup jobs.
+Postgres holds everything: every room, every message, every account, and the
+Mattermost database. Back it up. See BACKUP.md and
+samples/volumesnapshot.example.yaml for the recommended approaches
+(CSI VolumeSnapshots, pg_dump / managed-DB backups, Velero).
+{{- if and (eq .Values.postgresql.mode "managed") (not (include "switch.runtimePasswordSeparate" .)) }}
+
+── WARNING: database runtime role ──────────────────────────────────────────────
+The runtime role switch-core serves requests as ({{ include "switch.postgresUser" . }})
+shares the Postgres superuser's password, so the serving container effectively
+holds superuser credentials. Set secrets.dbRuntimePassword (or
+postgresql.managed.runtimeExistingSecret) to give it a password of its own.
+{{- end }}

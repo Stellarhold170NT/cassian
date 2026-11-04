@@ -1,0 +1,242 @@
+from __future__ import annotations
+
+import logging
+import time
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from switch_core.bridges.agent.api.activity_routes import router as activity_router
+from switch_core.bridges.agent.api.handlers import router as api_router
+from switch_core.bridges.agent.api.operations import router as operations_router
+from switch_core.bridges.agent.api.service_routes import router as service_router
+from switch_core.bridges.agent.api.version_routes import router as version_router
+from switch_core.bridges.agent.api_key_cache import ApiKeyCache
+from switch_core.bridges.agent.auth import (
+    BearerAuthMiddleware,
+    ControllerAuthenticator,
+)
+from switch_core.bridges.agent.deeplink import router as deeplink_router
+from switch_core.bridges.agent.dependencies import get_protocol, init_dependencies
+from switch_core.bridges.agent.mcp import create_mcp_app
+from switch_core.bridges.agent.protocol.agent_connections import AgentConnectionRegistry
+from switch_core.bridges.agent.protocol.agent_core import AgentCore
+from switch_core.bridges.agent.protocol.event_buffer import EventBuffer
+from switch_core.bridges.agent.room_access_cache import RoomAccessCache
+from switch_core.bridges.collaboration.lifecycle_service import (
+    CollaborationBridgeLifecycleService,
+)
+from switch_core.bridges.resource.service import ResourceService
+from switch_core.clients.client_lifecycle_service import ClientLifecycleService
+from switch_core.config import SwitchConfig
+from switch_core.db.stores.agent_session_store import AgentSessionStore
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.api_key_store import ApiKeyStore
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.gateway.ui import GatewayUi, GatewayUiMiddleware
+from switch_core.logging_context import log_context
+from switch_core.observability.http import MetricsMiddleware
+from switch_core.open_gate import OpenGate
+from switch_core.refusal_breaker import RefusalBreaker
+from switch_core.request_context import RequestContextMiddleware
+from switch_core.request_validation import public_errors
+from switch_core.room_service import RoomService
+from switch_core.session_activity.outcomes import ApprovalOutcomes
+from switch_core.sessions.errors import SessionError
+from switch_core.sessions.http import session_error_response
+from switch_core.telemetry import TelemetryService
+from switch_core.trust.client import TrustClient
+
+logger = logging.getLogger(__name__)
+
+
+def http_error_level(status_code: int) -> int:
+    """How loudly to log a refused request.
+
+    A 4xx is the caller's mistake (an argument the tool does not take, a room
+    it is not in): the server worked, so it is a warning. A 5xx is the
+    server's own failure and an error.
+    """
+    return logging.ERROR if status_code >= 500 else logging.WARNING
+
+
+async def log_http_exceptions(request: Request, exc: HTTPException) -> JSONResponse:
+    if exc.status_code >= 400:
+        logger.log(
+            http_error_level(exc.status_code),
+            "%s %s → %d: %s",
+            request.method,
+            request.url.path,
+            exc.status_code,
+            exc.detail,
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+
+async def log_validation_errors(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    # The log gets what the response gets and no more: the body that was sent,
+    # or an error's `input`, would put message text and secrets in the logs.
+    errors = public_errors(exc)
+    logger.warning(
+        "%s %s → 422 validation: errors=%s",
+        request.method,
+        request.url.path,
+        errors,
+    )
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+def create_agent_bridge_app(
+    *,
+    agent_store: AgentStore,
+    agent_session_store: AgentSessionStore,
+    room_store: RoomStore,
+    room_service: RoomService,
+    client_lifecycle: ClientLifecycleService,
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    event_buffer: EventBuffer,
+    resource_service: ResourceService,
+    api_key_store: ApiKeyStore,
+    external_user_store: ExternalUserStore,
+    bridge_store: CollaborationBridgeStore,
+    session_factory: object,
+    config: SwitchConfig,
+    approval_outcomes: ApprovalOutcomes,
+    controller_auth: ControllerAuthenticator | None,
+    trust_client: TrustClient,
+    gateway_ui: GatewayUi | None,
+    connections: AgentConnectionRegistry | None = None,
+    room_access: RoomAccessCache | None = None,
+    telemetry: TelemetryService | None = None,
+) -> tuple[FastAPI, AgentCore]:
+    # One registry for the whole process: the live connection set is the source
+    # of truth for reachability, so every service must see the same one. The
+    # caller may supply it, and main.py does, because the agent clients are
+    # wired before this app is built and read presence from the same registry.
+    if connections is None:
+        connections = AgentConnectionRegistry()
+
+    # One cache for the whole process, for the same reason as `connections`:
+    # the HTTP door and the MCP door each carry their own auth middleware, and
+    # a rotated key must stop working on both the moment it is rotated.
+    api_key_cache = ApiKeyCache(
+        ttl_seconds=config.agent_auth_cache_ttl_seconds,
+        max_entries=config.agent_auth_cache_max_entries,
+    )
+
+    init_dependencies(
+        agent_store=agent_store,
+        agent_session_store=agent_session_store,
+        room_store=room_store,
+        room_service=room_service,
+        client_lifecycle=client_lifecycle,
+        collab_lifecycle=collab_lifecycle,
+        event_buffer=event_buffer,
+        connections=connections,
+        resource_service=resource_service,
+        api_key_store=api_key_store,
+        api_key_cache=api_key_cache,
+        external_user_store=external_user_store,
+        bridge_store=bridge_store,
+        session_factory=session_factory,
+        config=config,
+        approval_outcomes=approval_outcomes,
+        trust_client=trust_client,
+        room_access=room_access,
+        telemetry=telemetry,
+    )
+
+    # The one `init_dependencies` just built, not a second of its own. Every
+    # HTTP handler resolves that instance through `Depends(get_protocol)`, so
+    # a second one here is an object whose wiring no request ever sees — which
+    # is how the agent bridge came to emit every session event into a
+    # telemetry service that was None.
+    protocol = get_protocol()
+
+    app = FastAPI(title="Switch Agent Bridge API")
+
+    app.add_exception_handler(HTTPException, log_http_exceptions)  # type: ignore[arg-type]
+    app.add_exception_handler(RequestValidationError, log_validation_errors)  # type: ignore[arg-type]
+    app.add_exception_handler(SessionError, session_error_response)
+    app.include_router(activity_router, tags=["session activity"])
+    app.include_router(api_router, prefix="/agents", tags=["api"])
+    if config.service_connections_enabled:
+        app.include_router(
+            service_router, prefix="/agents", tags=["service connections"]
+        )
+    app.include_router(operations_router)
+    app.include_router(deeplink_router, tags=["deeplink"])
+    app.include_router(version_router, tags=["version"])
+
+    app.state.config = config
+
+    mcp_asgi, mcp_lifespan = create_mcp_app(
+        agent_store=agent_store,
+        api_key_store=api_key_store,
+        protocol=protocol,
+        config=config,
+    )
+    app.mount("/mcp", mcp_asgi)
+    app.router.lifespan_context = mcp_lifespan
+
+    app.add_middleware(
+        BearerAuthMiddleware,
+        agent_store=agent_store,
+        api_key_store=api_key_store,
+        api_key_cache=api_key_cache,
+        session_factory=session_factory,  # type: ignore[arg-type]
+        controller_auth=controller_auth,
+    )
+    # Outside the bearer middleware, so an open the process cannot take yet is
+    # told when to come back before its credential is looked up.
+    app.add_middleware(OpenGate, limit=config.agent_open_limit, clock=time.monotonic)
+    # Outside the bearer middleware, so a caller that keeps repeating a refused
+    # request is answered before its credential is looked up again.
+    app.add_middleware(RefusalBreaker, clock=time.monotonic)
+    # Outside the bearer middleware and the breaker, because a page load carries
+    # a cookie and no agent key; inside the metrics, so page loads are counted.
+    if gateway_ui is not None:
+        app.add_middleware(GatewayUiMiddleware, ui=gateway_ui, router=app.router)
+    # Outside the bearer middleware, so a request rejected for bad credentials
+    # is still counted and timed — an authentication failure is traffic, and a
+    # spike of it is the thing you most want a dashboard to show.
+    app.add_middleware(MetricsMiddleware)
+    # Tags every log line of an agent request as the agent bridge's, as a
+    # field. Only agent paths: the gateway is mounted on this same app.
+    app.add_middleware(AgentBridgeLogContextMiddleware)
+    # Added last, so it wraps the bearer middleware: a request rejected for bad
+    # credentials is logged with a request id like any other.
+    app.add_middleware(RequestContextMiddleware)
+
+    return app, protocol
+
+
+class AgentBridgeLogContextMiddleware:
+    """Binds `bridge="agent"` for requests to the agent bridge's own paths.
+
+    Pure ASGI rather than `BaseHTTPMiddleware`, so the binding covers a
+    streamed response (the SSE stream) for as long as it runs, and is reset in
+    the same context it was set in.
+    """
+
+    _PREFIXES = ("/agents", "/mcp")
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "") if scope["type"] in ("http", "websocket") else ""
+        if not path.startswith(self._PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        with log_context(bridge="agent"):
+            await self.app(scope, receive, send)

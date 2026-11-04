@@ -1,0 +1,88 @@
+import { detectPlatform } from '@tanstack/react-hotkeys';
+import { PanelLeft } from 'lucide-react';
+import { type ReactNode } from 'react';
+import { NavButtons } from '@renderer/lib/components/nav-buttons';
+import { useWorkspaceLayoutContext } from '@renderer/lib/layout/layout-provider';
+import { Button } from '@renderer/lib/ui/button';
+import { BoundShortcut } from '@renderer/lib/ui/shortcut';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@renderer/lib/ui/tooltip';
+import { cn } from '@renderer/utils/utils';
+
+const isLinux = detectPlatform() === 'linux';
+
+export function Titlebar({
+  leftSlot,
+  rightSlot,
+  className,
+  leftClassName,
+  rightClassName,
+}: {
+  leftSlot?: ReactNode;
+  rightSlot?: ReactNode;
+  className?: string;
+  leftClassName?: string;
+  rightClassName?: string;
+}) {
+  const { setCollapsed, isLeftOpen } = useWorkspaceLayoutContext();
+  return (
+    <header
+      className={cn(
+        // No fill and no bottom rule: the header is part of the panel's own
+        // surface, so a bar across the top of it would read as a second
+        // divider next to the gutter that already separates panel from
+        // sidebar.
+        'flex h-11 shrink-0 items-center [-webkit-app-region:drag]',
+        // No traffic-light padding here: with the sidebar collapsed the panel
+        // itself now starts below them (see `WorkspaceLayout`), which also
+        // covers the views that render no titlebar at all.
+        // Linux draws its own controls flush to the right corner (no native
+        // frame); everywhere else keep the normal right padding.
+        isLinux ? 'pr-0' : 'pr-[18px]',
+        className
+      )}
+    >
+      <div className="pointer-events-auto flex min-w-0 flex-1 items-center gap-1 self-stretch">
+        {!isLeftOpen && <div className="[-webkit-app-region:no-drag]"></div>}
+        <div className="flex w-full items-center justify-between self-stretch">
+          <div
+            className={cn(
+              'flex items-center justify-start [-webkit-app-region:no-drag]',
+              leftClassName
+            )}
+          >
+            {!isLeftOpen && (
+              <div className="ml-2 flex items-center gap-0.5 [-webkit-app-region:no-drag]">
+                <Tooltip>
+                  <TooltipTrigger>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="size-7 p-0"
+                      onClick={() => setCollapsed('left', isLeftOpen)}
+                    >
+                      <PanelLeft className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    Toggle left sidebar
+                    <BoundShortcut settingsKey="toggleLeftSidebar" variant="badge" />
+                  </TooltipContent>
+                </Tooltip>
+                <NavButtons />
+              </div>
+            )}
+            {leftSlot}
+          </div>
+          <div
+            className={cn(
+              'flex items-center justify-end [-webkit-app-region:no-drag]',
+              rightClassName
+            )}
+          >
+            {rightSlot}
+          </div>
+        </div>
+      </div>
+    </header>
+  );
+}

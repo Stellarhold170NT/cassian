@@ -1,0 +1,405 @@
+"""Scoped agent-addressing permissions (CHOO-1585).
+
+Controls WHO may *address* an agent — i.e. cause it to receive a message it is
+expected to respond to (an `@name` / `@alias` / `@role` mention or a targeted
+message). An agent with no policy is open to any room
+participant; this module adds a per-agent allow-list model.
+
+Model:
+  - Each agent carries an `AddressingPolicy`: an ordered list of allow-rules.
+  - A rule constrains four dimensions of the *incoming* addressing attempt:
+      * `rooms`       — the room the message is in
+      * `room_groups` — the group that room belongs to (``None`` if ungrouped)
+      * `users`       — matched when the sender is a human
+      * `agents`      — matched when the sender is another agent
+  - Each dimension is either ``"*"`` (any), or an explicit list of ids. An
+    empty list ``[]`` is the "none" value: it matches nothing. The sender is
+    exactly one kind (user, agent, or platform), so a rule that should admit
+    only humans sets ``agents: []`` and vice-versa.
+  - A rule carries a ``platform`` boolean. When True, the rule admits the
+    Switch platform as a sender. Platform is denied by default, even by an
+    open policy (no rules), so an agent must opt in with ``platform=True``.
+  - A rule additionally carries two *symbolic* subjects (CHOO-2137), resolved
+    at enforcement time rather than stored as ids, so they survive the owner
+    claiming a new platform identity, a bridge being recreated, or the agent
+    changing hands:
+      * `owner`        — the agent's own owner, whoever that currently is.
+                         Human senders only.
+      * `owner_agents` — any agent owned by that same person. Agent senders
+                         only. This is what keeps an owner's own orchestration
+                         working under an owner-scoped policy: the manager
+                         dispatching a worker is the owner acting through a
+                         program, and naming each agent by id would break the
+                         moment they register a new one.
+    Both are per-rule, so they carry that rule's room scoping like any other
+    dimension.
+  - A rule *allows* an attempt when the context matches (room AND group) AND
+    the sender matches (its own kind's dimension, or `owner` for a human).
+    Addressing is permitted when **any** rule allows it.
+
+Defaults / precedence:
+  - An agent with **no rules** is open: anyone may address it. This is what a
+    pre-CHOO-2137 agent carries, and it is preserved rather than migrated.
+  - With rules present it is **deny-by-default**: only attempts matching a rule
+    are permitted.
+  - New agents start on `default_agent_policy`: their owner and the owner's
+    own agents, rather than open. Agents created earlier keep whatever policy
+    they were created with.
+  - **Platform senders are always deny-by-default**, even for an open
+    policy. An agent needs a rule with ``platform=True`` to receive the
+    platform's own messages. A platform message sent on a person's behalf is
+    judged as that person instead (`allows_on_behalf_of`), so the platform
+    never reaches an agent the person could not.
+
+This module is deliberately pure (no DB, no I/O) so it is trivially testable
+and reusable from the receive path, the protocol service, and the gateway.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, field_validator
+
+SenderKind = Literal["user", "agent", "platform"]
+
+ANY = "*"
+
+# A dimension is "*" (any) or an explicit list of ids ([] = none / match nothing).
+Dimension = str | list[str]
+
+
+class AddressingRule(BaseModel):
+    """One allow-rule. An attempt is allowed when it matches this rule on all
+    four dimensions (see module docstring). Each dimension defaults to ``"*"``
+    (unconstrained); note that leaving ``users``/``agents`` at ``"*"`` admits
+    that whole sender kind — set the one you want to exclude to ``[]``."""
+
+    rooms: Dimension = ANY
+    room_groups: Dimension = ANY
+    users: Dimension = ANY
+    agents: Dimension = ANY
+    owner: bool = False
+    owner_agents: bool = False
+    platform: bool = False
+
+    @field_validator("rooms", "room_groups", "users", "agents")
+    @classmethod
+    def _valid_dimension(cls, value: Dimension) -> Dimension:
+        if value == ANY:
+            return value
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return value
+        raise ValueError(f'dimension must be "*" or a list of ids, got {value!r}')
+
+    def _matches(
+        self,
+        *,
+        room_id: str,
+        group_id: str | None,
+        sender_kind: SenderKind,
+        sender_id: str,
+        sender_user_ids: list[str],
+        sender_owner_user_id: str | None,
+        owner_user_id: str | None,
+    ) -> bool:
+        if not _dim_contains(self.rooms, room_id):
+            return False
+        if not _dim_contains(self.room_groups, group_id):
+            return False
+        if sender_kind == "platform":
+            return self.platform
+        if sender_kind == "user" and self._is_owner(sender_user_ids, owner_user_id):
+            return True
+        if sender_kind == "agent" and self._is_owners_agent(
+            sender_owner_user_id, owner_user_id
+        ):
+            return True
+        sender_dim = self.users if sender_kind == "user" else self.agents
+        return _dim_contains(sender_dim, sender_id)
+
+    def _is_owner(self, sender_user_ids: list[str], owner_user_id: str | None) -> bool:
+        """Whether this rule admits the sender as the agent's owner.
+
+        A platform account may be claimed by several Switch users, so the
+        sender arrives as the set of users who say it is theirs; the owner
+        need only be among them. An ownerless agent has no owner to match, and
+        an unclaimed account resolves to nobody — both answer "not the owner"
+        rather than making a permissive guess.
+        """
+        if not self.owner:
+            return False
+        if owner_user_id is None:
+            return False
+        return owner_user_id in sender_user_ids
+
+    def _is_owners_agent(
+        self, sender_owner_user_id: str | None, owner_user_id: str | None
+    ) -> bool:
+        """Whether this rule admits the sender as an agent of the same owner.
+
+        Both sides must be owned for this to mean anything: two ownerless
+        agents are not each other's, and an ownerless target has nobody whose
+        agents these would be. Either one missing answers "no" rather than
+        letting an unowned agent inherit the fleet's trust.
+        """
+        if not self.owner_agents:
+            return False
+        if owner_user_id is None or sender_owner_user_id is None:
+            return False
+        return sender_owner_user_id == owner_user_id
+
+
+class AddressingPolicy(BaseModel):
+    """An agent's addressing allow-list. Empty ``rules`` → allow-all."""
+
+    rules: list[AddressingRule] = []
+
+    def is_open(self) -> bool:
+        """True when the policy imposes no restriction (no rules)."""
+        return not self.rules
+
+    def allows(
+        self,
+        *,
+        room_id: str,
+        group_id: str | None,
+        sender_kind: SenderKind,
+        sender_id: str,
+        sender_user_ids: list[str],
+        sender_owner_user_id: str | None,
+        owner_user_id: str | None,
+    ) -> bool:
+        """Whether an addressing attempt from this sender, in this room, is
+        permitted. Allow-all when the policy is open; otherwise permitted iff
+        at least one rule matches.
+
+        Platform senders are denied even by an open policy; an agent must opt
+        in with a rule that sets ``platform=True``.
+
+        `sender_user_ids` are the Switch users who have claimed a human
+        sender's platform account (empty when nobody has);
+        `sender_owner_user_id` is who owns an agent sender (None for a human
+        or an ownerless agent); `owner_user_id` is the addressed agent's
+        owner. Together they resolve the `owner` and `owner_agents` rules.
+        """
+        if self.is_open() and sender_kind != "platform":
+            return True
+        return any(
+            rule._matches(
+                room_id=room_id,
+                group_id=group_id,
+                sender_kind=sender_kind,
+                sender_id=sender_id,
+                sender_user_ids=sender_user_ids,
+                sender_owner_user_id=sender_owner_user_id,
+                owner_user_id=owner_user_id,
+            )
+            for rule in self.rules
+        )
+
+    def admits_others(self, *, owner_identity_ids: set[str]) -> bool:
+        """Whether anyone but the owner may address the agent, and so have it
+        act on what its owner granted it.
+
+        An open policy does; so does any rule that admits every human
+        (``"*"``, whatever its rooms), a human by an identity the owner has
+        not claimed, or any agent named by id or ``"*"``. The owner's own
+        agents (``owner_agents``) do not count: they already act for the
+        owner, so the default policy raises no warning. `owner_identity_ids`
+        are the platform identities the owner has claimed. A platform rule is
+        not counted: the platform acting for a person is judged as that person
+        (`allows_on_behalf_of`).
+
+        This only reports the exposure; it does not refuse anything.
+        """
+        if self.is_open():
+            return True
+        return any(
+            _admits_beyond(rule.users, owner_identity_ids) or rule.agents != []
+            for rule in self.rules
+        )
+
+    def requires_owner_identity(self) -> bool:
+        """Whether any rule depends on resolving the owner's platform identity.
+
+        Used to warn an operator that an agent is unreachable until its owner
+        claims an identity on the bridges it works over — the difference
+        between a policy that is merely strict and one that admits nobody.
+        """
+        return any(rule.owner for rule in self.rules)
+
+
+def _dim_contains(dimension: Dimension, value: str | None) -> bool:
+    """Whether a single dimension admits ``value``. ``"*"`` admits anything;
+    a list admits only its members; ``None`` (e.g. an ungrouped room) is admitted
+    only by ``"*"``."""
+    if dimension == ANY:
+        return True
+    if value is None:
+        return False
+    return value in dimension
+
+
+def _admits_beyond(dimension: Dimension, own: set[str]) -> bool:
+    """Whether a sender dimension admits anyone outside `own`."""
+    return dimension == ANY or any(value not in own for value in dimension)
+
+
+def parse_policy(raw: dict | None) -> AddressingPolicy:
+    """Build a policy from a stored JSONB blob (``None`` → open policy)."""
+    if not raw:
+        return AddressingPolicy()
+    return AddressingPolicy.model_validate(raw)
+
+
+def owner_only_policy(allowed_agent_ids: list[str]) -> AddressingPolicy:
+    """Owner-only: the agent's owner anywhere, and nobody else.
+
+    No other human, and no agent except those explicitly granted.
+    `allowed_agent_ids` names individual dispatchers by id; empty means the
+    agent answers only to its owner, in person.
+    """
+    return AddressingPolicy(
+        rules=[
+            AddressingRule(
+                rooms=ANY,
+                room_groups=ANY,
+                users=[],
+                agents=list(allowed_agent_ids),
+                owner=True,
+            )
+        ]
+    )
+
+
+def owner_and_owner_agents_policy() -> AddressingPolicy:
+    """The owner, plus any agent that owner runs (CHOO-2137).
+
+    What every new agent starts on (`default_agent_policy`). Strict owner-only
+    is one step too strict to be the thing everyone starts on: an owner's
+    manager agent dispatching their worker is still the owner acting, and an
+    agent that refuses its own owner's orchestration looks broken rather than
+    private. Somebody else's agent is admitted by neither.
+    """
+    return AddressingPolicy(
+        rules=[
+            AddressingRule(
+                rooms=ANY,
+                room_groups=ANY,
+                users=[],
+                agents=[],
+                owner=True,
+                owner_agents=True,
+            )
+        ]
+    )
+
+
+def default_agent_policy() -> AddressingPolicy:
+    """The policy a new agent gets when its creator makes no choice.
+
+    The one place the default is decided: registration, `create_agent`,
+    template runs and Switch Console all start from it. Agents that already
+    exist keep the policy they were created with.
+    """
+    return owner_and_owner_agents_policy()
+
+
+AddressingKind = Literal["owner_only", "owner_and_owner_agents", "anyone", "custom"]
+
+
+def policy_kind(raw: dict | None) -> AddressingKind:
+    """Which of the choices Switch Console offers a stored policy is.
+
+    "owner_only", "owner_and_owner_agents" and "anyone" are the three
+    shortcuts; "custom" is every other rule set, including owner-only with
+    agents granted by id. "anyone" is an open policy, which still turns the
+    platform's own messages away.
+    """
+    policy = parse_policy(raw)
+    if policy.is_open():
+        return "anyone"
+    if policy == owner_only_policy([]):
+        return "owner_only"
+    if policy == owner_and_owner_agents_policy():
+        return "owner_and_owner_agents"
+    return "custom"
+
+
+def platform_allowed_policy() -> AddressingPolicy:
+    """A policy that admits the platform sender.
+
+    Returns a single rule allowing ``platform`` in any room. Combine with
+    owner/agent rules by appending to their rule list rather than replacing
+    their policy with this one.
+    """
+    return AddressingPolicy(
+        rules=[
+            AddressingRule(
+                rooms=ANY,
+                room_groups=ANY,
+                users=[],
+                agents=[],
+                platform=True,
+            )
+        ]
+    )
+
+
+def allows_on_behalf_of(
+    policy: AddressingPolicy,
+    *,
+    room_id: str,
+    group_id: str | None,
+    user_id: str,
+    external_user_ids: list[str],
+    owner_user_id: str | None,
+) -> bool:
+    """Whether the platform may address this agent with `user_id`'s authority.
+
+    The answer is exactly what the policy would say to that person speaking
+    in the room themselves: an open policy admits them, an owner rule admits
+    them when they own the agent, and a ``users`` list admits them when one
+    of the platform accounts they have claimed (`external_user_ids`) is in
+    it. A person with no claimed account can still pass ``users: "*"`` and an
+    owner rule, which is what they could do as a human sender too.
+    """
+    if policy.is_open():
+        return True
+    candidates = external_user_ids or [""]
+    return any(
+        policy.allows(
+            room_id=room_id,
+            group_id=group_id,
+            sender_kind="user",
+            sender_id=external_id,
+            sender_user_ids=[user_id],
+            sender_owner_user_id=None,
+            owner_user_id=owner_user_id,
+        )
+        for external_id in candidates
+    )
+
+
+def can_address(
+    policy: AddressingPolicy,
+    *,
+    room_id: str,
+    group_id: str | None,
+    sender_kind: SenderKind,
+    sender_id: str,
+    sender_user_ids: list[str],
+    sender_owner_user_id: str | None,
+    owner_user_id: str | None,
+) -> bool:
+    """Convenience free function mirroring :meth:`AddressingPolicy.allows`."""
+    return policy.allows(
+        room_id=room_id,
+        group_id=group_id,
+        sender_kind=sender_kind,
+        sender_id=sender_id,
+        sender_user_ids=sender_user_ids,
+        sender_owner_user_id=sender_owner_user_id,
+        owner_user_id=owner_user_id,
+    )

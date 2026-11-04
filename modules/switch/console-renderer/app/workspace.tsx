@@ -1,0 +1,190 @@
+import { observer } from 'mobx-react-lite';
+import { useEffect, useState, type ReactNode } from 'react';
+import { shouldCatchUpIntro } from '@renderer/features/onboarding/intro-catch-up';
+import { OnboardingFlow } from '@renderer/features/onboarding/onboarding-flow';
+import { OnboardingIntro } from '@renderer/features/onboarding/onboarding-intro';
+import { onboardingStore } from '@renderer/features/onboarding/onboarding-store';
+import { LeftSidebar } from '@renderer/features/sidebar/left-sidebar';
+import { BuddyIntroDialog } from '@renderer/features/switch-buddy/buddy-intro-dialog';
+import { RoomEmbedLayer } from '@renderer/features/switch-rooms/room-embed-layer';
+import { FrozenBanner, frozenServer } from '@renderer/features/switch-servers/frozen-workspace';
+import { FROZEN } from '@renderer/features/switch-servers/managed-server-state';
+import { switchServersStore } from '@renderer/features/switch-servers/switch-servers-store';
+import { CommandShortcutBinder } from '@renderer/lib/commands/command-shortcut-binder';
+import { AppKeyboardShortcuts } from '@renderer/lib/components/app-keyboard-shortcuts';
+import { MonacoKeyboardBridge } from '@renderer/lib/components/monaco-keyboard-bridge';
+import { preloadFeatureFlags } from '@renderer/lib/hooks/useFeatureFlags';
+import { useTheme } from '@renderer/lib/hooks/useTheme';
+import { useCurrentViewId, useWorkspaceWrapParams } from '@renderer/lib/layout/navigation-provider';
+import { WorkspaceContentLayout, WorkspaceLayout } from '@renderer/lib/layout/workspace-layout';
+import { useWorkspaceSlots } from '@renderer/lib/layout/workspace-slots';
+import { Button } from '@renderer/lib/ui/button';
+import { Spinner } from '@renderer/lib/ui/spinner';
+import { Toaster } from '@renderer/lib/ui/toaster';
+import { BUILD_FEATURE_FLAGS } from '@shared/core/feature-flags/feature-flags';
+import { shellShape } from './shell-shape';
+import { viewWorksWithoutServer } from './view-registry';
+
+/**
+ * What fills the window.
+ *
+ * Two shapes, not one: the workspace — sidebar, views, the room layer — and the
+ * onboarding flow that takes the whole window before there is any server to
+ * show. The choice is made here rather than inside a view because it is the
+ * chrome itself that differs; an onboarding page rendered into the workspace
+ * would sit beside a sidebar listing nothing.
+ *
+ * The server list is read here for the same reason. It used to be loaded by the
+ * sidebar, which is no longer always mounted, and the shell cannot ask a
+ * component it may not render which shape to take.
+ */
+export const Workspace = observer(function Workspace() {
+  useTheme();
+  const { WrapView } = useWorkspaceSlots();
+  const { wrapParams } = useWorkspaceWrapParams();
+
+  useEffect(() => {
+    void switchServersStore.init();
+  }, []);
+
+  return (
+    <>
+      <AppKeyboardShortcuts />
+      <CommandShortcutBinder />
+      <MonacoKeyboardBridge />
+      <Shell
+        mainContent={
+          <WrapView {...wrapParams}>
+            <WorkspaceViewContent />
+          </WrapView>
+        }
+      />
+      <Toaster />
+    </>
+  );
+});
+
+/** How long the window waits for the servers' feature flags before drawing without them. */
+const FLAGS_WAIT_MS = 3_000;
+
+/**
+ * Whether the servers' feature flags have been read, or waited for long
+ * enough: until then the workspace is not drawn, since what it shows — the
+ * sidebar's sections, an agent's tabs — depends on them, and drawing it
+ * first redraws it a moment later.
+ */
+function useFlagsReady(): boolean {
+  const ids = switchServersStore.loaded ? switchServersStore.servers.map((s) => s.id) : null;
+  const key = ids?.join(',') ?? null;
+  const [readyFor, setReadyFor] = useState<string | null>(null);
+  useEffect(() => {
+    if (key === null) return;
+    let live = true;
+    void preloadFeatureFlags(key ? key.split(',') : [], FLAGS_WAIT_MS).finally(() => {
+      if (live) setReadyFor(key);
+    });
+    return () => {
+      live = false;
+    };
+  }, [key]);
+  // A server added later is read as it is added; only the first wait holds the window.
+  return readyFor !== null || key === '';
+}
+
+const Shell = observer(function Shell({ mainContent }: { mainContent: ReactNode }) {
+  const currentViewId = useCurrentViewId();
+  const flagsReady = useFlagsReady();
+  const shape = shellShape({
+    loaded: switchServersStore.loaded,
+    listError: switchServersStore.listError,
+    installIsEmpty: switchServersStore.installIsEmpty,
+    viewWorksWithoutServer: viewWorksWithoutServer(currentViewId),
+    onboardingInProgress: onboardingStore.inProgress,
+    onboardingEnabled: BUILD_FEATURE_FLAGS.onboarding,
+  });
+  const catchUpIntro = shouldCatchUpIntro({
+    shape,
+    loaded: switchServersStore.loaded,
+    installIsEmpty: switchServersStore.installIsEmpty,
+    onboardingInProgress: onboardingStore.inProgress,
+    onboardingEnabled: BUILD_FEATURE_FLAGS.onboarding,
+    introSeen: onboardingStore.introSeen,
+  });
+
+  switch (shape) {
+    // Nothing on screen rather than a spinner: this is one or two local IPC
+    // round-trips, and a spinner that flashes is worse than a beat of window.
+    case 'loading':
+      return null;
+    case 'failed':
+      return (
+        <ShellFailure
+          message={switchServersStore.listError ?? 'Could not load your Switch servers.'}
+          detail={switchServersStore.listErrorDetail}
+          retrying={switchServersStore.loadingServers}
+        />
+      );
+    case 'onboarding':
+      return <OnboardingFlow />;
+    case 'workspace': {
+      // In place of the workspace rather than over it, so nothing the
+      // workspace pops up on its own — the switch-buddy pop-up — opens behind it.
+      if (catchUpIntro) return <OnboardingIntro onDone={() => onboardingStore.introPlayed()} />;
+      if (!flagsReady) return null;
+      // A workspace whose server can't answer stays where it was, under a
+      // banner, rather than filling with errors from every call that fails.
+      const frozen = frozenServer(currentViewId);
+      return (
+        <>
+          <WorkspaceLayout
+            leftSidebar={<LeftSidebar />}
+            mainContent={mainContent}
+            persistentLayer={<RoomEmbedLayer />}
+            banner={frozen ? <FrozenBanner server={frozen} /> : null}
+            contentClassName={frozen ? FROZEN : undefined}
+          />
+          {!frozen && <BuddyIntroDialog />}
+        </>
+      );
+    }
+  }
+});
+
+/**
+ * The window when the first read of the server list failed.
+ *
+ * A retry runs on this page rather than replacing it. The read clears nothing
+ * as it starts, so the message, the detail and the button all stay put and the
+ * button says it is working — otherwise pressing it would unmount the only
+ * thing on screen and leave a blank window for as long as the retry took.
+ */
+function ShellFailure({
+  message,
+  detail,
+  retrying,
+}: {
+  message: string;
+  detail: string | null;
+  retrying: boolean;
+}) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 bg-background p-8 text-center [-webkit-app-region:drag]">
+      <p className="text-sm text-foreground">{message}</p>
+      {detail && <p className="max-w-md text-xs text-foreground-muted">{detail}</p>}
+      <Button
+        className="[-webkit-app-region:no-drag]"
+        variant="outline"
+        disabled={retrying}
+        onClick={() => void switchServersStore.init()}
+      >
+        {retrying && <Spinner size="sm" className="mr-2" />}
+        {retrying ? 'Trying again…' : 'Try again'}
+      </Button>
+    </div>
+  );
+}
+
+function WorkspaceViewContent() {
+  const { TitlebarSlot, MainPanel } = useWorkspaceSlots();
+  return <WorkspaceContentLayout titlebarSlot={<TitlebarSlot />} mainPanel={<MainPanel />} />;
+}

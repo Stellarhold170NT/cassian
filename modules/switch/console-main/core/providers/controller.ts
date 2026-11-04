@@ -1,0 +1,162 @@
+import type { InstallMethod } from '@switch-console/core/deps';
+import type {
+  DependencyId,
+  DependencyProbeOptions,
+  HostDependencySelection,
+  InstallOverride,
+} from '@switch-console/core/deps/runtime';
+import { reportedCliAction } from '@main/core/telemetry/cli-action';
+import { ensureUserBinDirsInPath } from '@main/utils/userEnv';
+import type { ProviderCustomConfig } from '@shared/core/app-settings';
+import {
+  type AgentProviderDefinition,
+  type AgentProviderId,
+  agentProviders,
+} from '@shared/core/providers/agent-provider-registry';
+import { createRPCController } from '@shared/lib/ipc/rpc';
+import { clearResolvedPathCache } from '../agent-runtime/impl/resolve-agent-executable';
+import { agentUpdateService } from '../dependencies/agent-update-service';
+import { getDependencyManager } from '../dependencies/dependency-managers';
+import { hostDependencyStore } from '../dependencies/host-dependency-store';
+import { providerOverrideSettings } from '../settings/provider-settings-service';
+import {
+  buildAgentPayload,
+  buildAgentPayloads,
+  toAgentInstallationStatus,
+} from './agent-payload-builder';
+import { providerLoginRunner } from './provider-login';
+
+/** Enrich a manager HostDependency snapshot with latestVersion/updateAvailable from the coordinator. */
+const enrichHostDep = (
+  id: DependencyId,
+  hostDep: Parameters<typeof agentUpdateService.enrichHostDependency>[1]
+) => agentUpdateService.enrichHostDependency(id, hostDep);
+
+/**
+ * The target every CLI action reported from here carries.
+ *
+ * Always local. This controller accepts a connection id and discards it —
+ * `getDependencyManager` returns the local manager whatever it is given — so
+ * nothing reached through it runs anywhere else.
+ */
+const TARGET = 'local';
+
+export const providersController = createRPCController({
+  // ── Metadata ────────────────────────────────────────────────────────────────
+
+  /** The provider catalogue the renderer installs before its first render. */
+  catalogue: (): readonly AgentProviderDefinition[] => agentProviders(),
+
+  list: async (connectionId?: string) => {
+    const mgr = await getDependencyManager(connectionId);
+    return buildAgentPayloads(mgr.platform, mgr, enrichHostDep);
+  },
+
+  get: async (id: string, connectionId?: string) => {
+    const mgr = await getDependencyManager(connectionId);
+    return buildAgentPayload(id, mgr.platform, mgr, enrichHostDep);
+  },
+
+  // ── Installation status ──────────────────────────────────────────────────────
+
+  listAgentInstallationStatus: async (connectionId?: string) => {
+    const mgr = await getDependencyManager(connectionId);
+    return Array.from(mgr.getAll().values())
+      .filter((s) => s.category === 'agent')
+      .map((state) => {
+        const rawHostDep = mgr.getHostDependency(state.id as DependencyId);
+        const hostDep = rawHostDep
+          ? agentUpdateService.enrichHostDependency(state.id as DependencyId, rawHostDep)
+          : undefined;
+        return toAgentInstallationStatus(state.id, connectionId, state, hostDep);
+      });
+  },
+
+  // ── Install / update ─────────────────────────────────────────────────────────
+
+  install: async (id: AgentProviderId, connectionId?: string, method?: InstallMethod) => {
+    const mgr = await getDependencyManager(connectionId);
+    const result = await reportedCliAction('install', TARGET, id, method, () =>
+      mgr.install(id, method)
+    );
+    if (result.success) {
+      // Persist the chosen method as an override, or clear to auto when no method was chosen.
+      // Do NOT auto-promote the inferred method — that would freeze a heuristic guess.
+      const override: InstallOverride | null = method ? { kind: 'method', method } : null;
+      await hostDependencyStore.setSelection(connectionId ?? 'local', id, override);
+      clearResolvedPathCache(id, connectionId);
+    }
+    return result;
+  },
+
+  update: async (id: AgentProviderId, connectionId?: string, method?: InstallMethod) => {
+    const mgr = await getDependencyManager(connectionId);
+    return reportedCliAction('update', TARGET, id, method, () => mgr.update(id, method));
+  },
+
+  uninstall: async (id: AgentProviderId, connectionId?: string, method?: InstallMethod) => {
+    const mgr = await getDependencyManager(connectionId);
+    return reportedCliAction('uninstall', TARGET, id, method, () => mgr.uninstall(id, method));
+  },
+
+  // ── Sign-in ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Runs the provider's own sign-in command on this computer. What it writes
+   * arrives on `providerLoginLineChannel`, and its end on
+   * `providerLoginExitChannel`, both under the attempt id returned.
+   */
+  startLogin: (id: AgentProviderId): { attemptId: string } => providerLoginRunner.start(id),
+
+  cancelLogin: (): void => providerLoginRunner.cancel(),
+
+  // ── Settings ─────────────────────────────────────────────────────────────────
+
+  getDefaultSettings: async (id: string): Promise<ProviderCustomConfig | null> => {
+    const meta = await providerOverrideSettings.getItemWithMeta(id);
+    return meta?.defaults ?? null;
+  },
+
+  getSettings: async (id: string) => {
+    return providerOverrideSettings.getItemWithMeta(id);
+  },
+
+  updateSettings: (id: string, config: Partial<ProviderCustomConfig>): Promise<void> =>
+    providerOverrideSettings.updateItem(id, config),
+
+  // ── Selection + probe ────────────────────────────────────────────────────────
+
+  setUsedInstallation: async (
+    id: DependencyId,
+    connectionId?: string,
+    selection?: HostDependencySelection
+  ): Promise<void> => {
+    // undefined = no-op; null = explicit auto (clear override)
+    if (selection === undefined) return;
+    await hostDependencyStore.setSelection(connectionId ?? 'local', id, selection);
+    clearResolvedPathCache(id, connectionId);
+    const mgr = await getDependencyManager(connectionId);
+    await mgr.probe(id);
+  },
+
+  refreshLatestVersion: async (id: DependencyId, connectionId?: string): Promise<void> => {
+    await agentUpdateService.refreshLatestVersion(id, connectionId);
+  },
+
+  probeOverride: async (
+    id: DependencyId,
+    selection: { path?: string; cli?: string },
+    connectionId?: string
+  ) => {
+    const mgr = await getDependencyManager(connectionId);
+    return mgr.probeOverride(id, selection);
+  },
+
+  probeAll: async (connectionId?: string, options?: DependencyProbeOptions) => {
+    // A CLI installed since start, by hand or by its own installer, is often in
+    // ~/.local/bin, which this computer's controller always looks in.
+    if (!connectionId) ensureUserBinDirsInPath();
+    const mgr = await getDependencyManager(connectionId);
+    return mgr.probeAll(options);
+  },
+});

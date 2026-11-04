@@ -1,0 +1,294 @@
+import { z } from 'zod';
+import type { Command, HostEvent, ServerEvent, Snapshot } from './contract';
+
+const id = z.string().min(1);
+const counter = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+const revision = counter;
+const sequence = counter.min(1);
+const timestamp = z.iso.datetime({ offset: true });
+// Switch's own surfaces, or a messaging platform key — the pattern is
+// switch-core's `messaging_platforms.PLATFORM_KEY_PATTERN`.
+const surface = z.string().regex(/^(console|switch-web|[a-z][a-z0-9_]{1,31})$/);
+const origin = z.strictObject({
+  surface,
+  actorId: id,
+  roomId: id.nullable(),
+  threadId: id.nullable(),
+  messageId: id.nullable(),
+});
+const capabilities = z.object({
+  input: z.enum(['queue', 'steer']),
+  approvals: z.boolean(),
+  questions: z.boolean(),
+  interrupt: z.boolean(),
+  reset: z.boolean(),
+  compact: z.boolean(),
+  modelChange: z.boolean(),
+  attachmentMimeTypes: z.array(z.string()),
+  retry: z.boolean().optional(),
+});
+export const attachmentSchema = z.strictObject({
+  attachmentId: id,
+  name: z.string(),
+  mimeType: z.string(),
+  bytes: counter,
+  sha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .nullable()
+    .optional(),
+});
+const item = z.strictObject({
+  itemId: id,
+  turnId: id,
+  revision,
+  kind: z.enum(['user-message', 'assistant-message', 'tool-activity']),
+  status: z.enum(['in-progress', 'completed', 'failed', 'declined']),
+  title: z.string(),
+  text: z.string(),
+  attachments: z.array(attachmentSchema),
+  origin: origin.nullable(),
+});
+const option = z.strictObject({
+  optionId: id,
+  label: z.string(),
+  decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']),
+});
+const question = z.strictObject({
+  questionId: id,
+  title: z.string(),
+  prompt: z.string(),
+  options: z.array(
+    z.strictObject({ optionId: id, label: z.string(), description: z.string().nullable() })
+  ),
+  multiSelect: z.boolean(),
+  allowCustomAnswer: z.boolean(),
+});
+const answer = z.strictObject({
+  questionId: id,
+  selectedOptionIds: z.array(id),
+  customText: z.string().nullable(),
+});
+const result = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('approval'), optionId: id }),
+  z.strictObject({ kind: z.literal('questions'), answers: z.array(answer) }),
+]);
+const request = z.strictObject({
+  requestId: id,
+  turnId: id,
+  revision,
+  state: z.enum(['open', 'submitting', 'resolved', 'closed']),
+  content: z.discriminatedUnion('kind', [
+    z.strictObject({
+      kind: z.literal('approval'),
+      title: z.string(),
+      detail: z.string().nullable(),
+      options: z.array(option),
+    }),
+    z.strictObject({
+      kind: z.literal('questions'),
+      title: z.string(),
+      questions: z.array(question),
+    }),
+  ]),
+  expiresAt: timestamp.nullable(),
+});
+export const sessionSchema = z.object({
+  roomIds: z.array(id).optional(),
+  retired: z.boolean().optional(),
+  sessionId: id,
+  agentId: id,
+  provider: id,
+  hostId: id,
+  epoch: id,
+  status: z.enum(['starting', 'ready', 'running', 'stopped', 'error']),
+  connectivity: z.enum(['online', 'offline']),
+  capabilities,
+  pendingRequestIds: z.array(id),
+  models: z
+    .array(
+      z.strictObject({
+        id,
+        label: z.string(),
+        options: z.record(z.string(), z.array(z.string())),
+        imageInput: z.boolean().nullable().optional(),
+      })
+    )
+    .optional(),
+  model: z
+    .strictObject({ id, options: z.record(z.string(), z.string()) })
+    .nullable()
+    .optional(),
+  context: z
+    .strictObject({
+      usedTokens: z.number().int().nonnegative(),
+      windowTokens: z.number().int().positive().nullable(),
+      updatedAt: timestamp,
+    })
+    .nullable()
+    .optional(),
+});
+const turn = z.strictObject({
+  type: z.literal('turn.upsert'),
+  turnId: id,
+  status: z.enum(['queued', 'running', 'completed', 'interrupted', 'error']),
+  commandId: id.nullable(),
+});
+const settlement = z.strictObject({
+  type: z.literal('request.settled'),
+  requestId: id,
+  revision,
+  outcome: z.enum(['answered', 'cancelled', 'expired', 'interrupted', 'provider-error']),
+  commandId: id.nullable(),
+  result: result.nullable(),
+});
+export const commandStatusSchema = z.strictObject({
+  type: z.literal('command.status'),
+  commandId: id,
+  status: z.enum(['accepted', 'dispatched', 'applied', 'rejected', 'unknown']),
+  code: z.string().nullable(),
+  message: z.string().nullable(),
+});
+const hostBodies = [
+  z.strictObject({ type: z.literal('session.upsert'), session: sessionSchema }),
+  turn,
+  z.strictObject({ type: z.literal('item.upsert'), item }),
+  z.strictObject({ type: z.literal('request.opened'), request }),
+  settlement,
+  z.strictObject({
+    type: z.literal('command.result'),
+    commandId: id,
+    status: z.enum(['applied', 'rejected', 'unknown']),
+    code: z.string().nullable(),
+    message: z.string().nullable(),
+  }),
+  z.strictObject({
+    type: z.literal('notice'),
+    level: z.enum(['info', 'warning', 'error']),
+    code: id,
+    message: z.string(),
+  }),
+] as const;
+const base = { contractVersion: z.literal(1), eventId: id, sessionId: id, occurredAt: timestamp };
+export const hostEventSchema: z.ZodType<HostEvent> = z.strictObject({
+  ...base,
+  epoch: id,
+  hostSequence: sequence,
+  body: z.discriminatedUnion('type', hostBodies),
+});
+export const serverEventSchema: z.ZodType<ServerEvent> = z.strictObject({
+  ...base,
+  sequence,
+  body: z.discriminatedUnion('type', [
+    ...hostBodies,
+    commandStatusSchema,
+    z.strictObject({
+      type: z.literal('request.submitting'),
+      requestId: id,
+      revision,
+      commandId: id,
+      actorId: id,
+      surface,
+    }),
+    z.strictObject({
+      type: z.literal('session.connectivity'),
+      connectivity: z.enum(['online', 'offline']),
+    }),
+  ]),
+});
+export const snapshotSchema: z.ZodType<Snapshot> = z.object({
+  contractVersion: z.literal(1),
+  throughSequence: counter,
+  session: sessionSchema,
+  turns: z.array(turn),
+  items: z.array(item),
+  requests: z.array(
+    request.extend({
+      result: settlement.nullable(),
+      decidedBy: z.strictObject({ actorId: id, surface, commandId: id }).nullable(),
+    })
+  ),
+  commandStatuses: z.array(commandStatusSchema),
+  notices: z
+    .array(
+      z.strictObject({
+        level: z.enum(['info', 'warning', 'error']),
+        code: id,
+        message: z.string(),
+        afterItemId: id.nullable(),
+      })
+    )
+    .default([]),
+  nextPageToken: id.nullable(),
+});
+export const commandSchema: z.ZodType<Command> = z.strictObject({
+  contractVersion: z.literal(1),
+  commandId: id,
+  sessionId: id,
+  epoch: id,
+  origin,
+  body: z.discriminatedUnion('type', [
+    z.strictObject({
+      type: z.literal('message.send'),
+      text: z.string(),
+      attachments: z.array(attachmentSchema),
+      delivery: z.enum(['queue', 'steer']),
+    }),
+    z.strictObject({
+      type: z.literal('request.answer'),
+      requestId: id,
+      expectedRevision: revision,
+      answer: result,
+    }),
+    z.strictObject({ type: z.literal('turn.interrupt'), turnId: id }),
+    z.strictObject({ type: z.literal('session.stop') }),
+    z.strictObject({ type: z.literal('session.reset') }),
+    z.strictObject({ type: z.literal('session.compact') }),
+    z.strictObject({ type: z.literal('message.retry'), messageId: id }),
+    z.strictObject({
+      type: z.literal('session.model.set'),
+      modelId: id,
+      options: z.record(z.string(), z.string()),
+    }),
+  ]),
+});
+// The receipt for a host that asked to be handed the command it just caused.
+// The command is set only when this submission created it and nothing else was
+// already queued for the session; on any other status, and from a server built
+// before the receipt existed, the command endpoint remains the way to reach it.
+// Absent rather than null is that older server, so the field is optional and
+// its absence means the same thing: fetch.
+export const roomMessageReceiptSchema = commandStatusSchema.extend({
+  command: commandSchema.nullish(),
+});
+// The rooms Switch has a session serving, answered when it names the connection
+// its events arrive over. The session's own, not the connection's: one
+// connection carries every session an agent has.
+export const roomBindingSchema = z.object({ rooms: z.array(z.string().min(1)) });
+// The deliveries Switch is still holding for the rooms a session itself holds,
+// answered when the session asks for its own work instead of waiting to be
+// handed it. The agent API's own field names, unconverted, and read loosely so
+// a server that learns to say more about a delivery does not stop this one
+// being read.
+export const heldDeliveriesSchema = z.array(
+  z.object({
+    room_id: z.string().min(1),
+    message_id: z.string().min(1),
+    sequence,
+    expired: z.boolean(),
+  })
+);
+
+export function eventBytes(event: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(event)).byteLength;
+}
+export function parseHostEvent(input: unknown): HostEvent {
+  if (eventBytes(input) > 64 * 1024) throw new Error('PAYLOAD_TOO_LARGE: event exceeds 64 KiB.');
+  const event = hostEventSchema.parse(input);
+  if (
+    event.body.type === 'session.upsert' &&
+    (event.body.session.sessionId !== event.sessionId || event.body.session.epoch !== event.epoch)
+  )
+    throw new Error('Session identity does not match event envelope.');
+  return event;
+}

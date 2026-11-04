@@ -1,0 +1,211 @@
+import { stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { providerReadinessSchema } from '@switch-console/agent-providers';
+import type { LaunchProfileModel } from '@switch-console/core/agents/plugins';
+import { resolveCommandPath } from '@switch-console/core/deps/runtime';
+import { isTransportFailure } from '@switch-console/core/exec';
+import { resolveAgentExecutable } from '@main/core/agent-runtime/impl/resolve-agent-executable';
+import { localDependencyManager } from '@main/core/dependencies/dependency-managers';
+import { hostDependencyStore } from '@main/core/dependencies/host-dependency-store';
+import { LocalExecutionContext } from '@main/core/execution-context/local-execution-context';
+import { SshExecutionContext } from '@main/core/execution-context/ssh-execution-context';
+import type { IExecutionContext } from '@main/core/execution-context/types';
+import { locationTransport } from '@main/core/locations/location-transport';
+import { getPlugin } from '@main/core/providers/plugin-registry';
+import { locateSharedHost } from '@main/core/sdk-host/shared-host-deployment';
+import { ensureSshConnected } from '@main/core/ssh/connect/connect-agent-ssh';
+import { log } from '@main/lib/logger';
+import { ensureUserBinDirsInPath } from '@main/utils/userEnv';
+import type { AgentProviderId } from '@shared/core/providers/agent-provider-registry';
+
+/**
+ * The models a host offers, or why we could not find out.
+ *
+ * Two outcomes rather than an empty list, because they mean opposite things to
+ * the form: `unavailable` leaves a model field as plain text and says why, while
+ * an empty `available` would flag everything the user types as wrong. The
+ * provider CLI not being installed on that host is the common case and is not an
+ * error worth a dialog — it is a reason the field cannot check itself.
+ */
+export type AgentModelCatalogue =
+  | { kind: 'available'; models: LaunchProfileModel[] }
+  | { kind: 'unavailable'; reason: string };
+
+/**
+ * Ask a host which models it offers for a provider, and what reasoning variants
+ * each accepts, for the advanced-configuration fields that declare a `catalogue`
+ * binding.
+ *
+ * Keyed on the host rather than on an agent so the create-agent form can ask
+ * before the agent exists, and so the answer comes from the machine that decides
+ * it: a local agent and a remote one do not offer the same models, and a
+ * locally-served model exists on exactly one of them.
+ *
+ * Never throws. Every failure becomes a reason the form shows.
+ */
+export async function getAgentModelCatalogue(params: {
+  providerId: AgentProviderId;
+  /** The location's SSH alias, or null for this machine. */
+  sshHost: string | null;
+  dir: string;
+}): Promise<AgentModelCatalogue> {
+  const plugin = getPlugin(params.providerId);
+  const launchProfileModels = plugin.behavior.mcp?.launchProfileModels;
+  if (!launchProfileModels) {
+    // The provider's own session lists its models. Starting one may sign the
+    // CLI in — opening a browser when there is no cached token — and opening
+    // the agent form is not a request to sign in, so such a provider is asked
+    // the read-only sign-in check first and stops here when the answer is no.
+    if (plugin.metadata.sessionStartMaySignIn) {
+      const probe = await getProviderReadiness(params, false);
+      if (probe.status !== 'authenticated') return { kind: 'unavailable', reason: probe.message };
+    }
+    const readiness = await getProviderReadiness(params, true);
+    return readiness.models.length
+      ? { kind: 'available', models: readiness.models.map((model) => ({ ...model, variants: [] })) }
+      : { kind: 'unavailable', reason: readiness.message };
+  }
+
+  let ctx: IExecutionContext | null = null;
+  try {
+    const dir = params.sshHost || (await isDirectory(params.dir)) ? params.dir : homedir();
+    const host = await resolveHost(params.sshHost, dir);
+    ctx = host.ctx;
+
+    const cli = await resolveAgentExecutable({
+      providerId: params.providerId,
+      binaryName: plugin.capabilities.hostDependency.binaryNames[0] ?? params.providerId,
+      ctx: host.ctx,
+      hostDependencyStore,
+      // Skips a `which` when the local dependency probe already resolved it.
+      // Absent for a remote host, whose probe is a different manager.
+      cachedStatePath:
+        params.sshHost === null
+          ? localDependencyManager.get(params.providerId as never)?.path
+          : undefined,
+      connectionId: host.connectionId,
+    });
+
+    // The resolved binary replaces the one the provider named, so a user who
+    // pinned a particular install is asked about that one rather than whatever
+    // happens to be first on PATH.
+    const execAt = host.ctx;
+    const models = await launchProfileModels(async (_command, args) => execAt.exec(cli, args));
+    return { kind: 'available', models };
+  } catch (error) {
+    const reason = describe(error, plugin.metadata.name, params.sshHost);
+    log.info('getAgentModelCatalogue: could not read the host model catalogue', {
+      providerId: params.providerId,
+      sshHost: params.sshHost,
+      reason,
+    });
+    return { kind: 'unavailable', reason };
+  } finally {
+    ctx?.dispose();
+  }
+}
+
+/**
+ * Say what went wrong in terms the person filling in the form can act on.
+ *
+ * A transport failure and a command failure look the same to a caller but call
+ * for opposite responses — fix the connection, or install the CLI — so they are
+ * distinguished rather than both reported as "could not read models".
+ */
+function describe(error: unknown, providerName: string, sshHost: string | null): string {
+  if (isTransportFailure(error)) {
+    return `Couldn't reach ${sshHost ?? 'this machine'}.`;
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  return `Couldn't ask ${providerName} on ${sshHost ?? 'this machine'} for its models: ${detail}`;
+}
+
+/** An execution context on the machine a location lives on, local or remote. */
+async function resolveHost(
+  sshHost: string | null,
+  dir: string
+): Promise<{ ctx: IExecutionContext; connectionId?: string }> {
+  const transport = locationTransport({ sshHost, dir });
+  if (transport.kind === 'local') {
+    return { ctx: new LocalExecutionContext({ root: dir }) };
+  }
+
+  const proxy = await ensureSshConnected(transport.connectionId, transport.host);
+  return {
+    ctx: new SshExecutionContext(proxy, { root: transport.dir }),
+    connectionId: transport.connectionId,
+  };
+}
+
+export async function getProviderReadiness(
+  params: {
+    providerId: AgentProviderId;
+    sshHost: string | null;
+    dir: string;
+  },
+  models: boolean
+) {
+  params = { ...params, dir: params.dir.trim() || (params.sshHost ? '.' : homedir()) };
+  // The CLI and its sign-in do not depend on the directory, and one not made yet
+  // (a managed agent's workspace before its first session) read as the CLI missing.
+  if (!params.sshHost && !(await isDirectory(params.dir))) params = { ...params, dir: homedir() };
+  let installed: boolean | null = null;
+  let ctx: IExecutionContext | undefined;
+  if (!params.sshHost) ensureUserBinDirsInPath();
+  try {
+    const transport = locationTransport(params);
+    const host = await resolveHost(params.sshHost, params.dir);
+    ctx = host.ctx;
+    const plugin = getPlugin(params.providerId);
+    const cli = await resolveAgentExecutable({
+      providerId: params.providerId,
+      binaryName: plugin.capabilities.hostDependency.binaryNames[0] ?? params.providerId,
+      ctx,
+      hostDependencyStore,
+      connectionId: host.connectionId,
+    });
+    installed = Boolean(await resolveCommandPath(cli, ctx));
+    if (!installed)
+      return {
+        installed: false,
+        status: 'unknown' as const,
+        message: `${plugin.metadata.name} is not installed or its selected executable cannot be found.`,
+        models: [],
+      };
+    const deployed = await locateSharedHost(transport, params.dir);
+    if (!deployed)
+      return {
+        installed: true,
+        status: 'unknown' as const,
+        message: `Switch is not set up on ${params.sshHost ?? 'this machine'} yet, so ${plugin.metadata.name} cannot be checked there. Start an agent on it, or press Update on one's Room watcher.`,
+        models: [],
+      };
+    try {
+      const { stdout } = await deployed.ctx.exec(
+        'node',
+        [deployed.entrypoint, models ? '--models' : '--probe', params.providerId, params.dir, cli],
+        { timeout: models ? 90000 : 35000 }
+      );
+      return { ...providerReadinessSchema.parse(JSON.parse(stdout)), installed: true };
+    } finally {
+      deployed.ctx.dispose();
+    }
+  } catch {
+    return {
+      installed,
+      status: 'unknown' as const,
+      message: 'Could not check this execution machine. Check provider setup and retry.',
+      models: [],
+    };
+  } finally {
+    ctx?.dispose();
+  }
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}

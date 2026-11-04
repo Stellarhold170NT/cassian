@@ -1,0 +1,254 @@
+"""Provisioning: every operation is a row.
+
+- **A room** gets an id minted here and stored by the caller, exactly as the
+  homeserver's `room_id` was.
+- **Membership** is a `client_rooms` row plus the arrival that explains it.
+  Over Matrix an invitation was a durable event a client picked up whenever it
+  next synced; here a live client is woken through the invite bus and joins
+  itself, which is what keeps its transport watching the room. When nobody is
+  live the membership is written directly, because a client that is not
+  running has nothing to wake and will find the room when it starts. Agents
+  are never live in that sense: nothing reads a room for them, so their
+  membership is always written here, and the arrival goes through the router
+  (`delivery/router.py`), which greets the room on the agent's behalf and hands
+  the arrival to the agents listening for joins.
+- **Removal** deletes the membership and wakes a live client so it drops the
+  room, mirroring the invitation. An agent's own events in the room are
+  deleted in the same transaction, and its connections and controller in this
+  process let go of the room once it commits. No leave event is written: a
+  departure is not something a reader of the room needs explained, and the
+  timeline the log serves is what was said.
+- **Discarding a room** is left to the caller's own delete, which cascades.
+  Nothing here has a second copy to clean up.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import TYPE_CHECKING
+
+from switch_core.db.models import ClientRoom, Message
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from switch_core.db.stores.client_store import ClientStore
+    from switch_core.db.stores.room_store import RoomStore
+    from switch_core.delivery.router import MessageRouter
+    from switch_core.transport.invites import InviteBus
+
+logger = logging.getLogger(__name__)
+
+MEMBERSHIP_EVENT_TYPE = "m.room.member"
+
+
+class ProvisioningError(RuntimeError):
+    """A provisioning operation could not be carried out."""
+
+
+def new_room_id() -> str:
+    """A room's transport-side id.
+
+    Stored in the column that held the homeserver's, and opaque in the same
+    way: the prefix is for a human reading a row during the window where both
+    kinds exist, and no code may branch on it.
+    """
+    return f"sw_room_{uuid.uuid4().hex}"
+
+
+class PostgresProvisioning:
+    """Accounts, rooms and membership as rows in Switch's own database."""
+
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        room_store: RoomStore,
+        client_store: ClientStore,
+        router: MessageRouter,
+        invites: InviteBus,
+    ) -> None:
+        self._session_factory = session_factory
+        self._room_store = room_store
+        self._client_store = client_store
+        self._router = router
+        self._invites = invites
+        self._membership_listeners: tuple[
+            Callable[[str, str, list[str]], None], ...
+        ] = ()
+
+    def on_membership_changed(
+        self, listener: Callable[[str, str, list[str]], None]
+    ) -> None:
+        """Call `listener(tenant_id, room_id, [client_id])` once a membership
+        written here has committed, a join or a removal (`room_changes`). It
+        must not block."""
+        self._membership_listeners = (*self._membership_listeners, listener)
+
+    def _membership_changed(self, tenant_id: str, room_id: str, client_id: str) -> None:
+        for listener in self._membership_listeners:
+            try:
+                listener(tenant_id, room_id, [client_id])
+            except Exception:
+                logger.exception("Membership listener failed for room %s", room_id)
+
+    async def create_room(self, name: str, topic: str) -> str:
+        """Mint the id the caller will store on its own room row.
+
+        No row is written here. The room is the caller's to create, and
+        writing a second record of it would be a second thing to keep in step.
+        """
+        return new_room_id()
+
+    async def invite_to_room(self, room_id: str, user_id: str) -> None:
+        """Put a user in a room, waking them if they are running.
+
+        A live client joins itself, which is what leaves its transport
+        watching the room. Already a member is success, per the port.
+
+        The wake-up is rung even when the membership is already recorded, and
+        that is deliberate. A row is no longer proof that a running client is
+        subscribed to the room — something else may have written it, and there
+        is a window at startup where a client is running but not yet on the
+        bus. Returning early on the row would make that state permanent, since
+        every later invitation would find the same row and stop. Membership is
+        what has to be exactly-once; a wake-up is cheap and idempotent.
+        """
+        async with self._session_factory() as session:
+            switch_room_id, tenant_id, client_id, display_name = await self._resolve(
+                session, room_id, user_id
+            )
+            existing = await session.get(
+                ClientRoom, {"client_id": client_id, "room_id": switch_room_id}
+            )
+
+        # By client id, not `user_id`: `clients.transport_user_id` is unique per
+        # tenant, and every tenant's admin client carries the same one, so
+        # waking "the client for @switch-admin" would wake whichever tenant's
+        # transport last claimed the slot. `_resolve` above has already turned
+        # the handle into this tenant's client row.
+        if await self._invites.invite(client_id, room_id):
+            return
+        if existing is not None:
+            return
+
+        async with self._session_factory() as session:
+            committed = await self._write_join(
+                session,
+                room_id,
+                user_id,
+                (switch_room_id, tenant_id, client_id, display_name),
+            )
+            await session.commit()
+        committed()
+
+    async def record_join(
+        self, session: AsyncSession, room_id: str, user_id: str
+    ) -> Callable[[], None]:
+        """Write a membership and its arrival in the caller's transaction, for
+        a client that is never live, so it commits with whatever else the
+        caller writes. Returns what to run once the caller has committed.
+        Already a member is success, with nothing to run."""
+        resolved = await self._resolve(session, room_id, user_id)
+        return await self._write_join(session, room_id, user_id, resolved)
+
+    async def _write_join(
+        self,
+        session: AsyncSession,
+        room_id: str,
+        user_id: str,
+        resolved: tuple[str, str, str, str],
+    ) -> Callable[[], None]:
+        switch_room_id, tenant_id, client_id, display_name = resolved
+        if not await self._room_store.add_client(session, client_id, switch_room_id):
+            # Recorded by another writer meanwhile, which wrote the arrival too.
+            return lambda: None
+        arrival = Message(
+            room_id=switch_room_id,
+            transport_event_id=f"sw_{uuid.uuid4().hex}",
+            sender_id=user_id,
+            sender_client_id=client_id,
+            sender_name=display_name,
+            event_type=MEMBERSHIP_EVENT_TYPE,
+            msgtype=None,
+            body=None,
+            formatted_body=None,
+            thread_root_event_id=None,
+            content={"membership": "join", "displayname": display_name},
+        )
+        routed = await self._router.store(
+            session,
+            tenant_id=tenant_id,
+            room_id=switch_room_id,
+            transport_room_id=room_id,
+            message=arrival,
+            attachments=[],
+        )
+
+        def committed() -> None:
+            routed.committed()
+            self._membership_changed(tenant_id, switch_room_id, client_id)
+
+        return committed
+
+    async def kick_user(self, room_id: str, user_id: str) -> None:
+        """Remove a membership, stopping a live client's delivery with it.
+
+        Already out is success, per the port.
+
+        The wake-up is the other half of the removal, not a nicety. A running
+        client holds its own subscription to the room, so deleting the row on
+        its own leaves it reading a room it is no longer in. It is rung after
+        the commit so a client that reacts by re-reading its rooms cannot see
+        the membership it was just removed from.
+
+        By client id, not `user_id`, for the reason `invite_to_room` spells
+        out: `clients.matrix_user_id` is unique per tenant, so "the client for
+        @switch-admin" names one client per tenant and waking by handle would
+        wake whichever tenant's transport last claimed the slot — here, telling
+        the wrong tenant's client to stop reading a room it is still in while
+        the right one carried on reading a room it is not.
+        """
+        async with self._session_factory() as session:
+            switch_room_id, tenant_id, client_id, _ = await self._resolve(
+                session, room_id, user_id
+            )
+            await self._room_store.remove_client(session, client_id, switch_room_id)
+            removed = await self._router.remove(
+                session,
+                tenant_id=tenant_id,
+                client_id=client_id,
+                room_id=switch_room_id,
+            )
+            await session.commit()
+        await removed.committed()
+        await self._invites.remove(client_id, room_id)
+        self._membership_changed(tenant_id, switch_room_id, client_id)
+
+    async def delete_room(self, room_id: str) -> None:
+        """Nothing of its own to discard.
+
+        The caller deletes the room, and its messages and memberships go with
+        it. The Matrix implementation had a second copy of the room to abandon;
+        this has none.
+        """
+
+    async def close(self) -> None:
+        """Nothing held open."""
+
+    async def _resolve(
+        self, session: AsyncSession, transport_room_id: str, user_id: str
+    ) -> tuple[str, str, str, str]:
+        """The room's id and tenant, and the client's id and name."""
+        room = await self._room_store.get_by_transport_room_id(
+            session, transport_room_id
+        )
+        if room is None:
+            raise ProvisioningError(f"{transport_room_id} is not a Switch room")
+        client = await self._client_store.get_by_transport_user_id(session, user_id)
+        if client is None:
+            raise ProvisioningError(f"{user_id} is not a Switch client")
+        return room.id, room.tenant_id, client.id, client.display_name

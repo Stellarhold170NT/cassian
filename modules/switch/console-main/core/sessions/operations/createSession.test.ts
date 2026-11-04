@@ -1,0 +1,167 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SessionRow } from '@main/db/schema';
+import { createSession } from './createSession';
+
+const mocks = vi.hoisted(() => ({
+  getAgentById: vi.fn(),
+  getLocation: vi.fn(),
+  insert: vi.fn(),
+  deleteFn: vi.fn(),
+  update: vi.fn(),
+  set: vi.fn(),
+  provisionSessionRuntime: vi.fn(),
+  registerSession: vi.fn(),
+  startSession: vi.fn(),
+}));
+
+vi.mock('@main/core/agents/getAgentById', () => ({
+  getAgentById: mocks.getAgentById,
+}));
+
+vi.mock('@main/core/locations/location-manager', () => ({
+  locationManager: { getLocation: mocks.getLocation },
+}));
+
+vi.mock('@main/db/client', () => ({
+  db: {
+    insert: mocks.insert,
+    delete: mocks.deleteFn,
+    update: mocks.update,
+  },
+}));
+
+vi.mock('../session-builder', () => ({
+  provisionSessionRuntime: mocks.provisionSessionRuntime,
+}));
+
+vi.mock('../session-runtime-manager', () => ({
+  sessionRuntimeManager: { registerSession: mocks.registerSession },
+}));
+
+function makeSessionRow(values: Partial<SessionRow>): SessionRow {
+  return {
+    id: values.id ?? 'session-1',
+    agentId: values.agentId ?? 'agent-1',
+    title: values.title ?? 'Test Session',
+    config: values.config ?? null,
+    status: values.status ?? 'in_progress',
+    agentStatus: values.agentStatus ?? null,
+    agentStatusSeen: values.agentStatusSeen ?? 1,
+    isInitialSession: values.isInitialSession ?? false,
+    isPinned: values.isPinned ?? 0,
+    archivedAt: values.archivedAt ?? null,
+    lastInteractedAt: values.lastInteractedAt ?? null,
+    statusChangedAt: values.statusChangedAt ?? '2026-05-18 12:00:00',
+    createdAt: values.createdAt ?? '2026-05-18 12:00:00',
+    updatedAt: values.updatedAt ?? '2026-05-18 12:00:00',
+  };
+}
+
+function setupInsertMock(options: { conflict?: boolean } = {}) {
+  mocks.insert.mockReturnValue({
+    values: (vals: Partial<SessionRow>) => ({
+      onConflictDoNothing: () => ({
+        returning: () => Promise.resolve(options.conflict ? [] : [makeSessionRow(vals)]),
+      }),
+    }),
+  });
+  mocks.deleteFn.mockReturnValue({ where: () => Promise.resolve() });
+  mocks.update.mockReturnValue({ set: mocks.set });
+  mocks.set.mockReturnValue({ where: async () => {} });
+}
+
+const baseParams = {
+  id: 'session-1',
+  agentId: 'agent-1',
+  title: 'Test Session',
+};
+
+describe('createSession', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.getAgentById.mockResolvedValue({
+      id: 'agent-1',
+      locationId: 'loc-1',
+      providerId: 'claude',
+    });
+    mocks.getLocation.mockReturnValue({ locationId: 'loc-1', dir: '/repo', ctx: {} });
+    mocks.provisionSessionRuntime.mockResolvedValue({
+      path: '/repo',
+      locationId: 'loc-1',
+      agent: { start: mocks.startSession },
+    });
+    mocks.registerSession.mockResolvedValue(undefined);
+    mocks.startSession.mockResolvedValue(undefined);
+    setupInsertMock();
+  });
+
+  it('returns agent-not-found when the agent does not exist', async () => {
+    mocks.getAgentById.mockResolvedValue(undefined);
+    const result = await createSession(baseParams);
+    expect(result).toEqual({ success: false, error: { type: 'agent-not-found' } });
+    expect(mocks.insert).not.toHaveBeenCalled();
+  });
+
+  it('inserts the session and provisions the runtime', async () => {
+    const result = await createSession(baseParams);
+    expect(result.success).toBe(true);
+    expect(mocks.insert).toHaveBeenCalledTimes(1);
+    expect(mocks.provisionSessionRuntime).toHaveBeenCalledTimes(1);
+    expect(mocks.registerSession).toHaveBeenCalledTimes(1);
+    expect(mocks.startSession).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('does not persist a stale bypass override (%s)', async (stale) => {
+    const result = await createSession({ ...baseParams, ...{ autoApprove: stale } });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error('Expected session creation to succeed');
+    expect(result.data.session.autoApprove).toBeUndefined();
+    expect(mocks.startSession).toHaveBeenCalledWith(
+      expect.not.objectContaining({ autoApprove: stale }),
+      false,
+      undefined,
+      null
+    );
+  });
+
+  it.each([
+    ['user', 'user'],
+    ['auto', 'automation'],
+    ['unknown', null],
+    [undefined, null],
+  ] as const)(
+    'tells the host a session started by %s was started by %s',
+    async (startSource, reported) => {
+      const result = await createSession({ ...baseParams, startSource });
+      expect(result.success).toBe(true);
+      expect(mocks.startSession.mock.calls[0]![3]).toBe(reported);
+    }
+  );
+
+  it('adopts a session at a closed location without provisioning or launching it', async () => {
+    mocks.getLocation.mockReturnValue(undefined);
+    const result = await createSession({ ...baseParams, startSource: 'adopted', attach: false });
+    expect(result.success).toBe(true);
+    expect(mocks.insert).toHaveBeenCalledTimes(1);
+    expect(mocks.getLocation).not.toHaveBeenCalled();
+    expect(mocks.provisionSessionRuntime).not.toHaveBeenCalled();
+    expect(mocks.registerSession).not.toHaveBeenCalled();
+    expect(mocks.startSession).not.toHaveBeenCalled();
+  });
+
+  it('preserves the session row after a failed launch so recovery cannot create another conversation', async () => {
+    mocks.provisionSessionRuntime.mockRejectedValue(new Error('boom'));
+    const result = await createSession(baseParams);
+    expect(result).toEqual({ success: false, error: { type: 'spawn-failed', message: 'boom' } });
+    expect(mocks.deleteFn).not.toHaveBeenCalled();
+    expect(mocks.set).toHaveBeenCalledWith({ status: 'review' });
+  });
+
+  it('returns already-exists when the id is taken, without provisioning or rollback', async () => {
+    setupInsertMock({ conflict: true });
+    const result = await createSession(baseParams);
+    expect(result).toEqual({ success: false, error: { type: 'already-exists' } });
+    expect(mocks.provisionSessionRuntime).not.toHaveBeenCalled();
+    expect(mocks.deleteFn).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,113 @@
+import { userDataDirName } from '../../app/user-data-dir';
+
+/**
+ * Fixed coordinates for the managed local stack. These mirror the ports and
+ * hosts baked into the bundled standalone compose (resources/…pinned.yml): the
+ * compose file is the contract, and these constants are how the rest of
+ * Switch Console addresses the resulting server.
+ */
+
+/**
+ * The `docker compose --project-name` of a managed stack kept by the Console
+ * whose data lives in `dataDirName`, made of what compose accepts in a project
+ * name: lowercase letters, digits, `-` and `_`, starting with a letter or digit.
+ */
+export function stackProjectName(dataDirName: string, kind: 'local' | 'remote'): string {
+  const safe = dataDirName
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^[^a-z0-9]+/, '');
+  return `${safe || 'switchdash'}-${kind}`;
+}
+
+/**
+ * `docker compose --project-name` for the managed stack on this machine, so its
+ * containers and volumes are isolated and discoverable across app restarts.
+ *
+ * One per data directory. Each Console keeps its generated stack secrets and
+ * its chosen ports in its own data directory, but Postgres only honours
+ * POSTGRES_PASSWORD when it initialises a fresh volume — so Consoles sharing one
+ * project name share `pgdata` and every one except the one that created it
+ * fails authentication. They also fight over the containers themselves,
+ * recreating each other's stack on start with their own ports. That covers
+ * dev builds and Canary started side by side with SWITCH_CONSOLE_USER_DATA_DIR,
+ * not only different builds. Stable keeps the original name, `switchdash-local`, so
+ * existing installs stay attached to the stack they already have.
+ */
+export const LOCAL_SERVER_PROJECT_NAME = stackProjectName(userDataDirName(), 'local');
+
+/** `docker compose --project-name` for a managed stack on a remote host. Each
+ * remote host runs its own Docker daemon, so one name per data directory is
+ * enough to isolate + rediscover the stack there — per data directory for the
+ * same reason as {@link LOCAL_SERVER_PROJECT_NAME}, since two Consoles can
+ * target one host. */
+export const REMOTE_SERVER_PROJECT_NAME = stackProjectName(userDataDirName(), 'remote');
+
+/**
+ * The volume holding what every Console sharing a remote stack must agree on:
+ * the published `.env`, the register and the activity log. Labelled with
+ * {@link STACK_STATE_LABEL} rather than compose's project label, so compose
+ * never removes it and a reset keeps the record of who reset the stack.
+ */
+export const STACK_STATE_VOLUME_SUFFIX = 'console-state';
+export const STACK_STATE_LABEL = 'com.switch-console.stack-state';
+
+/** For the throwaway containers that reach the state volume. The stack's own
+ * Postgres image, so any host that has run the stack already has it;
+ * `stack-state.test.ts` holds it to the bundled compose file. */
+export const STACK_HELPER_IMAGE = 'postgres:16-alpine';
+
+/** File names of the compose file and generated `.env` inside the host working
+ * dir. Kept relative so `docker compose -f <name>` resolves against the working
+ * dir on either host, independent of its absolute path. */
+export const COMPOSE_FILE_NAME = 'standalone-docker-compose.yml';
+export const ENV_FILE_NAME = '.env';
+/** The database volume the `.env` beside it was written for, like the
+ * published copy's stamp. */
+export const ENV_STAMP_FILE_NAME = '.env.db';
+
+/** File name of the dev-only build override layered on top of the compose file
+ * when the stack is built from a local checkout (see checkout-build.ts). */
+export const BUILD_OVERRIDE_FILE_NAME = 'standalone-docker-compose.build.yml';
+
+/** Display name of the auto-registered server record. */
+export const LOCAL_SERVER_NAME = 'Local Switch server';
+
+// The managed server's API and gateway URLs are NOT fixed constants: their host
+// ports are chosen from whatever is free on the machine (see ports.ts) so the
+// stack never collides with a dev's existing services. Resolve them via
+// gatewayUrlFor()/apiUrlFor() from the persisted port set.
+
+/** Compose profiles Switch Console enables: `collab` (Mattermost bridge + seeder) so
+ * the stack has a working collaboration bridge, and `gateway` so the operator
+ * web dashboard is available. */
+export const LOCAL_SERVER_PROFILES = ['collab', 'gateway'] as const;
+
+/** Registry the release images are published to and pulled from. */
+export const GHCR_REGISTRY = 'ghcr.io';
+
+/** The gateway admin account the stack seeds (GATEWAY_ADMIN_EMAIL). Switch Console
+ * generates its password, so it also auto-signs-in with these on start rather
+ * than making the user type a secret they never saw. */
+export const LOCAL_SERVER_ADMIN_EMAIL = 'admin@switch.local';
+
+/** Host interface the managed stack's published ports bind to, fed to the
+ * compose `${SWITCH_BIND_ADDR}` interpolation. Loopback, like the standalone
+ * compose's own default, so the single-user local stack is never exposed to the
+ * LAN. */
+export const LOCAL_SERVER_BIND_ADDR = '127.0.0.1';
+
+/** Mattermost team the stack's seeder creates (MATTERMOST_TEAM_NAME). Named
+ * rather than inlined because it is also what a link into the bundled
+ * Mattermost has to path through — the two must not drift. */
+export const LOCAL_SERVER_MATTERMOST_TEAM = 'switch';
+
+/** The human account the stack's seeder creates (MATTERMOST_USER), paired with
+ * the generated `mattermostUserPassword`. Three places depend on it being the
+ * name the seeder actually used — the generated env, the embed's silent login,
+ * and the sign-in Switch Console shows the user — so it is named once here. */
+export const LOCAL_SERVER_MATTERMOST_USER = 'user';
+
+/** Its container stands for "the stack is up", its image tag is the stack's
+ * version, and its environment carries the server's settings. */
+export const CORE_SERVICE = 'switch';

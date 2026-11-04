@@ -1,0 +1,1721 @@
+"""Puts session activity and requests on one bridge's platform.
+
+Pushed, not scanned: `AgentSessionActivityListener` hands every change for the
+bridge's tenant to `_on_change`, which only queues a key. A task of this
+bridge's own drains the queue and does the platform work, so a slow or rate
+limited platform never holds up the listener's other subscribers.
+
+The queue has three lanes, drained most urgent first. A change just announced
+is somebody waiting: a new turn's card and its 👀, a step. Retries, a resync's
+catch-up and an agent going offline or coming back are owed but older. A
+running turn's clock is cosmetic, so it waits behind both, and one the
+platform refuses is dropped rather than retried: the next minute draws it.
+
+A key queued while the same key is still waiting is dropped, and each key is
+handled by reading the rows as they are now. So a burst of steps in one turn
+costs one redraw rather than one per step, and a request answered before its
+card was posted is posted already answered — or, if it is no longer open, not
+at all.
+
+**Requests** (approvals and questions). The card lives in
+`approval_request_posts`: `token` rides in the controls and `handle` (`A<n>`)
+is what a person types. The reservation is committed before the platform call,
+with `external_post_id` null, so a process that dies mid-post leaves a card
+marked unconfirmed rather than one posted twice; the card is then searched for
+where the platform can be searched, and the channel told once where it cannot
+and the platform may say so. An approval answered by a person is taken off a
+platform that removes answered cards.
+
+**Turns.** Each turn is drawn in one message, from its rows, with the adapter's
+own activity rendering: every step, the stop control while it runs, and how
+long it took. The asking message carries a queued or working marker while the
+turn waits or runs — put on before the message is posted, so a platform short
+of room for the message does not hold it back — and a platform that says a
+turn is stuck in a message of its own gets one, cleared again once it no
+longer applies. All of it sits in `turn_status_posts`.
+
+Failures of a key are retried on a widening interval; a platform that asks for
+a wait gets exactly that wait.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import secrets
+from collections import OrderedDict, deque
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from typing import Literal, cast
+
+from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.bridges.collaboration.adapter import (
+    ActivityMarkRefused,
+    ActivitySnapshot,
+    PlatformAdapter,
+    RemovalFailed,
+    RichContentFailed,
+    RichContentFailedAfterPost,
+    RichContentThrottled,
+    RichContentWedged,
+    ThreadUnavailable,
+    TurnActivity,
+)
+from switch_core.bridges.collaboration.session.renderers import RUNNING_CLOCK_SECONDS
+from switch_core.db.models import (
+    Agent,
+    AgentSessionActivityItem,
+    ApprovalRequest,
+    ApprovalRequestPost,
+    BridgeMessageMap,
+    Message,
+    Room,
+    TurnStatusPost,
+)
+from switch_core.db.session_scope import tenant_session
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.client_store import ClientStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.room_role_store import RoomRoleStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.session_activity_post_store import (
+    ApprovalRequestPostStore,
+    TurnStatusPostStore,
+)
+from switch_core.db.stores.session_activity_store import (
+    TURN_ITEM_ID,
+    AgentSessionActivityStore,
+    ApprovalRequestStore,
+)
+from switch_core.delivery.addressing import AddressingResolver
+from switch_core.session_activity.bridge_turns import (
+    TurnView,
+    status_state,
+    turn_view,
+)
+from switch_core.session_activity.cards import (
+    answerer_of,
+    approval_card,
+    approval_request,
+)
+from switch_core.session_activity.listener import AgentSessionActivityListener, Change
+from switch_core.sessions.contract import DecidedBy, decided
+from switch_core.sessions.presentation import (
+    activity_error_summary,
+    notification_recipient,
+    request_card_recipient,
+)
+
+logger = logging.getLogger(__name__)
+
+HANDLE_PREFIX = "A"
+_MINT_ATTEMPTS = 5
+_HANDLE_CONSTRAINT = "uq_approval_request_posts_handle"
+# An inbound message and the card answering it can race: the platform post a
+# thread hangs off is mapped only once the inbound relay commits. Waited out a
+# few times before the card goes to the channel root instead.
+_THREAD_WAIT_SECONDS = 1.0
+_THREAD_WAIT_ATTEMPTS = 5
+# How far back a resync redraws settled cards and ended turns. A resync means
+# announcements may have been lost; one lost a while ago has had its message
+# corrected by a later resync already, and redrawing everything on each start
+# would spend a platform's rate budget on messages nobody is looking at.
+_RESYNC_WINDOW = timedelta(minutes=15)
+# How often running turns are looked at again: for their agent going offline
+# or coming back, and, where the platform redraws for it, for a clock that has
+# moved on a minute.
+_TICK_SECONDS = 5.0
+# How long after a platform closes a turn's message on its own the redraw that
+# repairs it is due, so that the redraw finds it closed.
+_AFTER_PLATFORM_CLOSE = timedelta(seconds=2)
+_RETRY_MIN_SECONDS = 5.0
+_RETRY_MAX_SECONDS = 600.0
+# How many turns' drawn state one bridge remembers. Forgetting one costs a
+# redraw nobody needed if that turn changes again, not a wrong one.
+_MAX_REMEMBERED_TURNS = 4096
+# A card that froze in the last hour is plausibly still on someone's screen and
+# misleading them; under an older one a notice reaches nobody.
+_WEDGE_NOTICE_MAX_AGE = timedelta(hours=1)
+_WEDGE_NOTICE = (
+    "⚠️ This platform dropped the live stream behind the message above, so that "
+    "card is frozen and cannot be updated, finished, or removed. Whatever it is "
+    "showing is the last thing the stream wrote, not where the turn got to — "
+    "the turn itself was unaffected."
+)
+_HOST_OFFLINE = "Host offline. Answers are unavailable until the session reconnects."
+
+Mark = Literal["queued", "working"]
+
+# The queue's lanes, most urgent first; see the module docstring.
+_NOW = 0
+_SOON = 1
+_CLOCK = 2
+
+
+@dataclass(frozen=True)
+class _Target:
+    channel_id: str
+    thread_ref: str | None
+    agent: Agent
+
+    @property
+    def agent_name(self) -> str:
+        return self.agent.name
+
+
+@dataclass(frozen=True)
+class StopTarget:
+    """What a Stop control on one of this bridge's messages would stop."""
+
+    agent_id: str
+    session_id: str
+    room_id: str
+    thread_id: str | None
+    # The session's running turn now, which the pressed control must still name.
+    running_turn_id: str | None
+
+
+@dataclass
+class _TurnDrawn:
+    """What this process last showed of a turn, so an unchanged redraw is skipped."""
+
+    status_state: str | None = None
+    attention_state: str | None = None
+    status: str | None = None
+    final: bool = False
+    wedged: bool = False
+    # When a running turn's message is next due a redraw without a change of
+    # its own: its clock showing another minute, or the platform closing it.
+    clock_due: datetime | None = None
+    # When the platform closes the turn's message on its own, if it does.
+    platform_closes_at: datetime | None = None
+
+
+@dataclass
+class _Backoff:
+    """A key's waits between failed attempts: doubling, capped, cleared on success."""
+
+    waits: dict[tuple[str, ...], float] = field(default_factory=dict)
+
+    def next(self, key: tuple[str, ...]) -> float:
+        wait = self.waits.get(key, _RETRY_MIN_SECONDS)
+        self.waits[key] = min(wait * 2, _RETRY_MAX_SECONDS)
+        return wait
+
+    def clear(self, key: tuple[str, ...]) -> None:
+        self.waits.pop(key, None)
+
+
+class _ThreadNotMappedYet(Exception):
+    pass
+
+
+_Key = tuple[str, ...]
+_RESYNC: _Key = ("resync",)
+
+
+class AgentSessionActivityPublisher:
+    def __init__(
+        self,
+        *,
+        adapter: PlatformAdapter,
+        bridge_id: str,
+        bridge_type: str,
+        tenant_id: str,
+        listener: AgentSessionActivityListener,
+        session_factory: async_sessionmaker[AsyncSession],
+        agent_online: Callable[[str], bool],
+    ) -> None:
+        self._adapter = adapter
+        self._bridge_id = bridge_id
+        self._bridge_type = bridge_type
+        self._tenant_id = tenant_id
+        self._listener = listener
+        self._sessions = session_factory
+        self._agent_online = agent_online
+        self._approvals = ApprovalRequestStore()
+        self._rooms = RoomStore()
+        self._addressing = AddressingResolver(
+            room_store=self._rooms,
+            room_role_store=RoomRoleStore(),
+            client_store=ClientStore(),
+            agent_store=AgentStore(),
+            external_user_store=ExternalUserStore(),
+            # Only role mentions consult liveness; a permission check never does.
+            live_connection_ids=set,
+        )
+        self._activity = AgentSessionActivityStore()
+        self._card_posts = ApprovalRequestPostStore()
+        self._turn_posts = TurnStatusPostStore()
+        self._lanes: tuple[deque[_Key], ...] = (deque(), deque(), deque())
+        self._pending: dict[_Key, int] = {}
+        self._wake = asyncio.Event()
+        self._thread_waits: dict[_Key, int] = {}
+        self._retries = _Backoff()
+        self._drawn: OrderedDict[_Key, _TurnDrawn] = OrderedDict()
+        self._live_turns: dict[_Key, str] = {}
+        # A turn's row before its message is posted, holding the marker
+        # already on the asking message until the row can be stored. Only in
+        # memory: a restart in that window forgets the marker, and the turn
+        # takes it off only if it is still running when the publisher is back.
+        self._unposted: dict[_Key, TurnStatusPost] = {}
+        self._open_cards: dict[_Key, str] = {}
+        self._online_seen: dict[str, bool] = {}
+        self._unsure_marks: set[_Key] = set()
+        self._card_edit_failures: dict[str, tuple[str, str | None]] = {}
+        self._noted_unconfirmed: set[str] = set()
+        self._tasks: list[asyncio.Task[None]] = []
+        self._unsubscribe: Callable[[], None] | None = None
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._tasks:
+            raise RuntimeError("AgentSessionActivityPublisher is already started")
+        self._unsubscribe = self._listener.subscribe(
+            self._tenant_id, self._on_change, self._on_resync
+        )
+        self._tasks = [
+            asyncio.create_task(
+                self._run(), name=f"session-activity-bridge-{self._bridge_id}"
+            ),
+            asyncio.create_task(
+                self._tick_forever(),
+                name=f"session-activity-bridge-tick-{self._bridge_id}",
+            ),
+        ]
+        # The listener resyncs its subscribers when it connects, which may have
+        # happened before this bridge started. The resync itself only reads and
+        # queues, so it goes first and what it finds owed waits its turn.
+        self._enqueue(_RESYNC, _NOW)
+
+    async def stop(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+        tasks, self._tasks = self._tasks, []
+        for task in tasks:
+            task.cancel()
+        # A task that had already died is logged rather than raised: the
+        # bridge stopping this publisher goes on to close its platform
+        # connection, and a second stop has nothing left to raise.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, result in zip(tasks, results, strict=True):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Session activity task %s had stopped on an error",
+                    task.get_name(),
+                    exc_info=result,
+                )
+
+    # ── Listener callbacks: queue only ────────────────────────────────────────
+
+    async def _on_change(self, change: Change) -> None:
+        if change.kind.startswith("approval."):
+            self._enqueue(
+                ("approval", change.agent_id, change.session_id, change.key), _NOW
+            )
+        elif change.kind == "activity":
+            self._enqueue(
+                ("turn", change.agent_id, change.session_id, change.key), _NOW
+            )
+
+    async def _on_resync(self) -> None:
+        self._enqueue(_RESYNC, _NOW)
+
+    def _enqueue(self, key: _Key, lane: int) -> None:
+        """Queue a key in a lane, or move it up to one if it waits in a lower one."""
+        queued = self._pending.get(key)
+        if queued is not None and queued <= lane:
+            return
+        self._pending[key] = lane
+        self._lanes[lane].append(key)
+        self._wake.set()
+
+    def _enqueue_later(self, key: _Key, delay: float, lane: int) -> None:
+        asyncio.get_running_loop().call_later(delay, self._enqueue, key, lane)
+
+    def _retry_later(self, key: _Key) -> None:
+        self._enqueue_later(key, self._retries.next(key), _SOON)
+
+    async def _next(self) -> tuple[_Key, int]:
+        """The first key in the most urgent lane holding one, and that lane.
+
+        A key moved up a lane leaves its old entry behind, which is passed over
+        here because the key is no longer pending in that lane.
+        """
+        while True:
+            for lane, queue in enumerate(self._lanes):
+                while queue:
+                    key = queue.popleft()
+                    if self._pending.get(key) == lane:
+                        del self._pending[key]
+                        return key, lane
+            self._wake.clear()
+            await self._wake.wait()
+
+    # ── The bridge's own tasks ────────────────────────────────────────────────
+
+    async def _run(self) -> None:
+        while True:
+            key, lane = await self._next()
+            try:
+                await self._handle(key)
+            except asyncio.CancelledError:
+                raise
+            except RichContentThrottled as throttled:
+                if lane == _CLOCK:
+                    continue
+                logger.warning(
+                    "%s asked bridge %s to wait %.1fs; retrying %s then.",
+                    self._adapter.platform_name,
+                    self._bridge_id,
+                    throttled.retry_after,
+                    key,
+                )
+                self._enqueue_later(key, throttled.retry_after, _SOON)
+            except _ThreadNotMappedYet:
+                self._enqueue_later(key, _THREAD_WAIT_SECONDS, lane)
+            except Exception:
+                # The delivery loop: one key failing must not stop the rest.
+                delay = self._retries.next(key)
+                logger.exception(
+                    "Could not publish %s on bridge %s; trying again in %.0fs.",
+                    key,
+                    self._bridge_id,
+                    delay,
+                )
+                self._enqueue_later(key, delay, _SOON)
+
+    async def _tick_forever(self) -> None:
+        while True:
+            await asyncio.sleep(_TICK_SECONDS)
+            self._tick(datetime.now(UTC))
+
+    def _tick(self, now: datetime) -> None:
+        """Queue what moved without a change of its own: an agent going offline
+        or coming back, and a running turn's clock once it shows another minute.
+
+        No clock while the platform is holding edits back. Each redraw would
+        only be refused, and the first tick after the wait draws whichever
+        clocks are due by then.
+        """
+        clock = (
+            self._adapter.redraws_for_elapsed_time
+            and self._adapter.rich_updates_held_for() <= 0
+        )
+        for keys in (self._live_turns, self._open_cards):
+            for key, agent_id in list(keys.items()):
+                online = self._agent_online(agent_id)
+                if self._online_seen.get(agent_id) != online:
+                    self._enqueue(key, _SOON)
+                elif (
+                    clock
+                    and online
+                    and keys is self._live_turns
+                    and self._clock_due(key, now)
+                ):
+                    self._enqueue(key, _CLOCK)
+
+    def _clock_due(self, key: _Key, now: datetime) -> bool:
+        drawn = self._drawn.get(key)
+        return drawn is None or drawn.clock_due is None or drawn.clock_due <= now
+
+    async def _handle(self, key: _Key) -> None:
+        kind = key[0]
+        if kind == "resync":
+            await self._resync()
+        elif kind == "approval":
+            await self._publish_approval(key, key[1], key[2], key[3])
+        elif kind == "turn":
+            await self._publish_turn(key, key[1], key[2], key[3])
+        else:
+            raise ValueError(f"Unknown publication key {key!r}")
+
+    async def _resync(self) -> None:
+        since = datetime.now(UTC) - _RESYNC_WINDOW
+        async with tenant_session(self._sessions, self._tenant_id) as db:
+            posted = exists().where(
+                ApprovalRequestPost.bridge_id == self._bridge_id,
+                ApprovalRequestPost.agent_id == ApprovalRequest.agent_id,
+                ApprovalRequestPost.session_id == ApprovalRequest.session_id,
+                ApprovalRequestPost.request_id == ApprovalRequest.request_id,
+            )
+            requests = (
+                await db.execute(
+                    select(
+                        ApprovalRequest.agent_id,
+                        ApprovalRequest.session_id,
+                        ApprovalRequest.request_id,
+                    )
+                    .join(Room, Room.id == ApprovalRequest.room_id)
+                    .where(
+                        Room.bridge_id == self._bridge_id,
+                        or_(
+                            ApprovalRequest.state == "open",
+                            and_(ApprovalRequest.updated_at >= since, posted),
+                        ),
+                    )
+                )
+            ).all()
+            unended = and_(
+                AgentSessionActivityItem.item_id == TURN_ITEM_ID,
+                AgentSessionActivityItem.status.in_(("queued", "running")),
+            )
+            turns = (
+                await db.execute(
+                    select(
+                        AgentSessionActivityItem.agent_id,
+                        AgentSessionActivityItem.session_id,
+                        AgentSessionActivityItem.turn_id,
+                        func.max(AgentSessionActivityItem.updated_at),
+                        func.bool_or(unended),
+                        TurnStatusPost.updated_at,
+                    )
+                    .join(Room, Room.id == AgentSessionActivityItem.room_id)
+                    .outerjoin(
+                        TurnStatusPost,
+                        and_(
+                            TurnStatusPost.bridge_id == self._bridge_id,
+                            TurnStatusPost.agent_id
+                            == AgentSessionActivityItem.agent_id,
+                            TurnStatusPost.session_id
+                            == AgentSessionActivityItem.session_id,
+                            TurnStatusPost.turn_id == AgentSessionActivityItem.turn_id,
+                        ),
+                    )
+                    .where(
+                        Room.bridge_id == self._bridge_id,
+                        or_(AgentSessionActivityItem.updated_at >= since, unended),
+                    )
+                    .group_by(
+                        AgentSessionActivityItem.agent_id,
+                        AgentSessionActivityItem.session_id,
+                        AgentSessionActivityItem.turn_id,
+                        TurnStatusPost.updated_at,
+                    )
+                )
+            ).all()
+            marked = await self._turn_posts.marked(db, self._bridge_id)
+        for agent_id, session_id, request_id in requests:
+            self._enqueue(("approval", agent_id, session_id, request_id), _SOON)
+        for agent_id, session_id, turn_id, changed, running, drawn_at in turns:
+            # An ended turn whose message was last drawn after its last change
+            # already shows how it ended.
+            if running or drawn_at is None or drawn_at < changed:
+                self._enqueue(("turn", agent_id, session_id, turn_id), _SOON)
+        for post in marked:
+            self._enqueue(("turn", post.agent_id, post.session_id, post.turn_id), _SOON)
+
+    # ── Where a room's publications go ────────────────────────────────────────
+
+    async def _target(
+        self,
+        db: AsyncSession,
+        key: _Key,
+        agent_id: str,
+        room_id: str,
+        thread_id: str | None,
+    ) -> _Target | None:
+        """The channel and thread for a room on this bridge, or None if it is not on it."""
+        found = await self._rooms.get_with_membership(db, room_id, agent_id)
+        if found is None or found[0].bridge_id != self._bridge_id:
+            return None
+        room, member = found
+        if not room.external_channel_id:
+            logger.warning(
+                "Room %s is on bridge %s but has no channel; nothing is published there.",
+                room_id,
+                self._bridge_id,
+            )
+            return None
+        agent = await db.get(Agent, agent_id)
+        if agent is None:
+            return None
+        if not member:
+            logger.warning(
+                "Not publishing for agent %s in room %s: it is no longer a member.",
+                agent.name,
+                room_id,
+            )
+            return None
+        return _Target(
+            channel_id=room.external_channel_id,
+            thread_ref=await self._thread_ref(
+                db, key, room.external_channel_id, thread_id
+            ),
+            agent=agent,
+        )
+
+    async def _platform_ref(
+        self, db: AsyncSession, channel_id: str, switch_id: str | None
+    ) -> str | None:
+        """The platform's post for a Switch message in this channel, if it has one."""
+        if switch_id is None:
+            return None
+        external_post_id: str | None = await db.scalar(
+            select(BridgeMessageMap.external_post_id).where(
+                BridgeMessageMap.bridge_id == self._bridge_id,
+                BridgeMessageMap.external_channel_id == channel_id,
+                BridgeMessageMap.transport_event_id == switch_id,
+            )
+        )
+        return external_post_id
+
+    async def _thread_ref(
+        self, db: AsyncSession, key: _Key, channel_id: str, thread_id: str | None
+    ) -> str | None:
+        if thread_id is None:
+            return None
+        external_post_id = await self._platform_ref(db, channel_id, thread_id)
+        if external_post_id is not None:
+            self._thread_waits.pop(key, None)
+            return external_post_id
+        waited = self._thread_waits.get(key, 0)
+        if waited < _THREAD_WAIT_ATTEMPTS:
+            self._thread_waits[key] = waited + 1
+            raise _ThreadNotMappedYet(thread_id)
+        self._thread_waits.pop(key, None)
+        logger.warning(
+            "Switch message %s has no post in channel %s on bridge %s; "
+            "publishing %s at the channel root instead of in its thread.",
+            thread_id,
+            channel_id,
+            self._bridge_id,
+            key,
+        )
+        return None
+
+    async def _recipient(
+        self,
+        db: AsyncSession,
+        room_id: str,
+        agent: Agent,
+        turn_row: AgentSessionActivityItem | None,
+        thread_ref: str | None,
+    ) -> str | None:
+        """Who a post asking someone to act names: whoever asked, else the owner."""
+        return await notification_recipient(
+            db,
+            bridge_id=self._bridge_id,
+            room_id=room_id,
+            surface=self._bridge_type,
+            actor_id=await self._asker(db, turn_row),
+            agent=agent,
+            thread_id=thread_ref,
+        )
+
+    async def _card_recipient(
+        self,
+        db: AsyncSession,
+        room_id: str,
+        agent: Agent,
+        turn_row: AgentSessionActivityItem | None,
+        thread_ref: str | None,
+    ) -> str | None:
+        """Who a new request card names: in a thread, somebody who may answer it."""
+        if thread_ref is None:
+            return await self._recipient(db, room_id, agent, turn_row, None)
+
+        async def may_answer(sender: str) -> bool:
+            decision = await self._addressing.permitted(
+                db, agent=agent, room_id=room_id, sender=sender
+            )
+            return decision.allowed
+
+        return await request_card_recipient(
+            db,
+            bridge_id=self._bridge_id,
+            room_id=room_id,
+            actor_id=await self._asker(db, turn_row),
+            agent=agent,
+            may_answer=may_answer,
+        )
+
+    async def _asker(
+        self, db: AsyncSession, turn_row: AgentSessionActivityItem | None
+    ) -> str | None:
+        """The room identity of whoever sent the message a turn answers, if known."""
+        if turn_row is None or turn_row.message_id is None:
+            return None
+        sender: str | None = await db.scalar(
+            select(Message.sender_id).where(
+                Message.transport_event_id == turn_row.message_id
+            )
+        )
+        return sender
+
+    async def _turn_row(
+        self, db: AsyncSession, agent_id: str, session_id: str, turn_id: str
+    ) -> AgentSessionActivityItem | None:
+        return await db.get(
+            AgentSessionActivityItem,
+            (self._tenant_id, agent_id, session_id, turn_id, TURN_ITEM_ID),
+        )
+
+    # ── Request cards ─────────────────────────────────────────────────────────
+
+    async def _publish_approval(
+        self, key: _Key, agent_id: str, session_id: str, request_id: str
+    ) -> None:
+        async with tenant_session(self._sessions, self._tenant_id) as db:
+            row = await self._approvals.get(
+                db, agent_id, session_id, request_id, for_update=False
+            )
+            if row is None or row.room_id is None:
+                self._open_cards.pop(key, None)
+                return
+            post = await self._card_posts.get(
+                db, self._bridge_id, agent_id, session_id, request_id, for_update=False
+            )
+            if (post is None and row.state != "open") or (
+                post is not None and post.removed_at is not None
+            ):
+                self._open_cards.pop(key, None)
+                return
+            target = await self._target(db, key, agent_id, row.room_id, row.thread_id)
+            if target is None:
+                self._open_cards.pop(key, None)
+                return
+            decided_by, responder = await answerer_of(db, row, self._bridge_id)
+            turn_row = await self._turn_row(db, agent_id, session_id, row.turn_id)
+            online = self._agent_online(agent_id)
+            asking = post is None and row.state == "open"
+            recipient = (
+                await self._card_recipient(
+                    db, row.room_id, target.agent, turn_row, target.thread_ref
+                )
+                if asking
+                else None
+            )
+            db.expunge_all()
+        self._online_seen[agent_id] = online
+        if row.state == "open":
+            self._open_cards[key] = agent_id
+        else:
+            self._open_cards.pop(key, None)
+        unavailable = _HOST_OFFLINE if not online and row.state == "open" else None
+        if post is None:
+            await self._post_card(
+                row,
+                target,
+                asked_at_root=_asked_at_root(turn_row),
+                unavailable_reason=unavailable,
+                notify_external_id=recipient,
+                notify_unreachable=recipient is None
+                and self._adapter.notifies_only_by_mention,
+            )
+            self._retries.clear(key)
+            return
+        if post.external_post_id is None:
+            recovered = await self._unconfirmed(key, post)
+            if recovered is None:
+                return
+            post = recovered
+        if getattr(self._adapter, "removes_answered_cards", False) and decided(
+            approval_request(row, decided_by)
+        ):
+            if await self._remove_card(key, post):
+                return
+        await self._refresh_card(
+            row,
+            post,
+            target,
+            decided_by=decided_by,
+            responder=responder,
+            unavailable_reason=unavailable,
+        )
+        self._retries.clear(key)
+
+    async def _post_card(
+        self,
+        row: ApprovalRequest,
+        target: _Target,
+        *,
+        asked_at_root: bool,
+        unavailable_reason: str | None,
+        notify_external_id: str | None,
+        notify_unreachable: bool,
+    ) -> None:
+        post = await self._reserve(row, target)
+        if post is None:
+            return
+        card = approval_card(
+            row,
+            post,
+            decided_by=None,
+            responder_external_id=None,
+            unavailable_reason=unavailable_reason,
+            notify_external_id=notify_external_id,
+            notify_unreachable=notify_unreachable,
+        )
+        thread_ref = target.thread_ref
+        try:
+            try:
+                ref = await self._adapter.post_rich(
+                    target.channel_id, target.agent_name, card, thread_ref
+                )
+            except ThreadUnavailable as missing:
+                if not asked_at_root:
+                    # Asked in a thread the platform no longer has: the channel
+                    # root is people who were never in that conversation.
+                    raise
+                logger.warning(
+                    "No thread for request %s in channel %s (%s); posting its "
+                    "card at the channel root, where it was asked.",
+                    row.request_id,
+                    target.channel_id,
+                    missing,
+                )
+                thread_ref = None
+                ref = await self._adapter.post_rich(
+                    target.channel_id, target.agent_name, card, None
+                )
+        except RichContentFailed:
+            await self._release(post)
+            raise
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            stored = await self._card_posts.get(
+                db,
+                self._bridge_id,
+                post.agent_id,
+                post.session_id,
+                post.request_id,
+                for_update=True,
+            )
+            if stored is None:
+                logger.error(
+                    "Posted card %s for request %s in channel %s, but its "
+                    "reservation is gone, so the card answers nothing.",
+                    post.handle,
+                    post.request_id,
+                    target.channel_id,
+                )
+                return
+            stored.external_post_id = ref
+            stored.thread_ref = thread_ref
+        logger.info(
+            "Posted card %s for request %s of session %s in channel %s",
+            post.handle,
+            row.request_id,
+            row.session_id,
+            target.channel_id,
+        )
+
+    async def _refresh_card(
+        self,
+        row: ApprovalRequest,
+        post: ApprovalRequestPost,
+        target: _Target,
+        *,
+        decided_by: DecidedBy | None,
+        responder: str | None,
+        unavailable_reason: str | None,
+    ) -> None:
+        """Redraw a card; a redraw that fails says so under the card, once per state.
+
+        A stale card goes on offering buttons for a request that has settled,
+        and a reader cannot tell that pressing one will do nothing.
+        """
+        assert post.external_post_id is not None
+        card = approval_card(
+            row,
+            post,
+            decided_by=decided_by,
+            responder_external_id=responder,
+            unavailable_reason=unavailable_reason,
+            notify_external_id=None,
+            notify_unreachable=False,
+        )
+        try:
+            await self._adapter.update_rich(
+                post.external_channel_id,
+                target.agent_name,
+                post.external_post_id,
+                card,
+                post.thread_ref,
+            )
+        except RichContentThrottled:
+            raise
+        except RichContentFailed as error:
+            logger.error(
+                "Could not update the card for request %s in channel %s: %s. "
+                "Posting the outcome as a reply instead.",
+                post.request_id,
+                post.external_channel_id,
+                error,
+            )
+            state = (row.state, unavailable_reason)
+            if self._card_edit_failures.get(post.token) != state:
+                await self._adapter.admin_message(
+                    post.external_channel_id,
+                    f"The card for request {post.handle} above could not be "
+                    "updated, so it may still be offering buttons that no "
+                    "longer work.",
+                    self._adapter.notice_address(
+                        post.external_post_id, post.thread_ref
+                    ),
+                    drawn=error.text,
+                )
+                self._card_edit_failures[post.token] = state
+            raise
+        self._card_edit_failures.pop(post.token, None)
+
+    async def _remove_card(self, key: _Key, post: ApprovalRequestPost) -> bool:
+        """Take an answered card off the platform. True once it is gone.
+
+        Nothing is written until the platform says the card is gone; a
+        deletion whose acknowledgement was lost is settled by asking again,
+        which the platform answers as already gone. A refusal leaves the card
+        settled and readable, and is tried again later.
+        """
+        assert post.external_post_id is not None
+        try:
+            await self._adapter.remove_publication(
+                post.external_channel_id, post.external_post_id
+            )
+        except RichContentThrottled:
+            raise
+        except RemovalFailed as refusal:
+            delay = self._retries.next(key)
+            logger.warning(
+                "Card %s for request %s was answered but %s would not take it "
+                "back: %s. It stays in channel %s showing the decision; trying "
+                "again in %.0fs.",
+                post.handle,
+                post.request_id,
+                self._adapter.platform_name,
+                refusal,
+                post.external_channel_id,
+                delay,
+            )
+            self._enqueue_later(key, delay, _SOON)
+            return False
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            stored = await self._card_posts.get(
+                db,
+                self._bridge_id,
+                post.agent_id,
+                post.session_id,
+                post.request_id,
+                for_update=True,
+            )
+            if stored is not None and stored.removed_at is None:
+                stored.removed_at = datetime.now(UTC)
+        self._retries.clear(key)
+        return True
+
+    async def _reserve(
+        self, row: ApprovalRequest, target: _Target
+    ) -> ApprovalRequestPost | None:
+        """Hold a handle nobody else in the channel has. None if another poster got there first."""
+        token = secrets.token_urlsafe(16)
+        async with tenant_session(self._sessions, self._tenant_id) as db:
+            start = await self._card_posts.count_in_channel(
+                db, self._bridge_id, target.channel_id
+            )
+            for attempt in range(_MINT_ATTEMPTS):
+                post = ApprovalRequestPost(
+                    tenant_id=self._tenant_id,
+                    bridge_id=self._bridge_id,
+                    agent_id=row.agent_id,
+                    session_id=row.session_id,
+                    request_id=row.request_id,
+                    token=token,
+                    handle=f"{HANDLE_PREFIX}{start + 1 + attempt}",
+                    external_channel_id=target.channel_id,
+                    external_post_id=None,
+                    thread_ref=target.thread_ref,
+                )
+                try:
+                    async with db.begin_nested():
+                        await self._card_posts.create(db, post)
+                except IntegrityError as error:
+                    if _HANDLE_CONSTRAINT in str(error.orig):
+                        continue
+                    existing = await self._card_posts.get(
+                        db,
+                        self._bridge_id,
+                        row.agent_id,
+                        row.session_id,
+                        row.request_id,
+                        for_update=False,
+                    )
+                    if existing is None:
+                        raise
+                    return None
+                await db.commit()
+                return post
+        raise RuntimeError(
+            f"No free handle for request {row.request_id} in channel "
+            f"{target.channel_id} after {_MINT_ATTEMPTS} tries; it has no card, "
+            "because a card nobody can name cannot be answered by typing."
+        )
+
+    async def _release(self, post: ApprovalRequestPost) -> None:
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            stored = await self._card_posts.get(
+                db,
+                self._bridge_id,
+                post.agent_id,
+                post.session_id,
+                post.request_id,
+                for_update=True,
+            )
+            if stored is not None and stored.external_post_id is None:
+                await db.delete(stored)
+
+    async def _unconfirmed(
+        self, key: _Key, post: ApprovalRequestPost
+    ) -> ApprovalRequestPost | None:
+        """A card whose post was never confirmed: find it, or say so; never repost."""
+        if post.unconfirmed_notice_at is not None:
+            return None
+        if not self._adapter.recovers_uncertain_posts:
+            if self._adapter.discloses_unconfirmed_posts:
+                await self._disclose_unconfirmed(post)
+            elif post.token not in self._noted_unconfirmed:
+                self._noted_unconfirmed.add(post.token)
+                logger.error(
+                    "Delivery of card %s in channel %s was never confirmed, and "
+                    "%s can neither search for it nor say so in the channel. The "
+                    "reservation is held and request %s can still be answered in "
+                    "Console.",
+                    post.handle,
+                    post.external_channel_id,
+                    self._adapter.platform_name,
+                    post.request_id,
+                )
+            return None
+        ref = await self._adapter.find_request_card(
+            post.external_channel_id,
+            post.thread_ref,
+            post.token,
+            post.created_at,
+            post.handle,
+        )
+        if ref is None:
+            delay = self._retries.next(key)
+            logger.warning(
+                "Card %s for request %s in channel %s was never confirmed and is "
+                "not on %s yet. It is not posted again, to avoid asking twice; "
+                "looking again in %.0fs.",
+                post.handle,
+                post.request_id,
+                post.external_channel_id,
+                self._adapter.platform_name,
+                delay,
+            )
+            self._enqueue_later(key, delay, _SOON)
+            return None
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            stored = await self._card_posts.get(
+                db,
+                self._bridge_id,
+                post.agent_id,
+                post.session_id,
+                post.request_id,
+                for_update=True,
+            )
+            if stored is None:
+                return None
+            stored.external_post_id = ref
+        post.external_post_id = ref
+        return post
+
+    async def _disclose_unconfirmed(self, post: ApprovalRequestPost) -> None:
+        """Say once in the channel that this card cannot be answered there.
+
+        The row is stamped before the message is sent: a second notice would
+        say nothing the first did not, so losing the notice to a crash
+        mid-send is the cheaper mistake.
+        """
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            stored = await self._card_posts.get(
+                db,
+                self._bridge_id,
+                post.agent_id,
+                post.session_id,
+                post.request_id,
+                for_update=True,
+            )
+            if stored is None or stored.unconfirmed_notice_at is not None:
+                return
+            stored.unconfirmed_notice_at = datetime.now(UTC)
+        sent = await self._adapter.admin_message(
+            post.external_channel_id,
+            f"Switch could not confirm that request **{post.handle}** reached "
+            "this chat. If a card for it is here, answering it here will not "
+            "work — answer it in Switch Console instead.",
+            post.thread_ref,
+        )
+        if sent is None:
+            logger.error(
+                "Could not tell channel %s that card %s was never confirmed. The "
+                "request can still be answered in Console, but nothing in the "
+                "channel says so, and this is not attempted again.",
+                post.external_channel_id,
+                post.handle,
+            )
+
+    # ── Turns ─────────────────────────────────────────────────────────────────
+
+    async def _publish_turn(
+        self, key: _Key, agent_id: str, session_id: str, turn_id: str
+    ) -> None:
+        async with tenant_session(self._sessions, self._tenant_id) as db:
+            view = turn_view(
+                await self._activity.turn(db, agent_id, session_id, turn_id)
+            )
+            if view is None or view.row.room_id is None:
+                self._forget_turn(key)
+                return
+            room_id = view.row.room_id
+            target = await self._target(db, key, agent_id, room_id, view.row.thread_id)
+            if target is None:
+                self._forget_turn(key)
+                return
+            asked_on = (
+                await self._platform_ref(db, target.channel_id, view.row.message_id)
+                or target.thread_ref
+            )
+            post = await self._turn_posts.get(
+                db, self._bridge_id, agent_id, session_id, turn_id, for_update=False
+            )
+            now: datetime = (await db.execute(select(func.now()))).scalar_one()
+            unended = [
+                row.turn_id
+                for row in await self._activity.turns_of_session(
+                    db, agent_id, session_id
+                )
+                if row.status in ("queued", "running") and row.turn_id != turn_id
+            ]
+            running = await self._running_turn(db, agent_id, session_id)
+            online = self._agent_online(agent_id)
+            error_summary = activity_error_summary(view.turn, online=online)
+            recipient = (
+                await self._recipient(
+                    db, room_id, target.agent, view.row, target.thread_ref
+                )
+                if error_summary and self._adapter.separate_attention_slot
+                else None
+            )
+            db.expunge_all()
+        self._online_seen[agent_id] = online
+        interrupt_turn_id = None if view.ended else running
+        elapsed = view.elapsed_seconds(now)
+        drawn = self._remembered(key)
+        was_final = drawn.final
+        content = TurnActivity(
+            view.items,
+            view.turn,
+            elapsed,
+            interrupt_turn_id=interrupt_turn_id,
+        )
+        state = status_state(
+            view,
+            elapsed_seconds=elapsed,
+            interrupt_turn_id=interrupt_turn_id,
+            clock_redraws=self._adapter.redraws_for_elapsed_time,
+            closed_by_platform=drawn.platform_closes_at is not None
+            and drawn.platform_closes_at <= datetime.now(UTC),
+        )
+        if post is None:
+            unposted = self._unposted.get(key)
+            # Rebuilt until it holds a marker, so the marker goes where the
+            # asking message is known to be now: its post can be mapped
+            # between one attempt and the next.
+            if unposted is None or unposted.mark is None:
+                unposted = self._unposted[key] = self._unposted_turn(
+                    view, target, asked_on
+                )
+            await self._marks(key, unposted, view, target, waiting_behind=bool(unended))
+            post = await self._begin_turn(
+                key, view, target, unposted, content, state, drawn
+            )
+            if post is not None or (view.ended and unposted.mark is None):
+                self._unposted.pop(key, None)
+        else:
+            await self._redraw_turn(key, post, view, target, content, state, drawn)
+            await self._marks(key, post, view, target, waiting_behind=bool(unended))
+        if post is not None:
+            await self._attention(post, view, target, error_summary, recipient, drawn)
+        if post is not None and not view.ended:
+            self._live_turns[key] = agent_id
+            drawn.clock_due = self._redraw_due(drawn, elapsed)
+        else:
+            self._live_turns.pop(key, None)
+        if post is not None and drawn.final and not was_final:
+            await self._stamp_drawn(post)
+        if drawn.status != view.turn.status:
+            drawn.status = view.turn.status
+            # The other waiting turns' stop controls name this session's
+            # running turn, which may just have changed.
+            for other in unended:
+                self._enqueue(("turn", agent_id, session_id, other), _SOON)
+
+    def _redraw_due(self, drawn: _TurnDrawn, elapsed: float | None) -> datetime:
+        """When a running turn is next due a redraw with no change of its own."""
+        now = datetime.now(UTC)
+        due = now + timedelta(seconds=_until_the_clock_moves(elapsed))
+        closes_at = drawn.platform_closes_at
+        if closes_at is not None and now < closes_at + _AFTER_PLATFORM_CLOSE < due:
+            due = closes_at + _AFTER_PLATFORM_CLOSE
+        return due
+
+    def _forget_turn(self, key: _Key) -> None:
+        """Stop watching a turn that is gone, or no longer published here."""
+        self._live_turns.pop(key, None)
+        self._drop_unposted(key)
+
+    def _drop_unposted(self, key: _Key) -> None:
+        """Forget a turn's unposted row, saying so if it leaves a marker behind.
+
+        Nothing is asked of the platform: a turn that stops being published
+        here keeps its marker whether or not its message was posted.
+        """
+        unposted = self._unposted.pop(key, None)
+        if unposted is not None and unposted.mark is not None:
+            logger.warning(
+                "No longer publishing turn %s of session %s, whose message was "
+                "never posted; the %s marker on %s in channel %s stays there.",
+                unposted.turn_id,
+                unposted.session_id,
+                unposted.mark,
+                unposted.reaction_message_ref,
+                unposted.external_channel_id,
+            )
+
+    async def _stamp_drawn(self, post: TurnStatusPost) -> None:
+        """Record that the turn's message shows how it ended, for the next resync."""
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            stored = await self._turn_posts.get(
+                db,
+                self._bridge_id,
+                post.agent_id,
+                post.session_id,
+                post.turn_id,
+                for_update=True,
+            )
+            if stored is not None:
+                stored.updated_at = func.now()
+
+    def _remembered(self, key: _Key) -> _TurnDrawn:
+        drawn = self._drawn.get(key)
+        if drawn is None:
+            drawn = self._drawn[key] = _TurnDrawn()
+        self._drawn.move_to_end(key)
+        while len(self._drawn) > _MAX_REMEMBERED_TURNS:
+            self._drawn.popitem(last=False)
+        return drawn
+
+    async def _running_turn(
+        self, db: AsyncSession, agent_id: str, session_id: str
+    ) -> str | None:
+        """The turn a stop control would end: the session's running one, if any."""
+        running = [
+            row.turn_id
+            for row in await self._activity.turns_of_session(db, agent_id, session_id)
+            if row.status == "running"
+        ]
+        return running[-1] if running else None
+
+    def _unposted_turn(
+        self, view: TurnView, target: _Target, asked_on: str | None
+    ) -> TurnStatusPost:
+        """The turn's row before its message exists, to carry its marker until then."""
+        return TurnStatusPost(
+            tenant_id=self._tenant_id,
+            bridge_id=self._bridge_id,
+            agent_id=view.row.agent_id,
+            session_id=view.row.session_id,
+            turn_id=view.turn.turn_id,
+            external_channel_id=target.channel_id,
+            thread_ref=target.thread_ref,
+            reaction_message_ref=asked_on,
+            mark=None,
+            attention_post_id=None,
+        )
+
+    async def _begin_turn(
+        self,
+        key: _Key,
+        view: TurnView,
+        target: _Target,
+        post: TurnStatusPost,
+        content: TurnActivity,
+        state: str,
+        drawn: _TurnDrawn,
+    ) -> TurnStatusPost | None:
+        """Post the turn in its thread, or at the channel root with none to thread under.
+
+        `post` is the turn's row as it stood before the message, marker and
+        all, and is stored once the platform has the message. One the platform
+        made but could not draw into is kept and drawn into later, rather than
+        posted a second time: after the wait, where it asked for one.
+
+        Once per turn, which is why the "agent has started" nudge belongs here.
+        A refusal is logged; the next change to the turn tries again, and an
+        ended turn is tried again after a wait.
+        """
+        if not view.ended:
+            await self._adapter.notify_working(
+                target.channel_id,
+                target.agent_name,
+                # Asked at the channel root, the turn threads under what was
+                # said, and whoever is waiting is watching the root.
+                None
+                if post.reaction_message_ref == target.thread_ref
+                else target.thread_ref,
+            )
+        drew = True
+        try:
+            ref = await self._adapter.post_rich(
+                target.channel_id, target.agent_name, content, target.thread_ref
+            )
+        except RichContentFailedAfterPost as failed:
+            ref = failed.ref
+            drew = False
+            if isinstance(failed, RichContentThrottled):
+                logger.warning(
+                    "%s made the message for turn %s in channel %s but asked for "
+                    "a %.1fs wait before drawing the turn into it; drawing it then.",
+                    self._adapter.platform_name,
+                    view.turn.turn_id,
+                    target.channel_id,
+                    failed.retry_after,
+                )
+                self._enqueue_later(key, failed.retry_after, _SOON)
+            else:
+                logger.error(
+                    "%s made the message for turn %s in channel %s but could not "
+                    "draw the turn into it: %s. %s",
+                    self._adapter.platform_name,
+                    view.turn.turn_id,
+                    target.channel_id,
+                    failed,
+                    "The turn has ended; trying again after a wait."
+                    if view.ended
+                    else "The next change to the turn draws into the same message.",
+                )
+                if view.ended:
+                    self._retry_later(key)
+        except RichContentThrottled:
+            raise
+        except RichContentFailed as error:
+            logger.error(
+                "Could not post the activity for turn %s of session %s in "
+                "channel %s: %s. The channel shows what the agent asked without "
+                "what it did.",
+                view.turn.turn_id,
+                view.row.session_id,
+                target.channel_id,
+                error,
+            )
+            if view.ended:
+                self._retry_later(key)
+            return None
+        closes_in = self._adapter.activity_closes_in(ref)
+        drawn.platform_closes_at = (
+            None
+            if closes_in is None
+            else datetime.now(UTC) + timedelta(seconds=closes_in)
+        )
+        post.external_post_id = ref
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            await self._turn_posts.create(db, post)
+            db.expunge(post)
+        if drew:
+            self._retries.clear(key)
+            drawn.status_state = state
+            drawn.final = view.ended
+        return post
+
+    async def _redraw_turn(
+        self,
+        key: _Key,
+        post: TurnStatusPost,
+        view: TurnView,
+        target: _Target,
+        content: TurnActivity,
+        state: str,
+        drawn: _TurnDrawn,
+    ) -> None:
+        """Rewrite the turn's message as the turn now stands, unless nothing shown moved."""
+        if drawn.wedged:
+            return
+        if drawn.status_state == state and (not view.ended or drawn.final):
+            return
+        try:
+            await self._adapter.update_rich(
+                post.external_channel_id,
+                target.agent_name,
+                post.external_post_id,
+                content,
+                post.thread_ref,
+            )
+        except RichContentThrottled:
+            raise
+        except RichContentWedged as wedged:
+            logger.error("%s", wedged)
+            drawn.wedged = True
+            await self._say_wedged(post, view, target)
+            return
+        except RichContentFailed as error:
+            logger.error(
+                "Could not update the activity for turn %s of session %s in "
+                "channel %s: %s. %s",
+                view.turn.turn_id,
+                view.row.session_id,
+                post.external_channel_id,
+                error,
+                "The turn has ended; trying again after a wait."
+                if view.ended
+                else "The next change to the turn will try the same message.",
+            )
+            if view.ended:
+                self._retry_later(key)
+            return
+        drawn.status_state = state
+        drawn.final = view.ended
+        self._retries.clear(key)
+
+    async def _say_wedged(
+        self, post: TurnStatusPost, view: TurnView, target: _Target
+    ) -> None:
+        """Tell the channel the message above has stopped for good, while anyone is looking."""
+        age = datetime.now(UTC) - view.row.created_at
+        if age > _WEDGE_NOTICE_MAX_AGE:
+            logger.warning(
+                "Not saying that the activity message %s is frozen: its turn "
+                "started %.0f minutes ago, so a reply under it now would reach "
+                "nobody still looking at it.",
+                post.external_post_id,
+                age.total_seconds() / 60,
+            )
+            return
+        try:
+            posted = await self._adapter.send_message(
+                post.external_channel_id,
+                target.agent_name,
+                _WEDGE_NOTICE,
+                post.thread_ref,
+            )
+        except Exception:
+            logger.exception(
+                "Could not say that the activity message %s for turn %s is "
+                "frozen. The message stays as it is, unexplained.",
+                post.external_post_id,
+                view.turn.turn_id,
+            )
+            return
+        if posted is None:
+            logger.error(
+                "The platform would not take the message saying that the "
+                "activity message %s for turn %s is frozen.",
+                post.external_post_id,
+                view.turn.turn_id,
+            )
+
+    # ── The marker on the asking message ──────────────────────────────────────
+
+    async def _marks(
+        self,
+        key: _Key,
+        post: TurnStatusPost,
+        view: TurnView,
+        target: _Target,
+        *,
+        waiting_behind: bool,
+    ) -> None:
+        """Put the one marker the turn's state earns on the asking message, and
+        take it off when the turn ends.
+
+        The marker is recorded before the platform is asked, so a request that
+        fails without an answer still counts as a marker that may be there.
+        """
+        if (
+            not self._adapter.supports_activity_reactions
+            or post.reaction_message_ref is None
+        ):
+            return
+        if view.ended:
+            if post.mark is not None and not await self._release_mark(
+                post, target.agent_name
+            ):
+                self._retry_later(key)
+            return
+        # A turn is reported queued for a moment before it starts even when
+        # nothing is ahead of it; the queued mark is only worth showing when
+        # another turn of the session really is in the way.
+        wanted: Mark = (
+            "queued"
+            if self._adapter.supports_queue_reaction
+            and view.turn.status == "queued"
+            and waiting_behind
+            else "working"
+        )
+        if post.mark == wanted and key not in self._unsure_marks:
+            return
+        if post.mark is not None and post.mark != wanted:
+            if not await self._release_mark(post, target.agent_name):
+                return
+        await self._record_mark(post, wanted)
+        try:
+            await self._adapter.mark_activity(
+                post.external_channel_id,
+                post.reaction_message_ref,
+                agent_name=target.agent_name,
+                mark=wanted,
+                on=True,
+                force=True,
+            )
+        except ActivityMarkRefused as refusal:
+            logger.warning("%s The turn goes on without the mark.", refusal)
+            self._unsure_marks.discard(key)
+            await self._record_mark(post, None)
+        except Exception:
+            logger.warning(
+                "Could not add the %s reaction on %s in %s; trying again with "
+                "the turn's next change.",
+                wanted,
+                post.reaction_message_ref,
+                post.external_channel_id,
+                exc_info=True,
+            )
+            self._unsure_marks.add(key)
+        else:
+            self._unsure_marks.discard(key)
+
+    async def _release_mark(self, post: TurnStatusPost, agent_name: str) -> bool:
+        """Take this turn's marker off, unless another turn still holds the same one.
+
+        Two turns can hang off one asking message; the last to let go removes
+        it. Where every agent reacts as one bot there is a single marker
+        between them, and where each reacts as its own there is one apiece.
+        False when the platform could not be asked, so it is tried again.
+        """
+        mark = post.mark
+        assert mark is not None and post.reaction_message_ref is not None
+        async with tenant_session(self._sessions, self._tenant_id) as db:
+            holders = await self._turn_posts.other_holders(
+                db,
+                post,
+                mark,
+                same_agent=self._adapter.activity_reactions_per_agent,
+            )
+        holders += self._unposted_holders(post, mark)
+        if not holders:
+            try:
+                await self._adapter.mark_activity(
+                    post.external_channel_id,
+                    post.reaction_message_ref,
+                    agent_name=agent_name,
+                    mark=cast(Mark, mark),
+                    on=False,
+                    force=True,
+                )
+            except ActivityMarkRefused as refusal:
+                logger.error("%s The %s marker may stay on the message.", refusal, mark)
+            except Exception:
+                logger.warning(
+                    "Could not remove the %s reaction on %s in %s.",
+                    mark,
+                    post.reaction_message_ref,
+                    post.external_channel_id,
+                    exc_info=True,
+                )
+                return False
+        await self._record_mark(post, None)
+        return True
+
+    def _unposted_holders(self, post: TurnStatusPost, mark: str) -> int:
+        """Other turns holding `mark` on the same asking message whose own
+        message is not posted yet. Their rows are not stored, so the database
+        cannot count them."""
+        per_agent = self._adapter.activity_reactions_per_agent
+        return sum(
+            1
+            for other in self._unposted.values()
+            if other is not post
+            and other.mark == mark
+            and other.external_channel_id == post.external_channel_id
+            and other.reaction_message_ref == post.reaction_message_ref
+            and (not per_agent or other.agent_id == post.agent_id)
+        )
+
+    async def _record_mark(self, post: TurnStatusPost, mark: Mark | None) -> None:
+        async with tenant_session(self._sessions, self._tenant_id) as db, db.begin():
+            stored = await self._turn_posts.get(
+                db,
+                self._bridge_id,
+                post.agent_id,
+                post.session_id,
+                post.turn_id,
+                for_update=True,
+            )
+            if stored is not None:
+                stored.mark = mark
+        post.mark = mark
+
+    # ── The "turn is stuck" message ───────────────────────────────────────────
+
+    async def _attention(
+        self,
+        post: TurnStatusPost,
+        view: TurnView,
+        target: _Target,
+        error_summary: str | None,
+        recipient: str | None,
+        drawn: _TurnDrawn,
+    ) -> None:
+        """One message per turn saying somebody has to act, cleared once nobody does.
+
+        Posted, not edited in, because a post notifies and an edit does not.
+        """
+        if not self._adapter.separate_attention_slot:
+            return
+        if error_summary is None and post.attention_post_id is None:
+            return
+        state = error_summary or view.turn.status
+        if post.attention_post_id is not None and drawn.attention_state == state:
+            return
+        content = TurnActivity(
+            [],
+            view.turn,
+            status_only=True,
+            notify_unreachable=bool(error_summary)
+            and recipient is None
+            and self._adapter.notifies_only_by_mention,
+            error_summary=error_summary,
+        )
+        try:
+            if post.attention_post_id is None:
+                ref = await self._adapter.post_rich(
+                    post.external_channel_id,
+                    target.agent_name,
+                    replace(content, notify_external_id=recipient),
+                    post.thread_ref,
+                )
+                async with (
+                    tenant_session(self._sessions, self._tenant_id) as db,
+                    db.begin(),
+                ):
+                    stored = await self._turn_posts.get(
+                        db,
+                        self._bridge_id,
+                        post.agent_id,
+                        post.session_id,
+                        post.turn_id,
+                        for_update=True,
+                    )
+                    if stored is not None:
+                        stored.attention_post_id = ref
+                post.attention_post_id = ref
+            else:
+                await self._adapter.update_rich(
+                    post.external_channel_id,
+                    target.agent_name,
+                    post.attention_post_id,
+                    content,
+                    post.thread_ref,
+                )
+        except RichContentThrottled:
+            raise
+        except RichContentWedged as wedged:
+            logger.error("%s", wedged)
+        except RichContentFailed as error:
+            logger.error(
+                "Could not draw the attention message for turn %s in channel "
+                "%s: %s. The next change to the turn will try again.",
+                view.turn.turn_id,
+                post.external_channel_id,
+                error,
+            )
+            return
+        drawn.attention_state = state
+
+    # ── Read back for a control pressed on a turn's message ───────────────────
+
+    async def activity_shown_at(
+        self, channel_id: str, ref: str
+    ) -> ActivitySnapshot | None:
+        """The turn a message of ours is showing, for an adapter that offers it."""
+        async with tenant_session(self._sessions, self._tenant_id) as db:
+            found = await self._turn_at(db, channel_id, ref)
+            if found is None:
+                return None
+            view, _ = found
+            now: datetime = (await db.execute(select(func.now()))).scalar_one()
+        return ActivitySnapshot(
+            items=view.items,
+            turn=view.turn,
+            elapsed_seconds=view.elapsed_seconds(now),
+            read_at=now,
+        )
+
+    async def stop_target(self, channel_id: str, ref: str) -> StopTarget | None:
+        """What a Stop control on the message at `ref` would stop, or None."""
+        async with tenant_session(self._sessions, self._tenant_id) as db:
+            found = await self._turn_at(db, channel_id, ref)
+            if found is None:
+                return None
+            view, running = found
+        assert view.row.room_id is not None
+        return StopTarget(
+            agent_id=view.row.agent_id,
+            session_id=view.row.session_id,
+            room_id=view.row.room_id,
+            thread_id=view.row.thread_id,
+            running_turn_id=running,
+        )
+
+    async def _turn_at(
+        self, db: AsyncSession, channel_id: str, ref: str
+    ) -> tuple[TurnView, str | None] | None:
+        """The turn behind a message, re-checked the way drawing it was checked."""
+        post = await self._turn_posts.at(db, self._bridge_id, channel_id, ref)
+        if post is None:
+            return None
+        view = turn_view(
+            await self._activity.turn(db, post.agent_id, post.session_id, post.turn_id)
+        )
+        if view is None or view.row.room_id is None:
+            return None
+        found = await self._rooms.get_with_membership(
+            db, view.row.room_id, post.agent_id
+        )
+        if (
+            found is None
+            or found[0].bridge_id != self._bridge_id
+            or found[0].external_channel_id != channel_id
+            or not found[1]
+        ):
+            return None
+        return view, await self._running_turn(db, post.agent_id, post.session_id)
+
+
+def _until_the_clock_moves(elapsed: float | None) -> float:
+    """Seconds until a running turn's clock shows another minute.
+
+    A queued turn shows no clock, and is looked at again after the same while.
+    """
+    if elapsed is None:
+        return RUNNING_CLOCK_SECONDS
+    return RUNNING_CLOCK_SECONDS - elapsed % RUNNING_CLOCK_SECONDS
+
+
+def _asked_at_root(turn_row: AgentSessionActivityItem | None) -> bool:
+    """Whether the turn a request belongs to was asked at the channel root.
+
+    Only then may its card go to the root when its thread cannot be found. A
+    request whose turn is not recorded says nothing about where it was asked,
+    and is treated as the root, as it always was without that record.
+    """
+    if turn_row is None or turn_row.message_id is None:
+        return True
+    return turn_row.thread_id in (None, turn_row.message_id)

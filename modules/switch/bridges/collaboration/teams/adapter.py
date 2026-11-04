@@ -1,0 +1,4489 @@
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import re
+import secrets
+import time
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from urllib.parse import quote, unquote, urlsplit
+
+import httpx
+from aiohttp import web
+from pydantic import ConfigDict, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
+
+from switch_core.bridges.agent.commands import COMMANDS_BY_NAME
+from switch_core.bridges.collaboration.adapter import (
+    AgentIdentity,
+    ChannelNotBindable,
+    ConfigEditRefused,
+    PlatformAdapter,
+    RemovalFailed,
+    RequestCard,
+    RichContent,
+    RichContentFailed,
+    RichContentThrottled,
+    TurnActivity,
+)
+from switch_core.bridges.collaboration.models import (
+    BridgeConnectionConfig,
+    BridgeCredentialError,
+    BridgeOperationError,
+    ChannelType,
+    DirectoryUser,
+    InboundAgentJoin,
+    InboundAppJoin,
+    InboundCommand,
+    InboundInteraction,
+    InboundMessage,
+    InboundUserJoin,
+)
+from switch_core.bridges.collaboration.session.renderers import (
+    INTERRUPT_QUEUED_NOTE,
+    Drawn,
+    Markup,
+    offered_controls,
+)
+from switch_core.bridges.collaboration.session.renderers.neutral import (
+    activity_log,
+    in_activity_log,
+    render_request,
+    turn_status,
+)
+from switch_core.bridges.collaboration.teams.auth import (
+    BOTFRAMEWORK_OPENID,
+    BotFrameworkAuthenticator,
+    ClientSecret,
+    SigningKeys,
+    SigningKeysUnavailable,
+    TeamsTokenProvider,
+    TokenRequestRefused,
+)
+from switch_core.bridges.collaboration.teams.cards import (
+    activity_detail,
+    agent_message_card,
+    answer_actions,
+    card_attachment,
+    interrupt_action,
+    read_press,
+)
+from switch_core.bridges.collaboration.teams.connector import (
+    BotConnectorClient,
+    BotConnectorConflict,
+    BotConnectorGone,
+    BotConnectorRefused,
+    BotConnectorThrottled,
+)
+from switch_core.bridges.collaboration.teams.crypto import (
+    ResourceDataError,
+    generate_encryption_keypair,
+    load_certificate_der_b64,
+    load_private_key,
+)
+from switch_core.bridges.collaboration.teams.graph import GraphClient, GraphError
+from switch_core.bridges.collaboration.teams.identity import (
+    NotificationKey,
+    NotificationKeyring,
+    TeamsIdentity,
+    TeamsTokens,
+)
+from switch_core.bridges.collaboration.teams.withdrawal import (
+    delete_own_subscriptions,
+    leave_every_team,
+)
+from switch_core.room_wide_mention import (
+    CODE_AND_URLS,
+    defuse_mass_mention_words_in_prose,
+)
+from switch_core.sessions.contract import TURN_ENDED
+
+if TYPE_CHECKING:
+    from switch_core.bridges.collaboration.teams.shared_app import TeamsSharedApp
+
+logger = logging.getLogger(__name__)
+
+_MENTION_TAG = re.compile(r"<at\b[^>]*>(.*?)</at>", re.IGNORECASE | re.DOTALL)
+_HTML_TAG = re.compile(r"<[^>]+>")
+_BR_TAG = re.compile(r"<br\s*/?>", re.IGNORECASE)
+# The whole of a name, if every character of it can be part of an `@mention`.
+_HANDLE_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# What may follow a name for it to have ended there, rather than the name
+# being a prefix of a longer one: `@ada` must not match inside `@adaline`.
+_MENTION_END = r"(?![A-Za-z0-9._-])"
+_AT_TAG = re.compile(r"<at>(.*?)</at>", re.DOTALL)
+_ZERO_WIDTH_SPACE = "\u200b"
+
+_PUBLICATION_LIMIT = 2000
+"""How many characters a status or a card may spend on its body.
+
+A readability choice, not a safety one \u2014 the size Teams will actually accept
+is enforced on the serialised activity in `connector.py`, which is where the
+card structure, the mention entities and the two further copies of this text
+in `summary` and `fallbackText` can all be counted. This is the separate
+question of how much of a turn belongs in a message somebody has to scroll
+past to reach the next one. 2000 is the same figure the platforms without a
+renderer of their own inherit, kept because it reads well in a Teams post
+rather than because it was inherited.
+"""
+
+_DETAIL_LIMIT = 2000
+"""How many characters the folded-away tool log may spend.
+
+The same figure as the status it hides behind, for the same reason: this is
+about how much a reader wants in front of them, not about what Teams accepts.
+It is also what keeps the fold rendering as one block to a line — past roughly
+this much, split into lines this short, `cards.body_blocks` runs out of its
+structural budget and sets the whole log as one double-spaced block instead.
+The log says how many calls it left out.
+"""
+
+_THROTTLE_BACKOFF = 5.0
+"""How long to wait when Teams throttles without saying how long.
+
+Ours, not Microsoft's, and only used when the 429 carried no `Retry-After`.
+"""
+
+_CONFLICT_BACKOFF = 1.0
+"""How long to wait after Teams reports the activity changed under an edit.
+
+Short: nothing is rate limited, something else simply wrote first, and the
+next attempt renders the current state from scratch. Long enough that two
+writers racing do not simply race again.
+"""
+
+_MAX_CONVERSATION_LOCKS = 512
+"""How many conversations' write locks one adapter keeps.
+
+Enough for every conversation a bridge is realistically mid-turn in at once.
+Only a lock nobody is using is ever dropped — see `_writes_to`.
+"""
+
+_PUBLICATION_MARK = "teams1"
+"""What marks a string as a publication reference rather than a message id.
+
+Versioned, because the parts are what an edit is addressed with and a later
+shape has to be told from this one rather than guessed at.
+"""
+
+_INVOKE_CARD_ACTION = "adaptiveCard/action"
+"""The invoke a press on an `Action.Execute` arrives as."""
+
+_MESSAGE_RESPONSE = "application/vnd.microsoft.activity.message"
+"""The invoke response that shows a line of text to whoever pressed, alone."""
+
+_ERROR_RESPONSE = "application/vnd.microsoft.error"
+"""The invoke response for a press this bridge could not finish reading."""
+
+_PRESS_NOTICE: ContextVar[list[str] | None] = ContextVar(
+    "switch_teams_press_notice", default=None
+)
+"""Where a refusal waits while a press is being handled.
+
+`tell_actor` has no press to answer and the press has nothing to say until the
+handler returns, so the two meet here. A list rather than one string, and a
+context rather than a field: two people pressing at once are two tasks with a
+context each, and the same person pressing twice is two presses rather than one
+notice overwriting another.
+"""
+
+
+def _invoke_error(status: int, code: str, message: str) -> dict[str, Any]:
+    """An invoke answered with a failure the presser alone is shown.
+
+    The alternative is an empty success, which takes the button out of its
+    loading state and says the answer landed. Nothing that reaches here got as
+    far as an answer, so the press is closed by saying so.
+    """
+    return {
+        "statusCode": status,
+        "type": _ERROR_RESPONSE,
+        "value": {"code": code, "message": message},
+    }
+
+
+def _publication_ref(service_url: str, conversation_id: str, activity_id: str) -> str:
+    """The durable address of a publication, as one string.
+
+    A Teams edit or delete needs three things and a bare message id is one of
+    them. The conversation is the part nothing else can supply — in a channel
+    it names the post the message sits in, and Teams may answer a create with
+    a conversation of its own choosing rather than the one that was asked for
+    — and the regional service URL is learned from inbound traffic, so a
+    process that has only heard from one region would send the next edit
+    somewhere else entirely.
+
+    So the caller is given all three to write down, in the single opaque
+    string its column and its journal already hold. Discord's publications
+    carry `channel:message` the same way and for the same reason.
+
+    Percent-encoded per part so a service URL's own separators cannot be read
+    as this one's.
+    """
+    return "|".join(
+        [
+            _PUBLICATION_MARK,
+            *(
+                quote(part, safe="")
+                for part in (service_url, conversation_id, activity_id)
+            ),
+        ]
+    )
+
+
+def _read_publication_ref(ref: str) -> tuple[str, str, str] | None:
+    """`(service_url, conversation_id, activity_id)`, or None if this is not one.
+
+    None rather than an error: every reference written before publication
+    carried its address is a bare message id, and so is anything the relay
+    stored. The caller decides what a missing address is worth.
+    """
+    parts = ref.split("|")
+    if len(parts) != 4 or parts[0] != _PUBLICATION_MARK:
+        return None
+    service_url, conversation_id, activity_id = (unquote(part) for part in parts[1:])
+    if not (service_url and conversation_id and activity_id):
+        return None
+    return (service_url, conversation_id, activity_id)
+
+
+@dataclass(frozen=True)
+class TeamPlacement:
+    """One team in the organisation, and whether Switch is in it.
+
+    `has_switch` is None when the team's apps could not be read.
+    """
+
+    team_id: str
+    name: str
+    has_switch: bool | None
+
+
+@dataclass(frozen=True)
+class TeamPlacements:
+    teams: list[TeamPlacement]
+    #: The app's id in the organisation's catalogue, as an installation in one
+    #: of these teams reported it; None when Switch is in none of them.
+    catalog_app_id: str | None
+
+
+@dataclass(frozen=True)
+class _Publication:
+    """Where a publication is, and whether that is known or reconstructed.
+
+    `trusted` is the part decisions hang off. A trusted address came back from
+    Teams and was written down, so a 404 against it means the message is gone;
+    a reconstructed one is this adapter's guess from a channel id and a stored
+    root, so the same 404 may only mean the guess was wrong, and an outcome
+    that cannot be told apart from a bad address is not an outcome.
+    """
+
+    service_url: str
+    conversation_id: str
+    activity_id: str
+    channel_id: str
+    trusted: bool
+
+    @property
+    def in_a_channel(self) -> bool:
+        """Whether this publication sits in a channel post rather than a chat.
+
+        Read off the address rather than the channel-type cache, which a
+        restart empties and which then answers "channel" for everything it has
+        not heard from. A chat is addressed as itself; a channel post is
+        addressed as a conversation inside the channel, so the two differ
+        exactly when the message is in a post.
+        """
+        return self.conversation_id != self.channel_id
+
+
+@dataclass
+class _ConversationWrites:
+    """One conversation's write lock, and how many writers are on it.
+
+    `users` counts everyone between asking for the lock and finishing with it,
+    holder and queue alike, because the lock itself cannot be asked: it reports
+    unheld from the moment it is released until the waiter it woke gets a turn
+    to run. Eviction reads this instead.
+    """
+
+    lock: asyncio.Lock
+    users: int
+
+
+class _TeamsMarkup(Markup):
+    """Markdown as an Adaptive Card TextBlock actually parses it.
+
+    A TextBlock renders a subset \u2014 emphasis, lists, links \u2014 and has no code
+    span at all, so a backtick reaches the reader as a backtick. That lands
+    worst on the one literal a card exists to be answered with: a handle drawn
+    as `` `R42` `` invites somebody to type the backticks with it. Bold is
+    emphasis Teams does render, so the literal is marked with that and arrives
+    as something to copy rather than something to decode.
+
+    A command gets neither. It is read rather than typed, so the argument that
+    wins for the handle does not apply, and a third bold on a card whose
+    heading and handle are already bold marks nothing out at all.
+    """
+
+    def literal(self, escape: Callable[[str], str]) -> Callable[[str], str]:
+        """The ordinary escape: neither spelling here is a code span.
+
+        A handle becomes emphasis and a command stays plain, so both land in
+        prose that a TextBlock parses as Markdown. The Markdown default exists
+        for content nothing will read; this content is read.
+        """
+        return escape
+
+    def code(self, text: str) -> str:
+        return f"**{text}**"
+
+    def command(self, text: str) -> str:
+        return text
+
+
+_TEAMS_MARKUP = _TeamsMarkup()
+
+
+# A Teams identifier standing where a person's name should be: a channel
+# account (`29:…`, `8:orgid:…`) or a bare Entra object id.
+_TEAMS_ID = re.compile(
+    r"^(?:\d+:\S+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
+# A newline with no newline either side of it.
+_LONE_NEWLINE = re.compile(r"(?<!\n)\n(?!\n)")
+# Both prefixes reach the same dispatcher. `!` is Switch's own; `/` is what a
+# Teams command list types into the compose box when someone picks a command,
+# and what anyone who has used Slack will try first.
+_COMMAND_PREFIXES = ("!", "/")
+
+# How long a failed Graph read of a channel is taken at its word before being
+# tried again. Long enough that a channel Graph will not describe is not read
+# on every message; short enough that a blip, or a permission granted after the
+# bridge started, heals on its own.
+_CHANNEL_READ_RETRY_AFTER = 300.0
+
+
+def _channel_type_of(channel: dict[str, Any]) -> ChannelType:
+    """Only a ``standard`` channel shares the team's membership. Anything else,
+    including values Graph adds later, is private: wrongly private fails
+    loudly, wrongly public adds people to the whole team."""
+    return (
+        "channel_public"
+        if channel.get("membershipType") == "standard"
+        else "channel_private"
+    )
+
+
+def _handle_for(user: dict[str, Any]) -> str:
+    """The handle Switch knows a Teams person by.
+
+    The local part of their user principal name — `ada.lovelace` from
+    `ada.lovelace@contoso.com`. Unique within a tenant, and unlike a display
+    name it survives being written as `@handle`, which is how someone is
+    addressed in a room and how an outbound mention is matched back to them.
+
+    Every path that meets a person must agree on this, or the same human gets
+    two records: the directory used to yield the whole principal name while
+    inbound messages yielded the display name, and whichever arrived first won.
+    """
+    principal = str(user.get("userPrincipalName") or "")
+    if principal:
+        return principal.split("@", 1)[0]
+    display = str(user.get("displayName") or "")
+    return display or str(user.get("id") or "")
+
+
+def _is_usable_handle(name: str) -> bool:
+    """Whether `name` survives being written as `@name`.
+
+    A handle is read back out of message text, where a mention ends at the
+    first character that cannot be part of one. A name containing anything
+    else — a space, above all, since most display names have one — is
+    therefore unaddressable, and an id was never a name to begin with.
+    """
+    return (
+        bool(name)
+        and not _TEAMS_ID.match(name)
+        and _HANDLE_SHAPE.match(name) is not None
+    )
+
+
+def _hard_wrap(text: str) -> str:
+    """Make single line breaks survive into a plain-text Teams activity.
+
+    Teams renders a bot's `text` as Markdown, where one newline is whitespace,
+    so a heading and the line under it arrive as one run-on sentence. Doubling
+    a lone newline gives the break back, at the cost of a paragraph gap in
+    place of every line break. Existing blank lines are left alone.
+
+    Only the seam that has no card to work with — an admin message, which is
+    the platform speaking rather than an agent. An agent's message is an
+    Adaptive Card, and `cards.body_blocks` gives it the same line breaks
+    without the gaps.
+    """
+    return _LONE_NEWLINE.sub("\n\n", text)
+
+
+def _render_mentions(text: str) -> str:
+    """Rewrite Teams ``<at>Display</at>`` mention markup to ``@Display``.
+
+    Teams sends an @mention as ``<at>Name</at>`` markup, with the addressable id
+    carried separately in the activity ``entities`` / Graph ``mentions``.
+    Deleting the markup would drop the ``@name`` the addressing layer matches on,
+    so we keep the display text as a plain ``@name`` token instead."""
+
+    def _sub(match: re.Match[str]) -> str:
+        inner = html.unescape(match.group(1)).strip()
+        return f"@{inner}" if inner else ""
+
+    return _MENTION_TAG.sub(_sub, text)
+
+
+_LEADING_MENTION_TAG = re.compile(
+    r"^\s*(?:<(?:p|div|span)\b[^>]*>\s*)?<at\b[^>]*>.*?</at>\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_leading_mention(text: str) -> str:
+    """Drop a single leading ``<at>…</at>`` mention (optionally inside one wrapper
+    tag) from Teams message markup.
+
+    In a Teams channel the Bot Framework only delivers a message when the bot is
+    @mentioned, so a command typed in a channel always arrives as
+    ``@Bot !command``. Removing the leading bot mention lets the shared
+    ``!``-command detection in ``_deliver`` see the ``!`` marker."""
+    return _LEADING_MENTION_TAG.sub("", text, count=1)
+
+
+def _aad_failure_message(exc: Exception) -> str:
+    """Reduce an AAD token failure to the sentence an operator can act on.
+
+    The raw failure carries the whole OAuth error body — trace ids, correlation
+    ids, timestamps — wrapped around one useful sentence. Microsoft writes that
+    sentence well (it names the client-secret value-vs-ID mix-up outright), so
+    surface it and drop the rest. Falls back to the full text if the body is not
+    the shape we expect, rather than losing the detail.
+    """
+    text = str(exc)
+    start = text.find("{")
+    if start != -1:
+        try:
+            body = json.loads(text[start:])
+        except json.JSONDecodeError:
+            body = None
+        if isinstance(body, dict):
+            description = body.get("error_description")
+            if isinstance(description, str) and description:
+                sentence = description.split("Trace ID:")[0].strip().rstrip(".")
+                return f"Microsoft rejected these credentials — {sentence}."
+    return f"Microsoft rejected these credentials — {text}"
+
+
+# Channel-message subscriptions with resource data live at most 60 minutes
+# without a lifecycle URL; we request 55 and renew well before expiry.
+_SUBSCRIPTION_TTL = timedelta(minutes=55)
+# How often the renewal loop wakes, and how close to running out a
+# subscription must be for it to be renewed then. Four chances before a
+# subscription lapses, so one failed renewal is retried rather than fatal.
+_RENEWAL_CHECK_SECONDS = 5 * 60
+_RENEW_WHEN_WITHIN = timedelta(minutes=20)
+# How long a "the app is blocked" answer from Teams stays on the connection's
+# attention note after it was last seen. Nothing tells Switch when it is lifted,
+# so it fades rather than staying forever.
+_BOT_DISABLED_NOTICE_SECONDS = 60 * 60
+# How many teams' installed apps are read at once when listing where Switch
+# is: enough to answer a large organisation in seconds, few enough that one
+# request does not spend the organisation's Graph budget on its own.
+_TEAM_READS_AT_ONCE = 8
+_GLOBAL_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
+# How soon, and how rarely, to re-attempt a channel that has no live
+# subscription. The floor is short because the common failure clears in about a
+# minute (a load balancer registering a newly-started pod); the ceiling keeps a
+# permanently broken channel from hammering Graph for the life of the process.
+_REPAIR_MIN_INTERVAL_SECONDS = 30
+_REPAIR_MAX_INTERVAL_SECONDS = 5 * 60
+# How long an answer to "is Switch in this team" stands before it is asked
+# again: Teams says when the app joins or leaves a team, but not reliably.
+_TEAM_RECHECK_SECONDS = 15 * 60
+# The least time between readings of Graph's subscriptions prompted by a
+# notification for one the bridge does not know.
+_ADOPT_ON_DEMAND_COOLDOWN_SECONDS = 10
+
+
+def activity_tenant(activity: dict[str, Any]) -> str | None:
+    """The organisation an activity says it is from, or None if it does not
+    say one thing.
+
+    Teams carries the directory in two places. Both are inside the signed
+    activity; if they disagree there is no telling which to believe, so the
+    answer is neither.
+    """
+    named = {
+        str(value)
+        for value in (
+            (activity.get("conversation") or {}).get("tenantId"),
+            ((activity.get("channelData") or {}).get("tenant") or {}).get("id"),
+        )
+        if value
+    }
+    return named.pop() if len(named) == 1 else None
+
+
+_CHANNEL_ID = re.compile(r"19:[^\s/?#%@]+@thread\.(?:tacv2|skype)")
+
+
+def _is_channel_id(channel_id: str) -> bool:
+    """Whether an id is a Teams channel's, as opposed to a chat's.
+
+    Channels are `19:…@thread.tacv2` (or the older `@thread.skype`); group
+    chats are `@thread.v2` and one-to-one chats have other shapes entirely.
+    Nothing that could change the shape of a URL is allowed in between, since
+    a channel id offered for binding goes into the Graph call that proves the
+    channel is this organisation's.
+    """
+    return _CHANNEL_ID.fullmatch(channel_id) is not None
+
+
+def _parse_graph_time(value: object) -> datetime | None:
+    """A Graph timestamp (`2026-10-01T12:00:00Z`, sometimes with fractional
+    seconds and a numeric offset) as an aware datetime, or None if unreadable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+#: What the bring-your-own registration form must ask for. Declared rather
+#: than read off the field types, because the same model also describes a
+#: bridge on the distributed app, which holds none of the app's credentials —
+#: so they are optional to the model and required of the person filling the
+#: form, and the form is built from the schema.
+_FORM_REQUIRED = ["app_id", "app_password", "tenant_id", "team_id", "public_base_url"]
+
+
+def _require_on_form(schema: dict[str, Any]) -> None:
+    schema["required"] = list(_FORM_REQUIRED)
+
+
+class TeamsConnectionConfig(BridgeConnectionConfig):
+    """Per-bridge Microsoft Teams settings.
+
+    Two shapes, decided by which app the bridge belongs to (`event_delivery`):
+
+    - **own_listener** — the bring-your-own app. An Azure AD app registration
+      the operator created backs both a Bot Framework bot and Microsoft Graph
+      access, and its secrets live per-bridge here, like every other
+      collaboration bridge. The bridge runs its own inbound listener.
+    - **shared** — the distributed app. The app and its credentials are the
+      deployment's; this bridge names only the organisation (`tenant_id`) that
+      approved it and, once chosen, the team new channels go in. Its traffic
+      reaches it through the deployment's public messaging routes.
+    """
+
+    model_config = ConfigDict(json_schema_extra=_require_on_form)
+
+    # Hidden from the form for the same reason Discord's is: reaching the form
+    # means the bring-your-own app, and `shared` is written by the install flow.
+    event_delivery: SkipJsonSchema[Literal["own_listener", "shared"]] = "own_listener"
+
+    # Azure AD app registration (bot client id + secret). The bring-your-own
+    # app's; a shared bridge carries none.
+    app_id: str | None = None
+    app_password: str | None = None
+    # The organisation's directory. Under the bring-your-own app it is where
+    # the operator's app lives; under the distributed app it is the customer
+    # organisation that approved ours.
+    tenant_id: str
+
+    # AAD team (group) id that outbound-created channels are provisioned into.
+    # Required of a bring-your-own bridge; chosen after install on a shared one,
+    # and channel creation refuses until it is.
+    team_id: str | None = None
+
+    # Public HTTPS base URL where this adapter's inbound listener is reachable.
+    # Teams and Graph are HTTP-push, so the bring-your-own adapter hosts its
+    # own listener: Bot Framework activities at ``/api/messages`` and Graph
+    # change notifications at ``/api/teams/notifications``, both under this
+    # base.
+    public_base_url: str | None = None
+
+    # Local bind for the inbound listener. This is a Switch-internal deployment
+    # detail, not an admin concern, so it is hidden from the gateway config form
+    # (SkipJsonSchema) and defaults are used; an operator can still override it
+    # via the stored connection_config when running more than one Teams bridge on
+    # a host (one bridge per listener port).
+    listen_host: SkipJsonSchema[str] = "0.0.0.0"
+    listen_port: SkipJsonSchema[int] = 3978
+
+    # Graph change-notification resource-data encryption. Graph encrypts message
+    # bodies with the public certificate; the private key decrypts them on
+    # delivery. Required once channel-message subscriptions are enabled, so the
+    # trio is generated on creation rather than asked for — an operator pasting
+    # PEMs into a form is three chances to disable channel capture silently, and
+    # the certificate is key transport that Graph never validates against a trust
+    # store, so there is nothing an operator-supplied one would buy. Hidden from
+    # the gateway form; supplying your own through the API still wins.
+    encryption_certificate_id: SkipJsonSchema[str | None] = None
+    encryption_public_certificate: SkipJsonSchema[str | None] = None
+    encryption_private_key: SkipJsonSchema[str | None] = None
+
+    # Shared secret echoed back in every change notification and validated on
+    # receipt. The ONLY control that authenticates a bring-your-own bridge's
+    # notifications: Graph resource-data encryption proves integrity but NOT
+    # origin (the wrapping key is the public certificate, which anyone can
+    # encrypt to), so without clientState the notification endpoint is
+    # spoofable.
+    #
+    # Generated, not asked for: it is a secret with no external meaning, so
+    # prompting an operator to invent one only invites a weak or reused value.
+    # Required of a bring-your-own bridge rather than defaulted, and minted in
+    # prepare_config at registration — a default here would mint a fresh secret
+    # every time a stored config was validated, and every live subscription
+    # would start failing its origin check with nothing to point at. A shared
+    # bridge's is derived for its organisation by the deployment and never
+    # stored.
+    client_state: SkipJsonSchema[str | None] = None
+
+    # Bot Connector serviceUrl (the per-tenant outbound endpoint). It is learned
+    # from inbound Bot Framework activities and persisted here so outbound
+    # survives a process restart — otherwise, until the bot next receives a
+    # (mention-triggered) activity, no serviceUrl is known and every outbound
+    # message fails. The Graph channel-capture path never carries a serviceUrl,
+    # so a busy channel whose traffic arrives only via capture would never
+    # re-learn it. Refreshed automatically whenever a newer value is observed.
+    # Learned at runtime and persisted here — never an admin input, so it is
+    # hidden from the gateway config form (SkipJsonSchema).
+    service_url: SkipJsonSchema[str | None] = None
+
+    # Channel id -> the AAD group id of the team holding it, learned from the
+    # `channelData` of inbound activities and persisted here. A Graph message
+    # subscription names the team as well as the channel, and `team_id` above
+    # is only the team Switch *provisions into* — a channel the bot was added
+    # to in some other team belongs to none of it. Held in memory alone this
+    # was lost on every restart, and capture in those channels stayed dead
+    # until someone thought to mention the bot; see `_learn_channel_team`.
+    # Learned at runtime, never an admin input, so it is hidden from the form.
+    channel_teams: SkipJsonSchema[dict[str, str]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _fields_match_delivery(self) -> TeamsConnectionConfig:
+        """Refuse the half-states that look configured and cannot work.
+
+        A bring-your-own bridge missing any of its app's settings has nothing
+        to authenticate with or nowhere to be reached. A shared bridge carrying
+        any of them is the opposite mistake — credentials, keys or a listener
+        for an app this bridge does not own, read as evidence that it does.
+        """
+        if self.event_delivery == "own_listener":
+            missing = [
+                name
+                for name in (
+                    "app_id",
+                    "app_password",
+                    "team_id",
+                    "public_base_url",
+                    "client_state",
+                )
+                if not getattr(self, name)
+            ]
+            if missing:
+                raise ValueError(
+                    f"{', '.join(missing)} must be set for a Teams bridge on its "
+                    "own app."
+                )
+            return self
+        # Compared with each field's default rather than read off which were
+        # supplied, so a config that has been dumped and read back — defaults
+        # and all — is still the same config.
+        foreign = sorted(
+            name
+            for name in (
+                "app_id",
+                "app_password",
+                "public_base_url",
+                "client_state",
+                "encryption_certificate_id",
+                "encryption_public_certificate",
+                "encryption_private_key",
+                "listen_host",
+                "listen_port",
+            )
+            if getattr(self, name) != type(self).model_fields[name].default
+        )
+        if foreign:
+            raise ValueError(
+                f"{', '.join(foreign)} must not be set on a bridge on the "
+                "distributed Teams app; its credentials, keys and listener are "
+                "the deployment's, not this connection's."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _encryption_material_is_all_or_nothing(self) -> TeamsConnectionConfig:
+        """A half-supplied encryption trio is a mistake, not a partial request.
+
+        Completing it for them would pair someone's certificate with a private
+        key they do not hold, and the only symptom would be channel capture that
+        never decrypts.
+        """
+        supplied = [
+            self.encryption_certificate_id,
+            self.encryption_public_certificate,
+            self.encryption_private_key,
+        ]
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "encryption_certificate_id, encryption_public_certificate and "
+                "encryption_private_key must be supplied together, or all left "
+                "unset to have them generated"
+            )
+        return self
+
+
+class TeamsAdapter(PlatformAdapter):
+    """Microsoft Teams collaboration adapter.
+
+    Single-bot identity model (like Slack): one Azure bot app backs every Switch
+    agent, and per-agent presentation is done with Adaptive Card sender labels
+    rather than a bot account per agent. Outbound messages are delivered through
+    the Bot Framework connector; inbound activities arrive at a self-hosted
+    aiohttp listener. Full (non-@mention) channel-message capture goes through
+    Microsoft Graph change-notification subscriptions.
+    """
+
+    display_name: ClassVar[str] = "Microsoft Teams"
+    # Switch is not granted Channel.Delete.All, so a deleted room's channel
+    # stays for someone to remove in Teams.
+    channel_on_delete = "kept"
+    docs_slug: ClassVar[str | None] = "microsoft-teams"
+    # Graph delivers a channel's messages to every subscription made for it,
+    # so only the process holding the bridge makes, adopts and renews them.
+    # A quiet copy still receives activities and notifications, which reach
+    # whichever process the load balancer picks, and relays to the holder
+    # what would change its subscriptions (`receive_relayed`).
+    keeps_quiet_unless_listening: ClassVar[bool] = True
+
+    # Teams keeps only http(s) anchors: a link on any other scheme is stripped
+    # whole, label and all, so a `switchdash://` deeplink left the literal
+    # brackets around it and rendered as "()". It needs the https redirect,
+    # which means `GATEWAY_PUBLIC_URL` must be set — and declaring this is what
+    # makes the lifecycle say so at startup when it is not.
+    renders_custom_url_schemes: ClassVar[bool] = False
+
+    draws_session_activity: ClassVar[bool] = True
+
+    # A problem gets its own message. An edit to the status is not something
+    # Teams notifies anyone about, so a failure folded into it reaches whoever
+    # happens to be looking.
+    separate_attention_slot: ClassVar[bool] = True
+
+    # Teams notifies on a mention and on little else: a reply inside a post
+    # reaches the people already following that post and nobody else.
+    notifies_only_by_mention: ClassVar[bool] = True
+
+    # No redraw for the clock alone. An edit is charged against the same
+    # per-thread send budget as a message, and a turn's status is the turn's
+    # one post here, so the elapsed time rides along with the next real change.
+    redraws_for_elapsed_time: ClassVar[bool] = False
+
+    # The Bot Connector gives a bot no way to add a reaction to a message.
+    supports_activity_reactions: ClassVar[bool] = False
+    activity_reactions_per_agent: ClassVar[bool] = False
+
+    # Nothing here can look for a publication whose response was lost. The
+    # Graph credentials are app-only and the app's resource-specific consent
+    # covers reading channel messages, not chats; `GraphClient` has no
+    # message-listing call and the bridge has no paging anywhere; and a
+    # publication carries no marker a search could match even if it did. An
+    # uncertain card is disclosed rather than looked for.
+    recovers_uncertain_posts: ClassVar[bool] = False
+    carries_publication_marker: ClassVar[bool] = False
+
+    #: A bot deletes its own activities through the Bot Connector, which is how
+    #: every card was posted. What a posts-layout channel leaves behind is
+    #: *"This message has been deleted."*; a chat and a threads-layout channel
+    #: take the card away entirely. See `remove_publication`.
+    removes_answered_cards: ClassVar[bool] = True
+
+    @classmethod
+    async def prepare_config(
+        cls, connection_config: dict[str, object]
+    ) -> dict[str, object]:
+        """Mint the clientState secret and the Graph encryption trio.
+
+        Here rather than as model defaults because this runs only at
+        registration, so what it produces is persisted once and never re-derived.
+        A default on the model would mint fresh values every time a stored config
+        was validated — a new certificate and a new shared secret on every
+        restart, while Graph carried on encrypting to the old certificate and
+        echoing the old secret. Capture would fail its origin check and its
+        decryption, with nothing in the logs pointing at why.
+
+        A bridge on the distributed app gets neither: both are the deployment's.
+        """
+        if connection_config.get("event_delivery") == "shared":
+            return connection_config
+        prepared = dict(connection_config)
+        if not prepared.get("client_state"):
+            prepared["client_state"] = secrets.token_urlsafe(32)
+        keys = (
+            "encryption_certificate_id",
+            "encryption_public_certificate",
+            "encryption_private_key",
+        )
+        if any(prepared.get(k) for k in keys):
+            return prepared
+        # RSA keygen is CPU-bound and switch-core runs every live client on
+        # this loop, so it does not run on it.
+        cert_pem, key_pem = await asyncio.to_thread(generate_encryption_keypair)
+        prepared["encryption_certificate_id"] = f"switch-teams-{secrets.token_hex(8)}"
+        prepared["encryption_public_certificate"] = cert_pem
+        prepared["encryption_private_key"] = key_pem
+        return prepared
+
+    @classmethod
+    def exclusive_resource(cls, connection_config: dict[str, object]) -> str | None:
+        """The inbound listener's TCP port, which one process can hold once.
+
+        Teams is push-based, so each bring-your-own bridge runs an HTTP server;
+        two on the same port means the second never binds. Declaring it here
+        turns that into a refusal at registration naming the port, rather than
+        a bind error in a background task that leaves the bridge silently
+        dropped. A bridge on the distributed app listens on nothing of its own,
+        so any number of them coexist.
+        """
+        config = TeamsConnectionConfig.model_validate(connection_config)
+        if config.event_delivery == "shared":
+            return None
+        return f"tcp/{config.listen_port}"
+
+    @classmethod
+    def editable_config_keys(
+        cls, connection_config: Mapping[str, object]
+    ) -> frozenset[str] | None:
+        """Only the default team is anyone's to edit on a shared bridge.
+
+        Everything else in it either names the organisation — which decides
+        whose Graph data the deployment's credential reads — or was learned
+        from Microsoft and decides where the deployment's Bot Connector token
+        is sent. Either, edited, would point one customer's connection at
+        another's organisation or at somebody else's server.
+        """
+        if connection_config.get("event_delivery") == "shared":
+            return frozenset({"team_id"})
+        return None
+
+    @classmethod
+    async def verify_credentials(cls, connection_config: dict[str, object]) -> None:
+        """Ask Azure AD for both tokens the bridge will need.
+
+        This is the call that fails on a wrong client secret, and Microsoft's
+        error names the mistake precisely — including the classic case of the
+        secret's ID being pasted instead of its value. Getting that to the
+        operator at save time is the whole point.
+
+        A bridge on the distributed app has no credentials of its own to try;
+        whether its organisation approved the app is proved when it installs.
+        """
+        config = TeamsConnectionConfig.model_validate(connection_config)
+        if config.event_delivery == "shared":
+            return
+        assert config.app_id is not None and config.app_password is not None
+        async with httpx.AsyncClient(timeout=30) as http:
+            tokens = TeamsTokenProvider(
+                tenant_id=config.tenant_id,
+                app_id=config.app_id,
+                credential=ClientSecret(config.app_password),
+                http=http,
+            )
+            try:
+                await tokens.graph_token()
+                await tokens.bot_token()
+            except RuntimeError as exc:
+                raise BridgeCredentialError(_aad_failure_message(exc)) from exc
+            except httpx.HTTPError as exc:
+                raise BridgeCredentialError(
+                    f"Could not reach Microsoft to verify these credentials: {exc}"
+                ) from exc
+
+    def __init__(self, *, config: TeamsConnectionConfig) -> None:
+        super().__init__()
+        self._config = config
+
+        # Who this bridge speaks as. A bring-your-own bridge's is in its own
+        # config; a shared bridge's arrives from the deployment's app before it
+        # starts (`attach_shared_app`), and start refuses without it.
+        self._shared_app: TeamsSharedApp | None = None
+        self._identity: TeamsIdentity | None = (
+            None if config.event_delivery == "shared" else self._own_identity(config)
+        )
+
+        self._http: httpx.AsyncClient | None = None
+        # A shared bridge borrows the deployment app's client and must not
+        # close it when it stops.
+        self._owns_http = False
+        self._tokens: TeamsTokens | None = None
+        self._connector: BotConnectorClient | None = None
+        self._graph: GraphClient | None = None
+        self._authenticator: BotFrameworkAuthenticator | None = None
+        self._runner: web.AppRunner | None = None
+
+        # What an admin has to act on for this bridge to keep working, as last
+        # found: the organisation's approval narrowed or withdrawn. None while
+        # nothing is known to be wrong. See `attention`.
+        self._approval_problem: str | None = None
+        # When Teams last answered that an admin blocked the app (monotonic).
+        self._bot_disabled_at: float | None = None
+
+        # Per-tenant Bot Connector endpoint, captured from inbound activities and
+        # seeded from persisted config so outbound works right after a restart,
+        # before the bot next receives a Bot Framework activity.
+        self._service_url: dict[str, str] = {}
+        self._default_service_url: str | None = config.service_url
+        # Installed by the bridge to persist a newly-learned serviceUrl so it
+        # survives a restart. No-op until set.
+        self._persist_service_url: Callable[[str], Awaitable[None]] | None = None
+        # channel/chat id -> ChannelType. A channel's privacy comes only from
+        # Graph or from creating it; an activity cannot say whether it is private.
+        self._channel_type: dict[str, ChannelType] = {}
+        # casefolded username -> AAD object id, for rendering real @mentions.
+        self._mention_targets: dict[str, str] = {}
+        # `_mention_targets` compiled into an `@name` matcher; None until built,
+        # and discarded whenever the targets change.
+        self._mention_pattern: re.Pattern[str] | None = None
+        # AAD object id -> the handle we know that person by, so a directory
+        # read happens once per sender rather than once per message.
+        self._sender_handles: dict[str, str] = {}
+        # channel id -> the post the bridge last saw a message in there, so a
+        # reply that names no thread lands under what it is answering.
+        self._last_post: dict[str, str] = {}
+        # channel id -> its display name; "" records that Graph was asked and
+        # could not say, so it is not asked again on every message.
+        self._channel_names: dict[str, str] = {}
+        # channel id -> when a Graph read of it last failed (monotonic), so the
+        # retry is throttled without being abandoned. See `_read_channel`.
+        self._channel_read_failed_at: dict[str, float] = {}
+        # channel id -> "post" | "chat", the conversation layout Graph reports.
+        # "" records that Graph was asked and could not say. See
+        # `_uses_post_layout` for what an unknown layout is treated as.
+        self._channel_layouts: dict[str, str] = {}
+        # message id -> (service_url, conversation_id) for later edit/delete.
+        self._sent: dict[str, tuple[str, str]] = {}
+        # conversation id -> the lock ordering this bridge's writes to it.
+        self._conversation_writes: OrderedDict[str, _ConversationWrites] = OrderedDict()
+        # Inbound de-duplication — the Bot Framework and Graph capture paths can
+        # both deliver the same channel message, keyed on the Teams message id.
+        self._seen: OrderedDict[str, None] = OrderedDict()
+        self._seen_max = 2000
+
+        # channel id -> Graph subscription id, for channels we capture.
+        self._subscriptions: dict[str, str] = {}
+        # channel id -> when its subscription runs out, as Graph last said. The
+        # renewal loop works from this rather than a fixed cadence, so a
+        # subscription adopted after a restart with minutes left is renewed in
+        # minutes rather than after a full interval it does not have.
+        self._subscription_expiry: dict[str, datetime] = {}
+        # Channels that should be captured, whether or not they currently are.
+        # Kept apart from `_subscriptions` so a failed attempt is remembered as
+        # work still owed rather than forgotten the moment it fails.
+        self._capture_wanted: set[str] = set()
+        # channel id -> last failure, so the repair loop can retry quietly and
+        # still speak up when the reason changes.
+        self._capture_failures: dict[str, str] = {}
+        # On the distributed app, whether Switch is in each team (team id ->
+        # answer), and the channels not captured because it is not: Graph
+        # delivers a team's messages whether or not the app is in it.
+        # (answer, when it was found, monotonic)
+        self._team_has_switch: dict[str, tuple[bool, float]] = {}
+        # channel id -> the team whose lack of Switch is keeping it uncaptured.
+        self._capture_parked: dict[str, str] = {}
+        # channel id -> the team Graph accepted its subscription through,
+        # which proves the channel is in that team.
+        self._subscription_team: dict[str, str] = {}
+        self._adopt_on_demand_at: float | None = None
+        # channel id -> AAD team id, learned from inbound activities so a
+        # channel-message subscription can be created for it. Seeded from the
+        # persisted config, so a channel outside the configured team keeps its
+        # capture across a restart instead of waiting to be re-taught.
+        self._team_of_channel: dict[str, str] = dict(config.channel_teams)
+        # Installed by the bridge to persist a newly-learned channel/team pair.
+        self._persist_channel_team: Callable[[str, str], Awaitable[None]] | None = None
+        self._sub_lock = asyncio.Lock()
+        # Whether the subscriptions Graph already holds for this bridge have
+        # been read since it started; see `_adopt_existing_subscriptions`.
+        self._adopted = False
+        # Set once the bridge starts letting go of the organisation for good,
+        # after which nothing may make a new subscription there.
+        self._withdrawing = False
+        self._renewal_task: asyncio.Task[None] | None = None
+        self._repair_task: asyncio.Task[None] | None = None
+
+    @staticmethod
+    def _own_identity(config: TeamsConnectionConfig) -> TeamsIdentity:
+        """A bring-your-own bridge's identity, read from its own config.
+
+        Malformed encryption material is logged and treated as absent rather
+        than failing the bridge: everything but channel capture still works
+        without it, and capture says why it is not running for as long as it
+        is not.
+        """
+        assert config.app_id is not None
+        assert config.client_state is not None
+        assert config.public_base_url is not None
+        keyring: NotificationKeyring | None = None
+        if (
+            config.encryption_certificate_id
+            and config.encryption_public_certificate
+            and config.encryption_private_key
+        ):
+            try:
+                keyring = NotificationKeyring(
+                    current=NotificationKey(
+                        certificate_id=config.encryption_certificate_id,
+                        private_key=load_private_key(config.encryption_private_key),
+                    ),
+                    certificate_der_b64=load_certificate_der_b64(
+                        config.encryption_public_certificate
+                    ),
+                    retired=(),
+                )
+            except (ValueError, TypeError, ResourceDataError) as error:
+                logger.error(
+                    "The Teams bridge's Graph encryption material cannot be read "
+                    "(%s); channel capture stays off until it is replaced",
+                    error,
+                )
+        return TeamsIdentity(
+            app_id=config.app_id,
+            org_tenant_id=config.tenant_id,
+            shared=False,
+            notification_url=(
+                f"{config.public_base_url.rstrip('/')}/api/teams/notifications"
+            ),
+            client_state=config.client_state,
+            keyring=keyring,
+            allowed_service_hosts=None,
+            required_graph_roles=frozenset(),
+        )
+
+    @property
+    def serves_shared_app(self) -> bool:
+        return self._config.event_delivery == "shared"
+
+    @property
+    def places_app_in_teams(self) -> bool:
+        return self.serves_shared_app
+
+    @property
+    def default_team_id(self) -> str | None:
+        """The team new channels are created in, if one has been chosen."""
+        return self._config.team_id
+
+    def attach_shared_app(self, app: TeamsSharedApp) -> None:
+        """Be handed the deployment's Teams app, before starting.
+
+        Only a bridge on the distributed app takes one. Its identity is built
+        for the organisation its config names, which the start guard has
+        already checked this tenant holds the install for — so this is the one
+        place the deployment's credential is pointed at an organisation, and it
+        is pointed at that one.
+        """
+        if not self.serves_shared_app:
+            raise ValueError(
+                "a bring-your-own Teams bridge carries its own app and cannot "
+                "be attached to the deployment's"
+            )
+        self._shared_app = app
+        self._identity = app.identity_for(self._config.tenant_id)
+
+    @property
+    def _me(self) -> TeamsIdentity:
+        if self._identity is None:
+            raise RuntimeError(
+                "This Teams bridge belongs to the distributed Teams app, which "
+                "is not configured on this deployment, so it has no app to "
+                "speak as. Set the TEAMS_APP_* settings or remove the connection."
+            )
+        return self._identity
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    async def start(
+        self,
+        on_message: Callable[[InboundMessage], Awaitable[None]],
+        on_command: Callable[[InboundCommand], Awaitable[None]],
+        on_agent_joined: Callable[[InboundAgentJoin], Awaitable[None]],
+        on_user_joined: Callable[[InboundUserJoin], Awaitable[None]],
+        on_app_joined: Callable[[InboundAppJoin], Awaitable[None]],
+    ) -> None:
+        self._on_message = on_message
+        self._on_command = on_command
+        self._on_agent_joined = on_agent_joined
+        self._on_user_joined = on_user_joined
+        self._on_app_joined = on_app_joined
+
+        identity = self._me
+        if self._shared_app is not None:
+            # The deployment's app: its client, our own directory's Bot
+            # Connector tokens, and Graph tokens issued in this organisation.
+            # No listener — this bridge's traffic reaches it through the
+            # deployment's public messaging routes.
+            self._http = self._shared_app.http
+            self._owns_http = False
+            self._tokens = self._shared_app.tokens_for(self._config.tenant_id)
+        else:
+            assert self._config.app_id is not None
+            assert self._config.app_password is not None
+            self._http = httpx.AsyncClient(timeout=30)
+            self._owns_http = True
+            self._tokens = TeamsTokenProvider(
+                tenant_id=self._config.tenant_id,
+                app_id=self._config.app_id,
+                credential=ClientSecret(self._config.app_password),
+                http=self._http,
+            )
+            self._authenticator = BotFrameworkAuthenticator(
+                app_id=self._config.app_id,
+                keys=SigningKeys(metadata_url=BOTFRAMEWORK_OPENID, http=self._http),
+            )
+        self._connector = BotConnectorClient(
+            tokens=self._tokens,
+            http=self._http,
+            allowed_hosts=identity.allowed_service_hosts,
+            on_bot_disabled=self._note_bot_disabled,
+        )
+        self._graph = GraphClient(tokens=self._tokens, http=self._http)
+        if self._shared_app is None:
+            # Only once there is something to answer with: an activity taken
+            # before then is acknowledged and lost, and Teams does not resend.
+            await self._open_listener()
+        # The approval is checked everywhere, so any copy can say it is gone.
+        self._renewal_task = asyncio.create_task(self._renewal_loop())
+        if not self._listening:
+            return
+        async with self._sub_lock:
+            await self._adopt_existing_subscriptions()
+        self._repair_task = asyncio.create_task(self._repair_loop())
+
+    async def _open_listener(self) -> None:
+        """The bring-your-own bridge's own inbound HTTP listener."""
+        app = web.Application()
+        app.router.add_post("/api/messages", self._handle_http_messages)
+        app.router.add_post("/api/teams/notifications", self._handle_http_notifications)
+        app.router.add_get("/api/teams/notifications", self._handle_http_notifications)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(
+            self._runner, self._config.listen_host, self._config.listen_port
+        )
+        await site.start()
+        logger.info(
+            "Teams adapter listening on %s:%d (app %s)",
+            self._config.listen_host,
+            self._config.listen_port,
+            self._config.app_id,
+        )
+
+    async def _adopt_existing_subscriptions(self) -> None:
+        """Re-attach to subscriptions this bridge already owns after a restart,
+        and delete stale ones left by a previous notification URL.
+
+        Graph subscriptions outlive the process, so on start we reclaim any that
+        point at our current notification URL rather than blindly creating
+        duplicates. Subscriptions for our channels that point at a *different*
+        URL (e.g. a rotated tunnel) can never deliver here, so we delete them;
+        ``ensure_channel_subscriptions`` then recreates them against the current
+        URL.
+
+        This is also why one Entra app must never serve two environments: each
+        would read the other's subscriptions as stale and delete them.
+
+        A quiet copy only learns which subscriptions are this bridge's, to
+        check the notifications that reach it, and deletes none: they are the
+        holder's to manage.
+
+        Until this has succeeded once, no subscription is made: one made for a
+        channel whose live subscription could not be seen would be a second,
+        delivering every message twice until the first runs out. A failure here
+        leaves the channels to the repair loop, which tries this again first."""
+        if self._graph is None:
+            return
+        try:
+            existing = await self._graph.list_subscriptions()
+        except Exception as error:
+            logger.warning(
+                "Could not list this Teams bridge's Graph subscriptions (%s); "
+                "capture waits until they can be read, so none is made twice",
+                error,
+            )
+            return
+        notification_url = self._me.notification_url
+        for sub in existing:
+            resource = str(sub.get("resource", ""))
+            channel_id = self._channel_from_resource(resource)
+            if not channel_id:
+                continue
+            if sub.get("notificationUrl") == notification_url:
+                self._subscriptions[channel_id] = str(sub.get("id", ""))
+                team_id = self._team_from_resource(resource)
+                if team_id:
+                    self._subscription_team[channel_id] = team_id
+                self._capture_wanted.add(channel_id)
+                expiry = _parse_graph_time(sub.get("expirationDateTime"))
+                if expiry is not None:
+                    self._subscription_expiry[channel_id] = expiry
+                continue
+            stale_id = str(sub.get("id", ""))
+            if not stale_id or not self._listening:
+                continue
+            try:
+                await self._graph.delete_subscription(subscription_id=stale_id)
+                logger.info(
+                    "Deleted stale Teams subscription %s for channel %s "
+                    "(notification URL changed)",
+                    stale_id,
+                    channel_id,
+                )
+            except Exception:
+                logger.warning("Failed to delete stale Teams subscription %s", stale_id)
+        self._adopted = True
+        if self._subscriptions:
+            logger.info(
+                "Re-attached to %d existing Teams subscriptions",
+                len(self._subscriptions),
+            )
+
+    async def ensure_channel_subscriptions(
+        self, channels: list[tuple[str, str]]
+    ) -> None:
+        """Recreate Graph subscriptions for known channels that lack a live one.
+
+        Called on startup with the bridge's channels so capture self-heals after
+        a restart or notification-URL change: ``_adopt_existing_subscriptions``
+        keeps still-valid subscriptions and clears stale ones, then this creates
+        any that are missing. ``_ensure_channel_subscription`` skips channels
+        already subscribed and logs (does not raise) on failure, so one bad
+        channel does not block the rest."""
+        for channel_id, channel_type in channels:
+            if channel_type in ("channel_public", "channel_private"):
+                await self._ensure_channel_subscription(channel_id)
+
+    async def _renewal_loop(self) -> None:
+        """Keep subscriptions alive and the organisation's approval checked.
+
+        Wakes often and renews only what is close to running out, rather than
+        renewing everything on a long fixed cadence: a renewal that fails is
+        tried again minutes later instead of after a full interval, by which
+        time a 55-minute subscription has already lapsed. Complements the
+        reactive ``reauthorizationRequired`` lifecycle handler, so capture never
+        silently lapses even if a lifecycle notification is missed.
+
+        The first round runs at once, for subscriptions adopted at start that
+        are already close to running out — here rather than in `start`, where
+        renewing many of them one by one, waiting out Graph's throttling,
+        would keep the bridge from connecting."""
+        while True:
+            # Caught here, in the loop, because the loop is what keeps every
+            # subscription alive: an error escaping it would end the task, and
+            # with it renewal, silently and for good.
+            try:
+                await self._check_approval()
+                if self._listening:
+                    await self._renew_due_subscriptions()
+            except Exception:
+                logger.exception(
+                    "Teams subscription renewal failed this round; trying again in %ss",
+                    _RENEWAL_CHECK_SECONDS,
+                )
+            await asyncio.sleep(_RENEWAL_CHECK_SECONDS)
+
+    async def _renew_due_subscriptions(self) -> None:
+        if self._graph is None:
+            return
+        due_by = datetime.now(UTC) + _RENEW_WHEN_WITHIN
+        for channel_id, subscription_id in list(self._subscriptions.items()):
+            expiry = self._subscription_expiry.get(channel_id)
+            if expiry is not None and expiry > due_by:
+                continue
+            await self._renew_subscription(channel_id, subscription_id)
+
+    async def _renew_subscription(
+        self, channel_id: str | None, subscription_id: str
+    ) -> None:
+        """Renew one subscription, recording when it now runs out.
+
+        `channel_id` is None for a subscription this bridge is not tracking —
+        one Graph asked to have renewed that was not adopted at start. Renewed
+        all the same, since the request passed its origin check; there is just
+        no channel to hand back to the repair loop if it has gone.
+        """
+        if self._graph is None:
+            return
+        requested = self._expiration_iso()
+        try:
+            await self._graph.renew_subscription(
+                subscription_id=subscription_id, expiration_iso=requested
+            )
+        except GraphError as error:
+            if error.status == 404 and channel_id is not None:
+                # The subscription is gone — expired, or removed on Graph's
+                # side. Renewing it again can never work; dropping it hands the
+                # channel to the repair loop, which makes a new one.
+                logger.warning(
+                    "Teams subscription %s for channel %s no longer exists; "
+                    "making a new one",
+                    subscription_id,
+                    channel_id,
+                )
+                self._forget_subscription(channel_id)
+                self._capture_wanted.add(channel_id)
+                return
+            logger.exception(
+                "Failed to renew subscription %s for channel %s; retrying shortly",
+                subscription_id,
+                channel_id,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "Failed to renew subscription %s for channel %s; retrying shortly",
+                subscription_id,
+                channel_id,
+            )
+            return
+        logger.info("Renewed Teams subscription %s", subscription_id)
+        parsed = _parse_graph_time(requested)
+        if parsed is not None and channel_id is not None:
+            self._subscription_expiry[channel_id] = parsed
+
+    def _forget_subscription(self, channel_id: str) -> None:
+        self._subscriptions.pop(channel_id, None)
+        self._subscription_expiry.pop(channel_id, None)
+        self._subscription_team.pop(channel_id, None)
+
+    async def _check_approval(self) -> None:
+        """Find out whether the organisation's approval of the app still stands.
+
+        Only a bridge on the distributed app has an approval to lose, and
+        Microsoft sends no word when it goes. A withdrawn approval shows up as
+        a directory that no longer issues tokens to the app; a narrowed one as
+        a token missing some of the permissions it was granted. Either becomes
+        something the workspace is told (`attention`), and neither ends the
+        install: a blip in Microsoft's directory must not disconnect a customer
+        and free their organisation for anyone else to claim.
+
+        Rides the renewal loop, which mints this organisation's token anyway,
+        so it costs no extra work.
+        """
+        identity = self._me
+        if not identity.required_graph_roles or self._tokens is None:
+            return
+        try:
+            granted = await self._tokens.graph_roles()
+        except TokenRequestRefused as error:
+            if error.app_not_approved:
+                self._approval_problem = (
+                    "Microsoft says Switch is no longer approved in this "
+                    "organisation. A Microsoft admin there needs to approve it "
+                    "again before Switch can read or post in Teams."
+                )
+                logger.error(
+                    "Teams organisation %s no longer approves the app: %s",
+                    identity.org_tenant_id,
+                    error,
+                )
+            else:
+                logger.warning(
+                    "Could not check the Teams app's approval in organisation %s: %s",
+                    identity.org_tenant_id,
+                    error,
+                )
+            return
+        except (httpx.HTTPError, OSError) as error:
+            # OSError: the federated credential's token file, unreadable for a
+            # moment while the kubelet rotates it.
+            logger.warning(
+                "Could not reach Microsoft to check the Teams app's approval in "
+                "organisation %s: %s",
+                identity.org_tenant_id,
+                error,
+            )
+            return
+        missing = sorted(identity.required_graph_roles - granted)
+        if missing:
+            self._approval_problem = (
+                "Switch's approval in this organisation no longer includes "
+                f"{', '.join(missing)}. A Microsoft admin there needs to approve "
+                "Switch again for it to work fully."
+            )
+            logger.error(
+                "Teams organisation %s withdrew permissions from the app: %s",
+                identity.org_tenant_id,
+                ", ".join(missing),
+            )
+            return
+        if self._approval_problem is not None:
+            logger.info(
+                "Teams organisation %s approves the app again", identity.org_tenant_id
+            )
+        self._approval_problem = None
+
+    def _note_bot_disabled(self) -> None:
+        self._bot_disabled_at = time.monotonic()
+        logger.error(
+            "Teams says an admin in organisation %s has blocked the app",
+            self._me.org_tenant_id,
+        )
+
+    async def attention(self) -> str | None:
+        notes: list[str] = []
+        if self._approval_problem is not None:
+            notes.append(self._approval_problem)
+        if (
+            self._bot_disabled_at is not None
+            and time.monotonic() - self._bot_disabled_at < _BOT_DISABLED_NOTICE_SECONDS
+        ):
+            notes.append(
+                "A Teams admin in this organisation has blocked the Switch app, "
+                "so Switch cannot post there until they allow it again."
+            )
+        return " ".join(notes) or None
+
+    async def withdraw(self) -> None:
+        """Stop listening in the organisation, because the bridge is being removed.
+
+        Graph keeps delivering a subscription until it runs out, and a removed
+        bridge would leave every channel's still running. From the start of
+        this nothing may make a new one — not the repair loop, and not a
+        `subscriptionRemoved` notification arriving while the bridge is still
+        routable — so none is made between these being deleted and the bridge
+        being stopped. Subscriptions are
+        found by asking Graph rather than from memory, so one this process
+        failed to adopt goes too.
+
+        On the distributed app the bridge also takes the app out of every team
+        it is in, since nothing else will: the customer asked to disconnect,
+        and the bot would otherwise stay in their channels unable to answer.
+        A bring-your-own bridge leaves its operator's app where they put it.
+        """
+        self._withdrawing = True
+        await self._cancel(self._renewal_task)
+        self._renewal_task = None
+        await self._cancel(self._repair_task)
+        self._repair_task = None
+        if self._graph is None:
+            return
+        identity = self._me
+        # Taken so a subscription being made as this starts is finished, and
+        # found and deleted below, rather than made just after.
+        async with self._sub_lock:
+            pass
+        left_behind = await delete_own_subscriptions(
+            self._graph, identity=identity, known=self._subscriptions.values()
+        )
+        self._subscriptions.clear()
+        self._subscription_expiry.clear()
+        self._capture_wanted.clear()
+
+        if identity.shared:
+            left_behind += await leave_every_team(self._graph, app_id=identity.app_id)
+
+        if self._shared_app is not None:
+            self._shared_app.forget_org(identity.org_tenant_id)
+
+        if left_behind:
+            raise BridgeOperationError(
+                "Removing the Teams connection left behind: "
+                + "; ".join(left_behind)
+                + ". Subscriptions run out on their own within the hour."
+            )
+
+    @staticmethod
+    async def _cancel(task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def stop(self) -> None:
+        await self._cancel(self._renewal_task)
+        self._renewal_task = None
+        await self._cancel(self._repair_task)
+        self._repair_task = None
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+        if self._http is not None and self._owns_http:
+            await self._http.aclose()
+        self._http = None
+        logger.info("Teams adapter stopped")
+
+    # ── Outbound helpers ─────────────────────────────────────────────────────
+
+    def _service_url_for(self, channel_id: str) -> str:
+        url = self._service_url.get(channel_id) or self._default_service_url
+        if not url and self._me.shared:
+            # Microsoft's documented global endpoint for a proactive message
+            # sent before any activity has named a regional one — which on the
+            # distributed app is a channel created from Switch straight after
+            # an organisation approved it.
+            url = _GLOBAL_SERVICE_URL
+        if not url:
+            raise RuntimeError(
+                f"no Bot Connector serviceUrl known for channel {channel_id} — "
+                "the bot has not yet received an activity from this tenant"
+            )
+        return url
+
+    def set_service_url_persister(
+        self, persist: Callable[[str], Awaitable[None]]
+    ) -> None:
+        self._persist_service_url = persist
+
+    async def _learn_service_url(self, service_url: str) -> None:
+        """Record a serviceUrl observed on an inbound activity, persisting it
+        when it is new or changed so outbound survives the next restart."""
+        if service_url == self._default_service_url:
+            return
+        self._default_service_url = service_url
+        if self._persist_service_url is None:
+            return
+        try:
+            await self._persist_service_url(service_url)
+        except Exception:
+            logger.warning("Failed to persist Teams serviceUrl", exc_info=True)
+
+    def set_channel_team_persister(
+        self, persist: Callable[[str, str], Awaitable[None]]
+    ) -> None:
+        self._persist_channel_team = persist
+
+    async def _learn_channel_team(self, channel_id: str, team_id: str) -> None:
+        """Record which team a channel belongs to, and persist it.
+
+        A Graph message subscription is created against
+        ``teams/{team}/channels/{channel}/messages``, so the team is not
+        optional — and the only place it arrives is the ``channelData`` of an
+        inbound activity. Held in memory alone it is lost on every restart,
+        and a channel in any team other than the configured one then falls
+        back to that one, where Graph answers "Channel is not present in the
+        team" and capture never starts.
+
+        That failure cannot heal on its own: refilling the map needs an
+        activity from the channel, and without capture Teams delivers only
+        messages that mention the bot — so tagging an *agent*, which is the
+        normal way to use the room, never arrives. Silence, until someone
+        happens to tag the bot itself.
+        """
+        if self._team_of_channel.get(channel_id) == team_id:
+            return
+        # Anything already read for this channel was read against a different
+        # team and is not to be trusted — most often it was not read at all,
+        # because the wrong team is exactly what Graph refuses. Without this the
+        # subscription heals on the new team while the name and layout stay
+        # stuck at whatever the failed read left behind. Privacy is kept: it
+        # belongs to the channel, whichever team it was read through.
+        self._team_of_channel[channel_id] = team_id
+        self._channel_names.pop(channel_id, None)
+        self._channel_layouts.pop(channel_id, None)
+        self._channel_read_failed_at.pop(channel_id, None)
+        if self._persist_channel_team is None:
+            return
+        try:
+            await self._persist_channel_team(channel_id, team_id)
+        except Exception:
+            logger.warning(
+                "Failed to persist the team of Teams channel %s; capture there "
+                "will need the bot mentioned again after the next restart",
+                channel_id,
+                exc_info=True,
+            )
+
+    def _is_channel(self, channel_id: str) -> bool:
+        """Whether ``channel_id`` is a Teams channel (threaded) vs a flat chat.
+
+        Learned type wins; otherwise fall back to the id shape (channels use
+        ``@thread.tacv2``). Switch-created channels default to channel."""
+        known = self._channel_type.get(channel_id)
+        if known is not None:
+            return known in ("channel_public", "channel_private")
+        return "@thread.tacv2" in channel_id or channel_id not in self._channel_type
+
+    @staticmethod
+    def _thread_conversation(channel_id: str, root_id: str) -> str:
+        return f"{channel_id};messageid={root_id}"
+
+    @staticmethod
+    def _root_of(conversation_id: str) -> str | None:
+        """The post a conversation is, where it is one — the inverse of above.
+
+        None for a chat, which is its own conversation, and for a conversation
+        Teams named itself rather than by the post it opened.
+        """
+        _, sep, root = conversation_id.partition(";messageid=")
+        return root if sep and root else None
+
+    def _reply_conversation(
+        self, channel_id: str, thread_root_id: str | None
+    ) -> str | None:
+        """Where a reply goes, or None to say a channel post must be opened.
+
+        The thread root may arrive as a publication reference rather than a
+        bare message id — `admin_message`'s callers name the conversation a
+        card is in, and a card that opened its own post *is* that conversation.
+        Where it does, the address it carries is used as given: it is the one
+        Teams confirmed, and reconstructing it from a channel id would throw
+        away the part that survives a restart.
+        """
+        if thread_root_id is not None:
+            carried = _read_publication_ref(thread_root_id)
+            if carried is not None:
+                return carried[1]
+        if not self._is_channel(channel_id):
+            return channel_id
+        if thread_root_id is None:
+            return None
+        return self._thread_conversation(channel_id, thread_root_id)
+
+    @asynccontextmanager
+    async def _writes_to(self, conversation_id: str) -> AsyncIterator[None]:
+        """Order this bridge's own writes to one conversation.
+
+        Teams answers an edit to an activity it is still processing with 412,
+        and two publishers redrawing in one conversation generate those against
+        each other for as long as both keep retrying. A lock per conversation
+        turns the race into a queue; it says nothing about writers in another
+        process, which is what the 412 handling is still for.
+
+        Bounded, and the registry counts its own users rather than asking the
+        lock whether it is held. `asyncio.Lock.locked()` is False for the whole
+        window between a release and the woken waiter resuming, so a lock with
+        someone queued behind it looks idle; dropping it there would hand the
+        next writer a brand-new lock and run the two side by side — which is
+        the ordering this exists to provide, quietly withdrawn under load.
+        An entry with a user is never evicted, so everyone who asks for one
+        conversation holds the same lock.
+        """
+        entry = self._conversation_writes.get(conversation_id)
+        if entry is None:
+            entry = _ConversationWrites(asyncio.Lock(), 0)
+            self._conversation_writes[conversation_id] = entry
+        self._conversation_writes.move_to_end(conversation_id)
+        entry.users += 1
+        while len(self._conversation_writes) > _MAX_CONVERSATION_LOCKS:
+            unused = next(
+                (
+                    key
+                    for key, waiting in self._conversation_writes.items()
+                    if not waiting.users
+                ),
+                None,
+            )
+            if unused is None:
+                break
+            del self._conversation_writes[unused]
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+
+    async def _channel_layout(self, channel_id: str) -> str | None:
+        """The channel's conversation layout as Graph reports it, or None.
+
+        Graph is the only thing that knows: a Bot Framework activity says
+        nothing about layout, and listing a team's channels returns the
+        property as null for every one of them. So it is a per-channel read,
+        cached — and the same read the channel's name comes from, so learning
+        both costs one call.
+        """
+        cached = self._channel_layouts.get(channel_id)
+        if cached is not None:
+            return cached or None
+        if self._read_recently_failed(channel_id):
+            return None
+        await self._read_channel(channel_id)
+        return self._channel_layouts.get(channel_id) or None
+
+    async def _uses_post_layout(
+        self, channel_id: str, *, is_channel: bool | None = None
+    ) -> bool:
+        """Whether replies in this channel have to be steered into a post.
+
+        Teams has two channel layouts and they want opposite things.
+
+        A **posts** channel is a list of conversations: a message at the root
+        opens a new one. An agent answering a question there must land under
+        the question, or the answer appears as a fresh post below and reads as
+        a non-sequitur.
+
+        A **chat** channel is a stream, like every other platform Switch
+        bridges. "No thread" means the root, and steering is exactly wrong: it
+        buries an agent's first message, the room-linked notice and the runtime
+        status inside whatever thread the channel last used. So a chat channel
+        gets the ordinary policy — the agent decides whether to thread, and
+        nothing is rewritten on the way out.
+
+        An unreadable layout is treated as posts. That is Graph's own default,
+        and it is what every Teams channel was before the chat layout existed,
+        so it is the answer least likely to surprise. Chats and group chats
+        have no posts to be wrong about and are never steered.
+        """
+        threaded = self._is_channel(channel_id) if is_channel is None else is_channel
+        if not threaded:
+            return False
+        return await self._channel_layout(channel_id) != "chat"
+
+    async def _remember_post(
+        self,
+        channel_id: str,
+        post_id: str,
+        *,
+        is_channel: bool | None = None,
+        only_if_unset: bool = False,
+    ) -> None:
+        """Note the post a posts-channel conversation is currently in.
+
+        Inbound, unconditionally: the message someone just sent is what an
+        untied reply should answer under.
+
+        Outbound, only when nothing is recorded yet (`only_if_unset`). The
+        first thing an agent says in a channel has no question to answer — it
+        opens a post — and what it says next belongs in that post rather than
+        in a fresh one each time, or an agent greeting itself into a channel
+        produces a column of one-line posts. But an agent's own message must
+        never *displace* a real one: an agent deliberately replying into an
+        older thread would otherwise drag every later answer back into it.
+        """
+        if not post_id:
+            return
+        if only_if_unset and channel_id in self._last_post:
+            return
+        if await self._uses_post_layout(channel_id, is_channel=is_channel):
+            self._last_post[channel_id] = post_id
+
+    async def _post_to_answer_in(
+        self, channel_id: str, thread_root_id: str | None
+    ) -> str | None:
+        """Which post a channel reply belongs under, in a posts channel.
+
+        A caller that named a thread knows better than we do and wins. What
+        this covers is the caller that named none, which is any agent whose
+        reply was not itself threaded in the room: answer in the post the bridge
+        last saw this channel speak in, rather than opening a new one.
+
+        The limitation, stated because it is real: "last" is per channel, so
+        two conversations running in the same posts channel at the same moment
+        can cross. Teams gives no better signal on an untied reply, and landing
+        in the wrong post beats starting a fresh one every time.
+
+        Chat-layout channels are left entirely alone — see `_uses_post_layout`.
+        """
+        if thread_root_id is not None:
+            return thread_root_id
+        if not await self._uses_post_layout(channel_id):
+            return None
+        return self._last_post.get(channel_id)
+
+    async def _message_activity(
+        self, sender_name: str, body: str, below: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        agent = await self.agent_rendering(sender_name)
+        mentions = self._mention_entities(body)
+        return {
+            "type": "message",
+            # Notification/preview text; without it Teams renders a
+            # "cards.unsupported" placeholder in toasts, mobile, and link previews.
+            # Plain text, rendered by no markup engine, so the label goes in raw.
+            "summary": f"{agent.field_label}: {body}",
+            "attachments": [
+                card_attachment(agent_message_card(agent, body, mentions, below))
+            ],
+        }
+
+    # ── Messaging ────────────────────────────────────────────────────────────
+
+    async def send_message(
+        self,
+        channel_id: str,
+        sender_name: str,
+        content: str,
+        thread_root_id: str | None = None,
+        *,
+        room_wide_mention: bool = False,
+    ) -> str | None:
+        if self._connector is None:
+            raise RuntimeError("Cannot send message: Teams adapter not started")
+
+        # `content` arrives rendered: every caller of `send_message` runs
+        # `translate_outbound` first, and rendering again here put the body
+        # through the conversion twice.
+        activity = await self._message_activity(sender_name, content, [])
+        thread_root_id = await self._post_to_answer_in(channel_id, thread_root_id)
+        return await self._relay(self._connector, channel_id, thread_root_id, activity)
+
+    async def _relay(
+        self,
+        connector: BotConnectorClient,
+        channel_id: str,
+        thread_root_id: str | None,
+        activity: dict[str, Any],
+    ) -> str:
+        """Send one relayed activity and remember where it went.
+
+        Where the thread root is a publication reference the address it carries
+        is used whole, service URL included: a bridge that has only heard from
+        one region since it started would otherwise send a reply to a card in
+        another region's conversation to the region it happens to know.
+        """
+        carried = _read_publication_ref(thread_root_id) if thread_root_id else None
+        service_url = carried[0] if carried else self._service_url_for(channel_id)
+        conversation_id = self._reply_conversation(channel_id, thread_root_id)
+        if conversation_id is None:
+            conversation_id, msg_id = await connector.create_channel_thread(
+                service_url=service_url,
+                channel_id=channel_id,
+                tenant_id=self._me.org_tenant_id,
+                activity=activity,
+            )
+            # A message that opened its own post is that post.
+            remembered = msg_id
+        else:
+            msg_id = await connector.send_to_conversation(
+                service_url=service_url,
+                conversation_id=conversation_id,
+                activity=activity,
+            )
+            # `_last_post` holds a post id, so a reply contributes the post it
+            # went into rather than itself — read back off the conversation,
+            # which is the one form a publication reference and a bare root
+            # both reduce to.
+            remembered = self._root_of(conversation_id) or thread_root_id or msg_id
+        self._sent[msg_id] = (service_url, conversation_id)
+        await self._remember_post(channel_id, remembered, only_if_unset=True)
+        return msg_id
+
+    async def admin_message(
+        self,
+        channel_id: str,
+        content: str,
+        thread_root_id: str | None = None,
+        *,
+        message_type: str | None = None,
+        drawn: str | None = None,
+    ) -> str | None:
+        # Admin/system messages render as the Switch bot itself — a plain text
+        # activity, no per-agent Adaptive Card — so they read as the platform
+        # speaking rather than an agent.
+        if self._connector is None:
+            raise RuntimeError("Cannot post admin message: Teams adapter not started")
+
+        body = self._admin_body(self.translate_outbound(content), drawn)
+        thread_root_id = await self._post_to_answer_in(channel_id, thread_root_id)
+        activity: dict[str, Any] = {"type": "message", "text": _hard_wrap(body)}
+        mentions = self._mention_entities(body)
+        if mentions:
+            # A plain-text activity carries its mention entities directly; only
+            # a card puts them under `msteams`.
+            activity["entities"] = mentions
+        return await self._relay(self._connector, channel_id, thread_root_id, activity)
+
+    def _locate(self, channel_id: str, message_ref: str) -> tuple[str, str]:
+        """Resolve ``(service_url, conversation_id)`` for a previously sent
+        message so it can be edited or deleted. Falls back to treating the
+        message as its own thread root when it wasn't sent in this session.
+
+        A guess, and only good enough for the relay: a message posted as a
+        reply inside a post is addressed by that post, so after a restart this
+        reconstruction names a conversation that does not exist and the edit
+        is refused. SDK publications do not come through here — they carry the
+        thread they were posted into and resolve it through
+        `_publication_conversation`.
+        """
+        located = self._sent.get(message_ref)
+        if located is not None:
+            return located
+        logger.warning(
+            "No tracked conversation for Teams message %s; reconstructing", message_ref
+        )
+        return (
+            self._service_url_for(channel_id),
+            self._thread_conversation(channel_id, message_ref),
+        )
+
+    async def update_message(
+        self, channel_id: str, message_ref: str, new_content: str
+    ) -> None:
+        """Rewrite a relayed message as plain text.
+
+        Degraded, and said out loud because a reader cannot see it happen: an
+        agent's message was posted as an Adaptive Card carrying its name and
+        avatar, and this replaces the whole activity with unlabelled text, so
+        an edited message stops looking like the agent that sent it. The
+        sender's name is what would fix it and this seam is not given one.
+        """
+        if self._connector is None:
+            raise RuntimeError("Cannot update message: Teams adapter not started")
+        service_url, conversation_id = self._locate(channel_id, message_ref)
+        logger.warning(
+            "Rewriting Teams message %s as plain text: an edit through this seam "
+            "drops the agent card it was posted in.",
+            message_ref,
+        )
+        await self._connector.update_activity(
+            service_url=service_url,
+            conversation_id=conversation_id,
+            activity_id=message_ref,
+            activity={"type": "message", "text": new_content},
+        )
+
+    async def delete_message(self, channel_id: str, message_ref: str) -> None:
+        if self._connector is None:
+            raise RuntimeError("Cannot delete message: Teams adapter not started")
+        service_url, conversation_id = self._locate(channel_id, message_ref)
+        await self._connector.delete_activity(
+            service_url=service_url,
+            conversation_id=conversation_id,
+            activity_id=message_ref,
+        )
+        self._sent.pop(message_ref, None)
+
+    async def send_typing(
+        self, channel_id: str, sender_name: str, is_typing: bool
+    ) -> None:
+        # Teams typing indicators auto-expire and are best-effort cosmetics; a
+        # failure to show one must not break the turn.
+        if not is_typing or self._connector is None:
+            return
+        try:
+            await self._connector.send_signal(
+                service_url=self._service_url_for(channel_id),
+                conversation_id=channel_id,
+                activity={"type": "typing"},
+            )
+        except Exception:
+            logger.warning("Failed to send typing indicator to %s", channel_id)
+
+    # ── SDK session publication ──────────────────────────────────────────────
+
+    def rich_fallback_limit(self) -> int:
+        return _PUBLICATION_LIMIT
+
+    def rich_markup(self) -> Markup:
+        return _TEAMS_MARKUP
+
+    def rich_fallback_text(self, content: RichContent) -> str:
+        """What a publication says, with nothing that had to be looked up.
+
+        The renderers are the ones `post_rich` uses; what is missing is the
+        mention and the responder's name, both of which come from an AAD id
+        that has to be turned back into a handle. This is the string carried on
+        a `RichContentFailed`, where a name this bridge could not resolve would
+        add nothing to a post that did not happen.
+        """
+        return self._draw(
+            content,
+            mention=None,
+            responder=None,
+            notice=self.unnotified_notice() if content.notify_unreachable else None,
+            stopping=False,
+        ).text
+
+    def _draw(
+        self,
+        content: RichContent,
+        *,
+        mention: str | None,
+        responder: str | None,
+        notice: str | None,
+        stopping: bool,
+    ) -> Drawn:
+        """The body of a publication, as a card will render it.
+
+        Line breaks are the card's problem rather than this text's: the body is
+        written with one newline to a line and `cards.body_blocks` turns those
+        into blocks. So the budget here is measured on what a reader actually
+        reads, with no display syntax counted against it.
+
+        The body prints every option in full even where a button carries one.
+        A control here is an `Action.Execute`, which a client too old for it
+        drops — and a card whose options only ever existed on the buttons would
+        drop the question with them. What that costs is a line of repetition on
+        a current client; what it buys is a card that can still be answered by
+        typing on any of them.
+        """
+        escape = self._rich_escape
+        limit = self.rich_fallback_limit()
+        markup = self.rich_markup()
+        if isinstance(content, TurnActivity):
+            # Charged to the same budget as the status it follows: a body that
+            # just fits, plus a line saying it reached nobody, is a body over
+            # the budget. The note under a queued turn's stop control is
+            # charged the same way, and for the same reason.
+            lines = []
+            if stopping and content.turn.status == "queued":
+                lines.append(INTERRUPT_QUEUED_NOTE)
+            if notice:
+                lines.append(notice)
+            tail = "".join(f"\n{line}" for line in lines)
+            text = (
+                turn_status(
+                    content.items,
+                    content.turn,
+                    escape=escape,
+                    limit=max(1, limit - len(tail)),
+                    markup=markup,
+                    elapsed_seconds=content.elapsed_seconds,
+                    mention=mention,
+                    error_summary=content.error_summary,
+                    tool_detail=True,
+                )
+                + tail
+            )
+            return Drawn(text=text, answerable=False)
+        # The mention goes on a line of its own rather than in front of the
+        # heading: the card is a block, and a name wedged before "Permission
+        # needed" reads as part of it.
+        lead = f"{mention}\n" if mention else ""
+        tail = f"\n{notice}" if notice else ""
+        drawn = render_request(
+            content.request,
+            content.reference,
+            escape=escape,
+            limit=max(1, limit - len(lead) - len(tail)),
+            markup=markup,
+            responder=responder,
+            unavailable_reason=content.unavailable_reason,
+            control_label_limit=None,
+        )
+        return replace(drawn, text=f"{lead}{drawn.text}{tail}")
+
+    def _mention(self, external_id: str | None) -> str | None:
+        """`<at>` markup naming whoever holds this AAD id, or None.
+
+        Both halves of a Teams mention or neither: the markup only reaches
+        anybody when `_mention_entities` can pair it with a target, so a
+        person this bridge holds no name for is written as no mention at all
+        rather than as a highlight that goes nowhere. The caller's
+        `notify_unreachable` is what tells the reader that happened.
+        """
+        if external_id is None:
+            return None
+        name = self._sender_handles.get(external_id) or next(
+            (
+                handle
+                for handle, target in self._mention_targets.items()
+                if target == external_id
+            ),
+            None,
+        )
+        if name is None or name.casefold() not in self._mention_targets:
+            return None
+        return f"<at>{html.escape(name)}</at>"
+
+    def _unmentionable_notice(self) -> str:
+        """Why a publication that had someone to name did not name them.
+
+        Not `unnotified_notice`, which says nobody is linked: here somebody is,
+        and what failed was turning their directory id into a name this team
+        can be `@`-mentioned by. Telling them to link an account they have
+        already linked would send the one person who could act to fix something
+        that is not broken.
+        """
+        return (
+            "Switch could not work out how to mention the person this is for, "
+            "so this notified no one. They are linked; finding their name in "
+            f"this {self.platform_name} team is what failed."
+        )
+
+    def _below(
+        self, content: RichContent, drawn: Drawn, stopping: str | None
+    ) -> list[dict[str, Any]]:
+        """What the card carries under its body.
+
+        Never a card's options and a turn's log together: a request card is
+        asking the reader for an answer, and a log folded under the options
+        competes for the press that the card exists to collect. A publication
+        is one or the other anyway — only a `TurnActivity` has a log, and only
+        a `RequestCard` has options.
+
+        A status's two are exclusive as well, and by the turn's own state
+        rather than by anything decided here: the log is folded under an
+        *ended* turn, and there is nothing to stop once a turn has ended. So a
+        status carries one button while it runs and a different one afterwards,
+        and never two at once.
+        """
+        if isinstance(content, TurnActivity):
+            below = self._activity_detail(content)
+            if stopping is not None:
+                below.extend(interrupt_action(stopping))
+            return below
+        return self._controls(content, drawn)
+
+    def _interrupt_turn(self, content: RichContent) -> str | None:
+        """The turn a stop control on this card would end, or None for none.
+
+        Three things have to be true. There has to be something to stop, which
+        the publication decides and puts in the content — one value for the
+        whole session, so a queued turn's card offers to stop the running turn
+        in front of it. The turn this card is about has to be unfinished,
+        because a status kept as the record of a turn that ended is not a place
+        to offer stopping anything. And a press has to have somewhere to land:
+        every press here arrives as an invoke that must be answered, and one
+        answered with nothing to route it to is a button that spins and then
+        reports a failure of its own.
+
+        Nothing measures the id. Teams states no limit on what an action's data
+        carries, and the connector already weighs the whole serialised activity
+        before it is sent — so an id long enough to matter is refused as a card
+        that is too big, with the reason named, rather than as a button whose
+        press the platform would silently decline.
+        """
+        if not isinstance(content, TurnActivity) or self._on_interaction is None:
+            return None
+        if content.interrupt_turn_id is None or content.turn.status in TURN_ENDED:
+            return None
+        return content.interrupt_turn_id
+
+    def _activity_detail(self, content: TurnActivity) -> list[dict[str, Any]]:
+        """An ended turn's work and its own words, folded away under its status.
+
+        Offered on an ended turn only, and that restriction is the design
+        rather than a simplification. Every change to a running turn rewrites
+        the card, and a rewritten card arrives folded shut: a reader who opened
+        the log while the agent worked would have it closed in their face by
+        the next tool call. An ended turn has no further changes to redraw for,
+        so what a reader opens stays open.
+
+        A turn that neither called anything nor said anything is offered
+        nothing. The fold is a promise that there is something behind it, and
+        "No activity." under a status line that already says the same is not
+        something anyone pressed for.
+
+        The log does not repeat the state line: it would sit directly under the
+        copy of itself the card already shows.
+        """
+        if content.turn.status not in TURN_ENDED:
+            return []
+        if not any(in_activity_log(item) for item in content.items):
+            return []
+        return activity_detail(
+            activity_log(
+                content.items,
+                content.turn,
+                escape=self._rich_escape,
+                limit=_DETAIL_LIMIT,
+                markup=self.rich_markup(),
+                elapsed_seconds=content.elapsed_seconds,
+                heading=False,
+            )
+        )
+
+    def _controls(self, content: RichContent, drawn: Drawn) -> list[dict[str, Any]]:
+        """The card's options as buttons, or nothing where a press cannot land.
+
+        Nothing at all is the ordinary answer: a status has no options, a
+        settled card has none left, and a card that cannot be answered where it
+        is showing says so — a live control under that sentence invites the
+        refusal the sentence just explained. Because every redraw rebuilds the
+        card, the buttons come off at the moment a card stops being pressable
+        without anything having to remember that it once had them.
+
+        Whether the drawing earned them comes from `drawn` rather than from
+        reading the request again. A body cut short of the difference between
+        two options is one the reader cannot decide from, and only the renderer
+        that cut it knows. A press would still resolve and settle the request,
+        so the whole of the protection is not offering the button.
+
+        A card with no interaction handler gets no buttons either. Every press
+        on this platform arrives as an invoke that has to be answered, and one
+        answered with nothing to route it to is a control that spins and then
+        reports a failure of its own.
+        """
+        if not isinstance(content, RequestCard) or not drawn.answerable:
+            return []
+        if self._on_interaction is None:
+            return []
+        controls = offered_controls(content.request)
+        if not controls:
+            return []
+        return answer_actions(content.reference.token, controls)
+
+    def _render_rich(self, content: RichContent) -> tuple[Drawn, str | None]:
+        """Draw a publication, saying so when the mention could not be made.
+
+        Two different failures reach the same reader. The publisher sets
+        `notify_unreachable` when there was nobody to name at all; this covers
+        the other one, where there was and the name could not be resolved here.
+        Either way the person who can answer has not been pinged, and the one
+        thing that must not happen is a card that looks like it went to them.
+
+        The turn to stop comes back with the drawing rather than being worked
+        out again beside it, so the decision to offer a stop is made once: the
+        note that explains the control and the control itself cannot then
+        disagree about whether there is one.
+        """
+        mention = self._mention(content.notify_external_id)
+        unmentionable = mention is None and content.notify_external_id is not None
+        if unmentionable:
+            logger.warning(
+                "No Teams mention target for %s, so the publication names "
+                "nobody and says so.",
+                content.notify_external_id,
+            )
+        stopping = self._interrupt_turn(content)
+        drawn = self._draw(
+            content,
+            mention=mention,
+            responder=self._mention(content.responder_external_id)
+            if isinstance(content, RequestCard)
+            else None,
+            notice=self._unmentionable_notice()
+            if unmentionable
+            else self.unnotified_notice()
+            if content.notify_unreachable
+            else None,
+            stopping=stopping is not None,
+        )
+        return drawn, stopping
+
+    def notice_address(self, message_ref: str, thread_root_id: str | None) -> str:
+        """The reference wins over the thread, where the publication has one.
+
+        Both name the same conversation, but the reference names the one Teams
+        confirmed, service URL included, while the thread is a root this
+        rebuilds into `channel;messageid=root` in whatever region the process
+        last heard from. A notice about a card in another region would go to
+        the region this happens to know.
+        """
+        if _read_publication_ref(message_ref) is not None:
+            return message_ref
+        return thread_root_id or message_ref
+
+    def _publication_conversation(self, channel_id: str, root_id: str | None) -> str:
+        """Where a *new* publication goes, from durable facts only.
+
+        A Teams message is sent to a *conversation*, and in a channel the
+        conversation is named by the post it sits in rather than by the
+        message. So the answer needs the thread — which the caller has written
+        down, in the journal's anchor or in the card's row, and passes in.
+
+        Deliberately neither `_sent`, which a restart empties, nor
+        `_last_post`, which is the relay's guess at where an untied reply
+        belongs and crosses conversations whenever two run in one channel.
+
+        A chat is its own conversation and has no root. So does a channel with
+        no post named — which is where a new post begins, and is why this is
+        not an error: only `post_rich` ever asks with nothing to name, and it
+        asks in order to start one.
+
+        For a redraw, `_publication_address` is the method to want: it reads
+        the address Teams confirmed instead of rebuilding one.
+        """
+        if root_id is not None:
+            carried = _read_publication_ref(root_id)
+            if carried is not None:
+                return carried[1]
+        if not self._is_channel(channel_id) or root_id is None:
+            return channel_id
+        return self._thread_conversation(channel_id, root_id)
+
+    def _publication_address(
+        self, channel_id: str, message_ref: str, thread_root_id: str | None
+    ) -> _Publication:
+        """The address to redraw or remove a publication at.
+
+        The reference `post_rich` handed back carries the whole of it —
+        service URL, conversation and activity — because those are what Teams
+        confirmed rather than what this process can work out, and they are the
+        three that a restart, a regional service URL or a conversation Teams
+        named itself would each break separately.
+
+        A reference from before that, or one the relay wrote, is a bare
+        message id, and then there is nothing to do but rebuild the address
+        from the channel and the stored thread. That is said out loud and
+        marked untrusted, because a 404 against a guess says the guess may be
+        wrong and not that the message is gone.
+        """
+        carried = _read_publication_ref(message_ref)
+        if carried is not None:
+            service_url, conversation_id, activity_id = carried
+            return _Publication(
+                service_url=service_url,
+                conversation_id=conversation_id,
+                activity_id=activity_id,
+                channel_id=channel_id,
+                trusted=True,
+            )
+        logger.warning(
+            "Teams publication %s in channel %s carries no address; rebuilding "
+            "one from the channel and its stored thread, which a chat whose "
+            "type this process has not learned will get wrong.",
+            message_ref,
+            channel_id,
+        )
+        return _Publication(
+            service_url=self._service_url_for(channel_id),
+            conversation_id=self._publication_conversation(
+                channel_id, thread_root_id or message_ref
+            ),
+            activity_id=message_ref,
+            channel_id=channel_id,
+            trusted=False,
+        )
+
+    @staticmethod
+    def _throttled(error: BotConnectorThrottled, text: str) -> RichContentThrottled:
+        return RichContentThrottled(
+            retry_after=_THROTTLE_BACKOFF
+            if error.retry_after is None
+            else error.retry_after,
+            text=text,
+        )
+
+    @staticmethod
+    def _conflicted(error: BotConnectorConflict, text: str) -> RichContentThrottled:
+        """A 412 is a wait, not a refusal.
+
+        The message is there and something else wrote to it first, so the
+        publication is neither lost nor wrong — it is one revision behind. Sent
+        back as a backoff so the caller keeps its anchor and comes round again
+        with content rendered from the state as it is by then, rather than
+        replaying an intent that has already been overtaken. Calling it a
+        failure instead put a "could not be updated" notice in the channel for
+        something that fixes itself in a second.
+        """
+        return RichContentThrottled(retry_after=_CONFLICT_BACKOFF, text=text)
+
+    async def post_rich(
+        self,
+        channel_id: str,
+        agent_name: str,
+        content: RichContent,
+        thread_root_id: str | None = None,
+    ) -> str:
+        """Post a turn's status or a request's card as an agent-labelled card.
+
+        What it raises is the whole point. `RichContentFailed` is the caller's
+        licence to throw its reservation away, so it is kept for the answers
+        Teams actually gave — a refusal, a 4xx, a payload this would not even
+        attempt. A timeout, a 5xx, or an activity Teams accepted without
+        returning an id all mean the publication may be sitting in the channel
+        already, and those propagate as themselves so the reservation survives
+        and nobody posts a second copy.
+
+        `thread_root_id` is used as given. `_post_to_answer_in`, which the
+        relay uses to steer an untied reply into whatever post the channel last
+        spoke in, is not consulted: a publication has a durable address to keep
+        and a guess is not one. Where the root is itself a publication
+        reference, both halves of it are kept — the conversation *and* the
+        service that holds it. Taking the conversation and the region from
+        different places sends a card in one region to another, and writes the
+        wrong region into the reference that comes back, so the next redraw
+        repeats it.
+
+        What comes back is that address rather than a message id — see
+        `_publication_ref`. It is what the caller stores, and the only thing
+        that makes a redraw after a restart address the conversation the post
+        actually went to.
+        """
+        drawn, stopping = self._render_rich(content)
+        text = drawn.text
+        if self._connector is None:
+            raise RichContentFailed(
+                "Teams is not connected, so the publication was not sent.", text=text
+            )
+        carried = _read_publication_ref(thread_root_id) if thread_root_id else None
+        service_url = carried[0] if carried else self._service_url_for(channel_id)
+        activity = await self._message_activity(
+            agent_name, text, self._below(content, drawn, stopping)
+        )
+        opening = self._is_channel(channel_id) and thread_root_id is None
+        # A new post has no conversation to queue behind yet, so its writes are
+        # ordered against the channel instead.
+        target = (
+            channel_id
+            if opening
+            else self._publication_conversation(channel_id, thread_root_id)
+        )
+        try:
+            async with self._writes_to(target):
+                if opening:
+                    conversation_id, ref = await self._connector.create_channel_thread(
+                        service_url=service_url,
+                        channel_id=channel_id,
+                        tenant_id=self._me.org_tenant_id,
+                        activity=activity,
+                    )
+                else:
+                    conversation_id = target
+                    ref = await self._connector.send_to_conversation(
+                        service_url=service_url,
+                        conversation_id=conversation_id,
+                        activity=activity,
+                    )
+        except BotConnectorThrottled as error:
+            raise self._throttled(error, text) from error
+        except BotConnectorConflict as error:
+            raise self._conflicted(error, text) from error
+        except BotConnectorRefused as error:
+            raise RichContentFailed(
+                f"Teams would not post in channel {channel_id}: {error}", text=text
+            ) from error
+        return _publication_ref(service_url, conversation_id, ref)
+
+    async def update_rich(
+        self,
+        channel_id: str,
+        agent_name: str,
+        message_ref: str,
+        content: RichContent,
+        thread_root_id: str | None,
+    ) -> None:
+        """Redraw a publication in place, including the last time.
+
+        A status is never taken down. A turn that has ended is edited to its
+        final state and stays in the conversation as the record that it ran,
+        how long it took and where to open it. A chat-layout channel used to
+        delete it, on the reasoning that a bot's own message goes there without
+        trace and a finished status is clutter; what went with it was the only
+        account of the turn anybody scrolling back could read. A posts channel
+        already kept it, because Teams leaves *"This message has been
+        deleted."* behind and that is worse than the line it replaces.
+
+        An answered request card does come down, through `remove_publication`,
+        tombstone and all: a card offering buttons nobody may press again is
+        worse than a line saying a message was removed.
+
+        Not `update_message`, for two reasons. That one replaces the whole
+        activity with plain text, which would strip the agent's card off a
+        status halfway through the turn; and it addresses the message through
+        `_sent`, which a restart empties. Here the card is rebuilt, and the
+        address is the one `post_rich` returned and the caller wrote down.
+
+        `agent_name` is what the redraw writes back into the header. One bot
+        posts for every agent here, so the name is part of what was drawn, and
+        an edit that did not know it would republish the turn as somebody else.
+        """
+        drawn, stopping = self._render_rich(replace(content, notify_external_id=None))
+        text = drawn.text
+        connector = self._connector
+        if connector is None:
+            raise RichContentFailed(
+                "Teams is not connected, so the publication could not be redrawn.",
+                text=text,
+            )
+        address = self._publication_address(channel_id, message_ref, thread_root_id)
+        await self._edit_rich(
+            connector, agent_name, address, text, self._below(content, drawn, stopping)
+        )
+
+    async def _edit_rich(
+        self,
+        connector: BotConnectorClient,
+        agent_name: str,
+        address: _Publication,
+        text: str,
+        below: list[dict[str, Any]],
+    ) -> None:
+        try:
+            async with self._writes_to(address.conversation_id):
+                await connector.update_activity(
+                    service_url=address.service_url,
+                    conversation_id=address.conversation_id,
+                    activity_id=address.activity_id,
+                    activity=await self._message_activity(agent_name, text, below),
+                )
+        except BotConnectorThrottled as error:
+            raise self._throttled(error, text) from error
+        except BotConnectorConflict as error:
+            raise self._conflicted(error, text) from error
+        except BotConnectorRefused as error:
+            raise RichContentFailed(
+                f"Teams refused the edit to {address.activity_id} in "
+                f"conversation {address.conversation_id}: {error}",
+                text=text,
+            ) from error
+
+    async def remove_publication(self, channel_id: str, message_ref: str) -> None:
+        """Take an answered card out of the conversation, or say why it is still there.
+
+        Addressed through `_publication_address`, which reads back the service
+        URL and conversation Teams confirmed when it took the card, rather than
+        through `_locate`, whose map a restart empties.
+
+        A 404 is read against that address rather than on its own. Gone at an
+        address Teams issued means nothing remains there, which is what the
+        caller asked for. Gone at an address this process rebuilt from the
+        channel and a stored root may be the guess being wrong instead, and an
+        outcome that cannot be told apart from a bad address is not one to
+        record: that is a failure, and the card is asked about again.
+
+        Only a wait Teams put a number on arrives as one. A 412, and a 429 with
+        no `Retry-After`, are owed instead. The caller treats a named wait as
+        authoritative and replaces its own growing interval with it, so an
+        invented second — or the five seconds the edit path substitutes — comes
+        back as a *shorter* delay than the cleanup had already worked up to,
+        and resets the growth every sweep. A redraw invents one anyway because
+        it holds a reservation and content that goes stale; a deletion has
+        neither, and is content to be asked about later rather than sooner.
+
+        In a posts-layout channel Teams substitutes *"This message has been
+        deleted."* where the card was. A chat and a threads-layout channel take
+        it away entirely.
+        """
+        connector = self._connector
+        if connector is None:
+            raise RemovalFailed("Teams is not connected.")
+
+        address = self._publication_address(channel_id, message_ref, None)
+        try:
+            async with self._writes_to(address.conversation_id):
+                await connector.delete_activity(
+                    service_url=address.service_url,
+                    conversation_id=address.conversation_id,
+                    activity_id=address.activity_id,
+                )
+        except BotConnectorThrottled as error:
+            if error.retry_after is None:
+                # A rate limit Teams put no number on. Inventing one would
+                # overwrite the cleanup's own interval with something shorter
+                # and stop it growing, so this is owed like any other failure
+                # and the caller keeps widening the gap between attempts.
+                raise RemovalFailed(
+                    f"Teams rate-limited the deletion of {address.activity_id} "
+                    f"in conversation {address.conversation_id} and named no "
+                    f"wait: {error}"
+                ) from error
+            raise RichContentThrottled(
+                retry_after=error.retry_after, text=""
+            ) from error
+        except BotConnectorGone as error:
+            if not address.trusted:
+                raise RemovalFailed(
+                    f"Teams found nothing at the address rebuilt for "
+                    f"{message_ref} in channel {channel_id}, which is as likely "
+                    f"to be the address as the card: {error}"
+                ) from error
+            # Worth a line because the innocent reading — a deletion whose
+            # acknowledgement we lost, or one done by hand — is not the only one.
+            logger.warning(
+                "Teams card %s was already gone when it was taken back: %s",
+                message_ref,
+                error,
+            )
+        except Exception as error:
+            raise RemovalFailed(
+                f"Teams would not delete {address.activity_id} in conversation "
+                f"{address.conversation_id}: {error}"
+            ) from error
+
+    # ── Channels ─────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _sanitize_channel_name(name: str) -> str:
+        """Teams channel display names disallow several characters and cap at
+        50 chars. Replace the reserved set and trim."""
+        cleaned = re.sub(r'[~#%&*{}+/\\:<>?|\'"]', "-", name).strip(" .-")
+        return (cleaned or "switch")[:50]
+
+    async def create_channel(
+        self,
+        name: str,
+        topic: str,
+        *,
+        channel_type: ChannelType = "channel_public",
+    ) -> str:
+        if self._graph is None:
+            raise RuntimeError("Teams adapter not started")
+        if channel_type in ("group", "direct"):
+            raise ValueError(
+                f"Cannot create {channel_type} channels — they are initiated "
+                "from the messaging platform"
+            )
+
+        team_id = self._config.team_id
+        if not team_id:
+            raise BridgeOperationError(
+                "No default team is set for this Teams connection, so Switch "
+                "does not know which team to create the channel in. Choose one "
+                "in the connection's Microsoft Teams settings."
+            )
+        membership_type = "private" if channel_type == "channel_private" else "standard"
+        channel = await self._graph.create_channel(
+            team_id=team_id,
+            display_name=self._sanitize_channel_name(name),
+            description=topic,
+            membership_type=membership_type,
+        )
+        channel_id = str(channel.get("id", ""))
+        if not channel_id:
+            raise RuntimeError(f"Teams channel creation returned no id for '{name}'")
+
+        self._channel_type[channel_id] = channel_type
+        await self._learn_channel_team(channel_id, team_id)
+        self._channel_names[channel_id] = str(channel.get("displayName") or "")
+        self._channel_layouts[channel_id] = str(channel.get("layoutType") or "")
+        # Capture the new channel's messages right away.
+        await self._ensure_channel_subscription(channel_id)
+        return channel_id
+
+    async def get_channel_type(self, channel_id: str) -> ChannelType:
+        known = self._channel_type.get(channel_id)
+        if known is not None:
+            return known
+        channel = await self._fetch_channel(channel_id)
+        return _channel_type_of(channel)
+
+    async def refresh_channel_types(self, channel_ids: list[str]) -> None:
+        for channel_id in channel_ids:
+            try:
+                await self._fetch_channel(channel_id)
+            except Exception:
+                logger.warning(
+                    "Could not read whether Teams channel %s is private; its "
+                    "room keeps the type it was saved with until a read succeeds",
+                    channel_id,
+                    exc_info=True,
+                )
+
+    async def search_directory_users(self, query: str) -> list[DirectoryUser]:
+        """Search the AAD directory for people to claim as an identity.
+
+        Teams identifies a message sender by AAD object id where one is
+        available, which is what Graph returns here, so a claim made from this
+        list matches what arrives on the inbound path.
+        """
+        if self._graph is None:
+            raise RuntimeError("Teams adapter not started")
+        term = query.strip()
+        if not term:
+            return []
+        users = await self._graph.search_users(query=term)
+        results = [
+            DirectoryUser(
+                external_user_id=str(user.get("id")),
+                username=_handle_for(user),
+                display_name=str(
+                    user.get("displayName") or user.get("userPrincipalName") or ""
+                ),
+                email=user.get("mail") or user.get("userPrincipalName") or None,
+            )
+            for user in users
+            if user.get("id")
+        ]
+        results.sort(key=lambda u: u.display_name.lower())
+        return results
+
+    async def channel_deeplink(self, external_channel_id: str) -> str | None:
+        """`https://teams.microsoft.com/l/channel/...` opening the channel in the
+        Teams client. Built from the channel id, its team, and the tenant."""
+        if not external_channel_id:
+            return None
+        team_id = self._team_of_channel.get(external_channel_id) or self._config.team_id
+        if not team_id:
+            return None
+        encoded = quote(external_channel_id, safe="")
+        return (
+            f"https://teams.microsoft.com/l/channel/{encoded}/channel"
+            f"?groupId={team_id}&tenantId={self._config.tenant_id}"
+        )
+
+    async def home_deeplink(self) -> str | None:
+        """`https://teams.microsoft.com/?tenantId=<tenant>` — opens Teams on the
+        right tenant.
+
+        Deliberately the tenant root rather than a team link: the
+        `/l/team/{id}/conversations` form keys off the General channel's thread
+        id, not the team id, and this adapter does not hold that. A link that
+        reliably lands in the correct tenant beats one that may 404."""
+        if not self._config.tenant_id:
+            return None
+        return f"https://teams.microsoft.com/?tenantId={self._config.tenant_id}"
+
+    async def add_agents_to_channel(
+        self, channel_id: str, agent_names: list[str]
+    ) -> None:
+        # Single-bot identity model: agents share one Teams bot, so there is no
+        # per-agent membership to manage (mirrors Slack).
+        pass
+
+    async def add_users_to_channel(
+        self,
+        channel_id: str,
+        user_names: list[str],
+        user_external_ids: list[str],
+    ) -> list[str]:
+        if self._graph is None:
+            raise RuntimeError("Teams adapter not started")
+        team_id = self._team_of_channel.get(channel_id) or self._config.team_id
+        if not team_id:
+            logger.error(
+                "Cannot add people to Teams channel %s: Switch does not know "
+                "which team it is in",
+                channel_id,
+            )
+            return list(user_external_ids)
+        # Private channels have their own membership; standard channels inherit
+        # the team's, so a user is added to the team instead — only ever when
+        # the channel is known to be standard, never as a fallback.
+        try:
+            channel_type = await self.get_channel_type(channel_id)
+        except Exception:
+            logger.exception(
+                "Could not tell whether Teams channel %s is private; added none "
+                "of %d user(s) rather than risk adding them to the whole team",
+                channel_id,
+                len(user_external_ids),
+            )
+            return list(user_external_ids)
+        if channel_type not in ("channel_public", "channel_private"):
+            logger.error(
+                "Teams conversation %s is a %s, not a channel; added none of "
+                "%d user(s)",
+                channel_id,
+                channel_type,
+                len(user_external_ids),
+            )
+            return list(user_external_ids)
+        is_private = channel_type == "channel_private"
+        failed: list[str] = []
+        for user_id in user_external_ids:
+            try:
+                if is_private:
+                    await self._graph.add_channel_member(
+                        team_id=team_id, channel_id=channel_id, user_aad_id=user_id
+                    )
+                else:
+                    await self._graph.add_team_member(
+                        team_id=team_id, user_aad_id=user_id
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to add user %s to Teams channel %s", user_id, channel_id
+                )
+                failed.append(user_id)
+        return failed
+
+    # ── Agent identity ───────────────────────────────────────────────────────
+
+    async def create_agent_identity(self, agent: AgentIdentity) -> None:
+        # Single-bot model: no per-agent platform account is created.
+        pass
+
+    async def remove_agent_identity(self, agent: AgentIdentity) -> None:
+        pass
+
+    async def get_channel_agent_names(self, channel_id: str) -> list[str]:
+        # Single shared bot cannot enumerate per-agent membership (mirrors Slack).
+        return []
+
+    # ── Translation ──────────────────────────────────────────────────────────
+
+    def prime_mention_targets(self, targets: dict[str, str]) -> None:
+        """Learn ``username -> AAD object id`` so an ``@name`` can become a real
+        Teams mention. Without it every ``@name`` goes out as inert text and the
+        person it names is never notified."""
+        self._mention_targets.update(
+            {name.casefold(): external_id for name, external_id in targets.items()}
+        )
+        self._mention_pattern = None
+
+    def _known_name_pattern(self) -> re.Pattern[str] | None:
+        """An ``@name`` matcher covering the names we can actually address.
+
+        Built from the targets rather than from a general name shape, because
+        a Teams handle is often a display name and so often contains a space:
+        no fixed pattern can tell where `@Louis Amaudruz` ends without knowing
+        the name. Longest first, so the full name wins over its first word.
+
+        Rebuilt when the targets change, which is on startup and once per
+        person met.
+        """
+        if self._mention_pattern is None and self._mention_targets:
+            names = sorted(self._mention_targets, key=len, reverse=True)
+            alternatives = "|".join(re.escape(name) for name in names)
+            self._mention_pattern = re.compile(
+                f"@({alternatives}){_MENTION_END}", re.IGNORECASE
+            )
+        return self._mention_pattern
+
+    def _render_outbound(self, content: str) -> str:
+        return self._mark_mentions(content)
+
+    def defuse_mass_mentions(self, text: str) -> str:
+        """Defuse the words as prose: Teams pages nobody from text.
+
+        A Teams mention needs an entity alongside the `<at>` markup, and there
+        is no entity for a whole channel, so the words are defused only for
+        how they read, leaving code and links exact."""
+        return defuse_mass_mention_words_in_prose(text, keep=CODE_AND_URLS)
+
+    def escape_label_for_body(self, label: str) -> str:
+        """Add the `<at>` tag to what the base class already defuses.
+
+        The inherited `@` rule is what stops `_mark_mentions` marking up an
+        `@alice` a label carried in, and the inherited `]` rule is what stops
+        a card's TextBlock, which renders markdown, turning a label's
+        `[text](url)` into a link of its own choosing. Teams needs one
+        more: `<at>alice</at>` written straight into a label skips the marking
+        pass but is still found by `_mention_entities`, which scans the
+        rendered body for the markup and pairs whatever it finds with an entity
+        that notifies whoever `alice` actually is. A zero-width space after
+        every `<` breaks the tag.
+
+        Broken syntax rather than entity escaping, because an Adaptive Card is
+        not HTML: `&lt;` here is shown to the reader as those four
+        characters."""
+        return (
+            super().escape_label_for_body(label).replace("<", "<" + _ZERO_WIDTH_SPACE)
+        )
+
+    def _mark_mentions(self, content: str) -> str:
+        """Wrap ``@name`` in Teams' ``<at>`` markup for people we can address.
+
+        Only names we hold an AAD id for: the markup is half of a mention and
+        the entity built from it in ``_mention_entities`` is the other, so
+        marking a name we cannot pair would render a mention that highlights
+        nobody. Agent names are deliberately among those left alone — an agent
+        is not a Teams user, and ``@agent`` is Switch's own addressing, which
+        wants the plain text.
+        """
+        pattern = self._known_name_pattern()
+        if pattern is None:
+            return content
+
+        def _replace(match: re.Match[str]) -> str:
+            name = match.group(1)
+            # The pattern matches case-insensitively while the entity is looked
+            # up by casefold, and for a few scripts those disagree. Emitting
+            # markup the entity pass would not pair leaves a mention that
+            # highlights nobody, so leave the text alone instead.
+            if name.casefold() not in self._mention_targets:
+                return match.group(0)
+            return f"<at>{html.escape(name)}</at>"
+
+        return pattern.sub(_replace, content)
+
+    def _mention_entities(self, text: str) -> list[dict[str, Any]]:
+        """Bot Framework mention entities for the ``<at>`` markup in ``text``.
+
+        Teams needs both halves and rejects neither: markup with no entity is
+        plain text, an entity with no markup does nothing. Built from the
+        rendered body so the two cannot drift.
+        """
+        entities: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for escaped_name in _AT_TAG.findall(text):
+            if escaped_name in seen:
+                continue
+            name = html.unescape(escaped_name)
+            external_id = self._mention_targets.get(name.casefold())
+            if external_id is None:
+                continue
+            seen.add(escaped_name)
+            entities.append(
+                {
+                    "type": "mention",
+                    "text": f"<at>{escaped_name}</at>",
+                    "mentioned": {"id": external_id, "name": name},
+                }
+            )
+        return entities
+
+    async def _sender_handle(self, sender_id: str, offered_name: str) -> str:
+        """The handle to file an inbound sender under.
+
+        Teams omits the sender's name from some activities — 1:1 chats above
+        all — and the fallback was the raw id, so `29:1AbCdEf…` became a
+        person's name: in the room title, on their client, and in the
+        text of every agent reply that addressed them. An id is never a name,
+        so look one up instead, and only give up when Graph cannot say either.
+
+        What Teams offers on an activity is the *display* name, which is
+        usually two words. A handle is also what an agent writes to address
+        someone, and `@Louis Amaudruz` cannot be read back — a mention ends at
+        the first space — so taking the offered name at face value files
+        people under something that can never be tagged. Ask the directory for
+        the principal name instead, which is one word by construction, and
+        keep the offered name only if the directory cannot say.
+
+        Cached per sender: it is one directory read per person, on a value that
+        does not change between messages.
+        """
+        cached = self._sender_handles.get(sender_id)
+        if cached is not None:
+            return cached
+        handle = ""
+        # A one-word name Teams offered is already a usable handle and costs
+        # nothing. An id masquerading as a name, or a name with a space in it,
+        # sends us to the directory for something better.
+        if (
+            offered_name
+            and offered_name != sender_id
+            and _is_usable_handle(offered_name)
+        ):
+            handle = offered_name
+        elif self._graph is not None and sender_id:
+            try:
+                handle = _handle_for(await self._graph.get_user(user_id=sender_id))
+            except Exception:
+                logger.warning(
+                    "Could not resolve a handle for Teams sender %s; falling "
+                    "back to %s",
+                    sender_id,
+                    "the display name Teams offered" if offered_name else "their id",
+                    exc_info=True,
+                )
+        # A display name with a space is a poor handle but a good deal better
+        # than an id, so it stands when the directory yields nothing.
+        handle = handle or offered_name or sender_id
+        self._sender_handles[sender_id] = handle
+        return handle
+
+    @staticmethod
+    def _command_name(token: str) -> str:
+        """The command a leading `!name` or `/name` token names.
+
+        Teams has no server-registered slash commands — a bot's command list
+        is declared in its app manifest and, when picked, simply types the text
+        into the compose box. So `/help` reaches us as an ordinary message and
+        the two prefixes are the same thing by the time we see them.
+        """
+        return token.lstrip("!/")
+
+    def slash_invite_hint(self) -> str | None:
+        # Teams has no server-registered slash commands: a manifest command
+        # list only types the text into the compose box, and the bot parses it
+        # like any other message. So the slash form always works, whether or
+        # not the operator has declared it, and reaches the same dispatcher.
+        return (
+            "`/invite-agent @agent-name` — the same thing, if you prefer the slash form"
+        )
+
+    @classmethod
+    def link_code_instructions(
+        cls, code: str, connection_config: Mapping[str, object]
+    ) -> str:
+        # Teams hands the bot a channel message only when it is mentioned, and
+        # a bare command name counts once it is.
+        return (
+            "From that account, @mention the Switch app in a channel or chat it "
+            f"is in and add `link-account {code}`."
+        )
+
+    def is_placeholder_username(self, username: str) -> bool:
+        # Every id Teams hands out for a person is one of two shapes: a
+        # channel-account id, prefixed with digits and a colon (`29:1AbC…`,
+        # `8:orgid:…`), or a bare Entra object id. Neither is anybody's name.
+        return bool(_TEAMS_ID.match(username.strip()))
+
+    def render_app_mention(self, token: str) -> str:
+        # Teams' handle for the app is an id, not a name, and it has no inline
+        # syntax that turns one into a mention — so name nobody and read
+        # naturally instead of printing `<@28:…>` at someone.
+        return "me"
+
+    def translate_inbound(self, raw_message: str) -> str:
+        return raw_message
+
+    # ── Inbound listener ─────────────────────────────────────────────────────
+
+    async def _handle_http_messages(self, request: web.Request) -> web.Response:
+        """The bring-your-own listener's Bot Framework endpoint.
+
+        Read before it is checked because the check needs the body — the token
+        has to name the same `serviceUrl` and be endorsed for the same channel
+        as the activity — but nothing in it is acted on until it passes.
+        """
+        try:
+            activity = await request.json()
+        except Exception:
+            return web.Response(status=400, text="invalid json")
+        if not isinstance(activity, dict):
+            return web.Response(status=400, text="invalid activity")
+
+        if self._authenticator is not None:
+            try:
+                await self._authenticator.verify(
+                    request.headers.get("Authorization"),
+                    service_url=str(activity.get("serviceUrl", "")).strip(),
+                    channel_id=str(activity.get("channelId", "")),
+                )
+            except PermissionError as e:
+                logger.warning("Rejected inbound Teams activity: %s", e)
+                return web.Response(status=401, text="unauthorized")
+            except SigningKeysUnavailable as e:
+                # Not refused as forged: Teams resends what it was told to
+                # retry, and nothing about this one was found wrong.
+                logger.error("Could not check an inbound Teams activity: %s", e)
+                return web.Response(status=503, text="unavailable")
+
+        try:
+            answer = await self.receive_activity(activity)
+        except Exception:
+            logger.exception("Failed to handle inbound Teams activity")
+            return web.Response(status=200)
+
+        if answer is None:
+            return web.Response(status=200)
+        return web.json_response(answer)
+
+    async def dispatch_event(
+        self, *, envelope_type: str, payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """An activity or a notification for the distributed app, from the
+        deployment's public route — already authenticated, and routed here by
+        the organisation it is for."""
+        if envelope_type == "activity":
+            return await self.receive_activity(payload)
+        if envelope_type == "notification":
+            await self.receive_notification(payload)
+            return None
+        raise ValueError(f"not a Teams envelope: {envelope_type!r}")
+
+    async def receive_activity(self, activity: dict[str, Any]) -> dict[str, Any] | None:
+        """Handle one authenticated Bot Framework activity; return an invoke's answer.
+
+        The one entry point for activities, whichever way they arrived — the
+        bring-your-own listener above, or the deployment's public route for the
+        distributed app. Whoever calls it has already checked the activity's
+        token.
+
+        On the distributed app the token proves the activity came from the Bot
+        Framework, not which organisation it is for: one app serves them all.
+        So an activity from any other organisation is refused here, and a
+        service URL that is not Microsoft's is refused before it is learned,
+        since this bridge then sends the deployment's token to it.
+        """
+        identity = self._me
+        tenant = activity_tenant(activity)
+        if not identity.serves(tenant):
+            logger.warning(
+                "Refused a Teams activity from organisation %s on the bridge for %s",
+                tenant,
+                identity.org_tenant_id,
+            )
+            if activity.get("type") == "invoke":
+                return _invoke_error(
+                    403, "Forbidden", "This card belongs to another organisation."
+                )
+            return None
+        service_url = str(activity.get("serviceUrl", "")).strip()
+        hosts = identity.allowed_service_hosts
+        if service_url and hosts is not None:
+            parts = urlsplit(service_url)
+            if parts.scheme != "https" or parts.hostname not in hosts:
+                logger.warning(
+                    "Refused a Teams activity naming service URL host %r, which "
+                    "is not a Bot Connector host",
+                    parts.hostname,
+                )
+                return None
+        return await self._dispatch_activity(activity)
+
+    async def _dispatch_activity(
+        self, activity: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        service_url = str(activity.get("serviceUrl", "")).strip()
+        activity_type = activity.get("type")
+
+        channel_id, chat_type = self._channel_from_activity(activity)
+        if service_url and channel_id:
+            self._service_url[channel_id] = service_url
+            await self._learn_service_url(service_url)
+            if chat_type is not None:
+                self._channel_type[channel_id] = chat_type
+
+        team = (activity.get("channelData") or {}).get("team") or {}
+        # Graph channel subscriptions key on the team's AAD group GUID, which
+        # Teams sends as ``aadGroupId`` — on some activities only. ``team.id``
+        # is the non-GUID channel thread id and Graph rejects it ("TeamGroupId
+        # must be ... a valid GUID"). A bring-your-own bridge lives in its one
+        # configured team, so that stands in for a channel not yet placed; a
+        # bridge on the distributed app is in many teams, and guessing its
+        # default would file another team's channel under it.
+        group_id = team.get("aadGroupId")
+        if (
+            not group_id
+            and not self._me.shared
+            and channel_id not in self._team_of_channel
+        ):
+            group_id = self._config.team_id
+        # A chat's type is known from the activity; a channel's is not.
+        is_channel = chat_type is None
+        if group_id and channel_id and is_channel:
+            await self._learn_channel_team(channel_id, str(group_id))
+
+        if activity_type == "message":
+            channel_type = await self._inbound_channel_type(channel_id, chat_type)
+            await self._dispatch_message(activity, channel_id, channel_type)
+        elif activity_type == "conversationUpdate":
+            await self._dispatch_conversation_update(activity, channel_id, chat_type)
+        elif activity_type == "installationUpdate":
+            await self._dispatch_installation_update(activity)
+        elif activity_type == "invoke" and activity.get("name") == _INVOKE_CARD_ACTION:
+            return await self._dispatch_card_action(activity, channel_id)
+        return None
+
+    async def _dispatch_installation_update(self, activity: dict[str, Any]) -> None:
+        """The app was added to or removed from a team.
+
+        Removed, Graph keeps delivering that team's channels to a bot that can
+        no longer answer in them, so their subscriptions are deleted and their
+        capture waits for Switch to be added back. Added, the channels that
+        were waiting are captured again; the bot's own join arrives as a
+        `conversationUpdate` and is handled there. An upgrade arrives as
+        `remove-upgrade` followed by `add-upgrade` and is neither.
+        """
+        action = activity.get("action")
+        if action not in ("add", "remove"):
+            return
+        team = (activity.get("channelData") or {}).get("team") or {}
+        team_id = str(team.get("aadGroupId") or "")
+        if not team_id:
+            logger.warning(
+                "The Teams app was %s a team that the activity does not name",
+                "added to" if action == "add" else "removed from",
+            )
+            return
+        if action == "add":
+            await self._switch_joined_team(team_id)
+            return
+        logger.info(
+            "The Teams app was removed from team %s; stopping capture in its "
+            "known channels",
+            team_id,
+        )
+        await self._switch_left_team(team_id)
+
+    async def _switch_in_team(self, team_id: str) -> bool | None:
+        """On the distributed app, whether Switch is in a team; None if unknown.
+
+        Asked before capturing any of the team's channels, because Graph
+        delivers them whether or not the app is in the team: a room in a team
+        Switch was taken out of would otherwise go on receiving everything
+        said there, across restarts, to a bot that cannot answer. Remembered
+        per team, changed by Switch joining or leaving it, and asked again by
+        the repair loop once it is old (`_recheck_teams`).
+        """
+        cached = self._team_has_switch.get(team_id)
+        if cached is not None:
+            return cached[0]
+        assert self._graph is not None
+        try:
+            installations = await self._graph.find_app_installations(
+                team_id=team_id, external_id=self._me.app_id
+            )
+        except Exception as error:
+            logger.warning(
+                "Could not check whether Switch is in Teams team %s: %s",
+                team_id,
+                error,
+            )
+            return None
+        known = bool(installations)
+        self._team_has_switch[team_id] = (known, time.monotonic())
+        return known
+
+    def _capture_team(self, channel_id: str) -> str | None:
+        """The team a channel's messages would be captured through: the one it
+        is known to be in, or failing that the default team."""
+        return self._known_team(channel_id) or self._config.team_id
+
+    def _known_team(self, channel_id: str) -> str | None:
+        """The team a channel is known to be in: as Teams said, or as proved
+        by Graph accepting a subscription through it. Not the default team
+        merely because nothing else is known."""
+        return self._team_of_channel.get(channel_id) or self._subscription_team.get(
+            channel_id
+        )
+
+    async def _park_capture(self, channel_id: str, team_id: str) -> None:
+        """Stop capturing a channel whose team Switch is not in, until it is."""
+        await self._stop_capture(channel_id)
+        if self._capture_parked.get(channel_id) != team_id:
+            self._capture_parked[channel_id] = team_id
+            logger.info(
+                "Not capturing Teams channel %s: Switch is not in its team %s",
+                channel_id,
+                team_id,
+            )
+
+    async def _switch_joined_team(self, team_id: str) -> None:
+        """Switch is in a team now: capture the channels waiting on that."""
+        if not self._listening:
+            self._hand_to_holder({"action": "team_joined", "team_id": team_id})
+            return
+        self._team_has_switch[team_id] = (True, time.monotonic())
+        waiting = [c for c, t in self._capture_parked.items() if t == team_id]
+        for channel_id in waiting:
+            del self._capture_parked[channel_id]
+            await self._ensure_channel_subscription(channel_id)
+
+    async def _switch_left_team(self, team_id: str) -> None:
+        """Switch is out of a team: stop capturing it, ready to resume on return."""
+        if not self._listening:
+            self._hand_to_holder({"action": "team_left", "team_id": team_id})
+            return
+        self._team_has_switch[team_id] = (False, time.monotonic())
+        known = (
+            self._capture_wanted | set(self._subscriptions) | set(self._team_of_channel)
+        )
+        for channel_id in [c for c in known if self._known_team(c) == team_id]:
+            captured = (
+                channel_id in self._capture_wanted or channel_id in self._subscriptions
+            )
+            await self._stop_capture(channel_id)
+            if captured:
+                self._capture_parked[channel_id] = team_id
+
+    async def _recheck_teams(self) -> None:
+        """Ask again whether Switch is in each team whose answer is old.
+
+        Teams tells the bot when the app joins or leaves a team, but an admin
+        can do either where the bot hears nothing of it, and an answer kept
+        for ever would keep a team uncaptured, or captured, for ever.
+        """
+        if not self._me.shared or self._graph is None:
+            return
+        now = time.monotonic()
+        stale = [
+            (team_id, answer)
+            for team_id, (answer, found_at) in self._team_has_switch.items()
+            if now - found_at >= _TEAM_RECHECK_SECONDS
+        ]
+        for team_id, previous in stale:
+            del self._team_has_switch[team_id]
+            current = await self._switch_in_team(team_id)
+            if current is None:
+                # Asked again next round, rather than taken as changed.
+                self._team_has_switch[team_id] = (previous, 0.0)
+            elif current and not previous:
+                await self._switch_joined_team(team_id)
+            elif previous and not current:
+                await self._switch_left_team(team_id)
+
+    async def _stop_capture(self, channel_id: str) -> None:
+        self._capture_wanted.discard(channel_id)
+        self._capture_failures.pop(channel_id, None)
+        subscription_id = self._subscriptions.get(channel_id)
+        self._forget_subscription(channel_id)
+        if subscription_id is None or self._graph is None:
+            return
+        try:
+            await self._graph.delete_subscription(subscription_id=subscription_id)
+        except Exception:
+            logger.warning(
+                "Failed to delete the Teams subscription for channel %s; it runs "
+                "out on its own within the hour",
+                channel_id,
+                exc_info=True,
+            )
+
+    # ── Which teams Switch is in (the distributed app) ──────────────────────
+
+    def _require_shared(self) -> GraphClient:
+        if not self._me.shared:
+            raise BridgeOperationError(
+                "Only a connection on the distributed Teams app places itself "
+                "in teams from Switch; a bring-your-own app is added in Teams."
+            )
+        if self._graph is None:
+            raise RuntimeError("Teams adapter not started")
+        return self._graph
+
+    async def list_team_placements(self) -> TeamPlacements:
+        """Every team in the organisation, and whether Switch is in each.
+
+        One read per team for the second half, a handful at a time: Graph has
+        no call that answers it for the whole organisation at once. A team
+        whose apps cannot be read — archived, being deleted, restricted, or
+        the read timing out — is listed as unknown rather than failing the
+        rest.
+
+        Each installation found also says the app's id in the organisation's
+        catalogue, so this is how Switch learns that id when a Teams admin
+        uploaded the app by hand rather than Switch publishing it.
+        """
+        graph = self._require_shared()
+        app_id = self._me.app_id
+        teams = await graph.list_teams()
+        gate = asyncio.Semaphore(_TEAM_READS_AT_ONCE)
+        seen_catalog_ids: set[str] = set()
+
+        async def placed(team: dict[str, Any]) -> TeamPlacement:
+            team_id = str(team.get("id") or "")
+            name = str(team.get("displayName") or team_id)
+            try:
+                async with gate:
+                    installations = await graph.find_app_installations(
+                        team_id=team_id, external_id=app_id
+                    )
+            except (GraphError, httpx.HTTPError) as error:
+                logger.warning(
+                    "Could not read which apps are in Teams team %s: %s", team_id, error
+                )
+                return TeamPlacement(team_id=team_id, name=name, has_switch=None)
+            seen_catalog_ids.update(
+                i.catalog_app_id for i in installations if i.catalog_app_id
+            )
+            return TeamPlacement(
+                team_id=team_id, name=name, has_switch=bool(installations)
+            )
+
+        # Anything else — the organisation's token refused — fails every read
+        # alike, so the listing fails, and the reads still queued are
+        # cancelled rather than left spending the organisation's Graph budget.
+        reads = [asyncio.create_task(placed(team)) for team in teams if team.get("id")]
+        try:
+            placements = await asyncio.gather(*reads)
+        except BaseException:
+            for read in reads:
+                read.cancel()
+            await asyncio.gather(*reads, return_exceptions=True)
+            raise
+        if len(seen_catalog_ids) > 1:
+            # A copy uploaded to one team on its own (sideloaded) carries an id
+            # of its own; which one the catalogue holds cannot be told from here.
+            logger.warning(
+                "The Switch app is in Microsoft organisation %s's teams under "
+                "more than one catalogue id (%s); using the first",
+                self._config.tenant_id,
+                ", ".join(sorted(seen_catalog_ids)),
+            )
+        return TeamPlacements(
+            teams=sorted(placements, key=lambda p: p.name.casefold()),
+            catalog_app_id=next(iter(sorted(seen_catalog_ids)), None),
+        )
+
+    async def add_to_team(self, team_id: str, *, catalog_app_id: str) -> None:
+        """Add Switch to a team; its own join then makes the rooms, as today."""
+        await self._require_shared().install_app(
+            team_id=team_id, catalog_app_id=catalog_app_id
+        )
+        await self._switch_joined_team(team_id)
+
+    async def remove_from_team(self, team_id: str) -> None:
+        graph = self._require_shared()
+        for installation in await graph.find_app_installations(
+            team_id=team_id, external_id=self._me.app_id
+        ):
+            await graph.uninstall_app(
+                team_id=team_id, installation_id=installation.installation_id
+            )
+        await self._switch_left_team(team_id)
+
+    async def check_config_edit(self, connection_config: Mapping[str, object]) -> None:
+        """On the distributed app, a default team must be one Switch is in.
+
+        New channels are made in it, which fails in a team the app is not in —
+        and fails at the first room, long after the edit that caused it.
+        """
+        if not self._me.shared:
+            return
+        team_id = connection_config.get("team_id")
+        if not team_id or team_id == self._config.team_id:
+            return
+        try:
+            installations = await self._require_shared().find_app_installations(
+                team_id=str(team_id), external_id=self._me.app_id
+            )
+        except GraphError as error:
+            if error.status in (400, 404):
+                raise ConfigEditRefused(
+                    f"There is no team {team_id} in this organisation."
+                ) from error
+            raise
+        except (TokenRequestRefused, httpx.HTTPError) as error:
+            raise BridgeOperationError(
+                f"Microsoft could not be asked whether Switch is in team {team_id}: "
+                f"{error}"
+            ) from error
+        if not installations:
+            raise ConfigEditRefused(
+                "Switch is not in that team. Add it to the team first, then "
+                "make it the default."
+            )
+
+    async def require_bindable_channel(self, channel_id: str) -> None:
+        """On the distributed app, bind only a channel in this organisation.
+
+        The deployment's Bot Connector token posts into every approving
+        organisation's channels, so a room bound to another organisation's
+        channel id would post there. Reading the channel with a Graph token
+        issued in this organisation is what proves it is this organisation's:
+        Graph answers only for its own directory. Chats cannot be checked that
+        way, and become rooms only from activity Microsoft delivered to this
+        bridge, so they cannot be bound by id at all.
+
+        A bring-your-own bridge's own credential reaches only its own
+        organisation, so there is nothing to refuse.
+        """
+        if not self._me.shared:
+            return
+        if not _is_channel_id(channel_id):
+            raise ChannelNotBindable(
+                f"{channel_id!r} is not a Teams channel id. Only a channel can be "
+                "bound by id; a chat becomes a room when someone messages Switch "
+                "in it."
+            )
+        team_id = self._team_of_channel.get(channel_id) or self._config.team_id
+        if not team_id:
+            raise ChannelNotBindable(
+                "Switch does not know which team this channel is in. Add the "
+                "Switch app to its team first."
+            )
+        if self._graph is None:
+            raise RuntimeError("Teams adapter not started")
+        try:
+            await self._graph.get_channel(team_id=team_id, channel_id=channel_id)
+        except GraphError as error:
+            raise ChannelNotBindable(
+                f"Teams channel {channel_id} is not one Switch can reach in this "
+                f"organisation ({error})."
+            ) from error
+
+    @staticmethod
+    def _channel_from_activity(
+        activity: dict[str, Any],
+    ) -> tuple[str, ChannelType | None]:
+        """The conversation id and, for a chat, its type. A channel's type is
+        None: Teams sends the same shape for standard, private and shared."""
+        conversation = activity.get("conversation") or {}
+        conv_id = str(conversation.get("id", ""))
+        conv_type = conversation.get("conversationType", "")
+        channel_data = activity.get("channelData") or {}
+        channel = channel_data.get("channel") or {}
+
+        if conv_type == "channel" or "@thread.tacv2" in conv_id:
+            channel_id = str(channel.get("id") or conv_id.split(";", 1)[0])
+            return channel_id, None
+        if conv_type == "personal":
+            return conv_id, "direct"
+        if conv_type == "groupChat":
+            return conv_id, "group"
+        return conv_id.split(";", 1)[0], None
+
+    async def _inbound_channel_type(
+        self, channel_id: str, chat_type: ChannelType | None
+    ) -> ChannelType:
+        """The type to report for an inbound conversation. A channel Graph
+        cannot describe is reported private but not cached, so it is re-read
+        once the retry window passes."""
+        if chat_type is not None:
+            return chat_type
+        known = self._channel_type.get(channel_id)
+        if known is not None:
+            return known
+        if self._read_recently_failed(channel_id):
+            return "channel_private"
+        channel = await self._read_channel(channel_id)
+        return "channel_private" if channel is None else _channel_type_of(channel)
+
+    def _seen_activity(self, activity_id: str) -> bool:
+        if not activity_id:
+            return False
+        if activity_id in self._seen:
+            return True
+        self._seen[activity_id] = None
+        if len(self._seen) > self._seen_max:
+            self._seen.popitem(last=False)
+        return False
+
+    async def _dispatch_message(
+        self, activity: dict[str, Any], channel_id: str, channel_type: ChannelType
+    ) -> None:
+        activity_id = str(activity.get("id", ""))
+        if self._seen_activity(activity_id):
+            return
+
+        sender = activity.get("from") or {}
+        sender_id = str(sender.get("aadObjectId") or sender.get("id") or "")
+        sender_name = await self._sender_handle(
+            sender_id, str(sender.get("name") or "")
+        )
+
+        raw_text = str(activity.get("text", ""))
+        text = self._clean_text(raw_text)
+        text += self._disclosed_attachment_note(
+            self._activity_attachment_descriptors(activity)
+        )
+        self_mention_token = self._self_mention_token(activity)
+        command_text = (
+            self._clean_text(_strip_leading_mention(raw_text))
+            if self_mention_token is not None
+            else text
+        )
+
+        conversation = activity.get("conversation") or {}
+        conv_id = str(conversation.get("id", ""))
+        root_id: str | None = None
+        if ";messageid=" in conv_id:
+            thread_root = conv_id.split(";messageid=", 1)[1]
+            if thread_root and thread_root != activity_id:
+                root_id = thread_root
+
+        channel_name = await self._resolve_channel_name(activity, channel_id)
+
+        await self._deliver(
+            channel_id=channel_id,
+            channel_type=channel_type,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            text=text,
+            message_ref=activity_id,
+            root_id=root_id,
+            channel_name=channel_name,
+            self_mention_token=self_mention_token,
+            command_text=command_text,
+            is_targeted=bool((activity.get("recipient") or {}).get("isTargeted")),
+        )
+
+    async def _dispatch_card_action(
+        self, activity: dict[str, Any], channel_id: str
+    ) -> dict[str, Any] | None:
+        """Someone pressed a button on a card this bridge posted.
+
+        Two buttons arrive here — an option on a request card, and the stop
+        control on a turn's status — and everything below is the same for
+        both, which is why they are read into one action and one value before
+        any of it.
+
+        Who pressed comes from `from`, which the Bot Connector fills in and the
+        button's data cannot: what travels in the button is which card and which
+        option, or which turn to stop, never who. So a press replayed from
+        another client is still attributed to whoever actually sent it, and the
+        identity check downstream is against a real account rather than a claim.
+
+        Which message comes from the activity too, and for the same reason.
+        Teams names the message the press was on in `replyToId`, and the
+        conversation and the region around it, which is the whole of a
+        publication's address — so the publication is found the way an edit
+        finds it rather than by trusting a reference the presser's client could
+        have carried anything in. What the button carried still has to resolve
+        against that same address downstream, so a token lifted from one card
+        cannot be pressed against another, and a stop stops the session behind
+        the status it was pressed on.
+
+        Every path out of here answers the press. Until it is answered the
+        button spins on the presser's client and then reports a failure of its
+        own, which is a worse account of what happened than any of these. What
+        the presser is shown is whatever the shared path left in `_PRESS_NOTICE`
+        through `tell_actor` — a refusal, or a stop's acceptance saying Switch
+        has asked the agent to stop — seen by them alone, which is the one thing
+        this platform can do that Telegram's alert and Slack's ephemeral also
+        do. An answer that landed leaves nothing, and is answered with nothing:
+        the card's own redraw is what says it was taken, and saying so here
+        would be saying it before the redraw that proves it.
+
+        Nothing here dedupes. Teams retries an invoke it got no answer for, and
+        the same press twice is the same option — or the same turn to stop — by
+        the same person, against the same revision, which the shared layer
+        derives one command id from. So the second is the first rather than a
+        second answer or a second interrupt.
+        """
+        press = read_press(activity.get("value") or {})
+        if press is None:
+            logger.warning(
+                "Ignoring a card action in channel %s: it is not a Switch press.",
+                channel_id,
+            )
+            return _invoke_error(400, "BadRequest", "This is not a Switch card action.")
+        if self._on_interaction is None:
+            logger.warning(
+                "A press on a Switch card in channel %s has nowhere to go: this "
+                "bridge handles no interactions, so the card should not have "
+                "been drawn with buttons.",
+                channel_id,
+            )
+            return _invoke_error(
+                500,
+                "InternalServerError",
+                "This card is not connected to anything that can act on it.",
+            )
+
+        action_id, value = press
+        card = self._pressed_card(activity)
+        if card is None:
+            logger.warning(
+                "Ignoring a press in channel %s: Teams named no message for it, "
+                "so there is no publication to match it against.",
+                channel_id,
+            )
+            return _invoke_error(
+                400, "BadRequest", "This press does not say which message it is on."
+            )
+
+        sender = activity.get("from") or {}
+        sender_id = str(sender.get("aadObjectId") or sender.get("id") or "")
+        sender_name = await self._sender_handle(
+            sender_id, str(sender.get("name") or "")
+        )
+
+        notices: list[str] = []
+        held = _PRESS_NOTICE.set(notices)
+        try:
+            await self._on_interaction(
+                InboundInteraction(
+                    channel_id=channel_id,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    action_id=action_id,
+                    value=value,
+                    message_ref=card,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to handle a press on a Teams card")
+            return _invoke_error(
+                500, "InternalServerError", "Something went wrong handling that press."
+            )
+        finally:
+            _PRESS_NOTICE.reset(held)
+        if notices:
+            return {"statusCode": 200, "type": _MESSAGE_RESPONSE, "value": notices[0]}
+        return None
+
+    def _pressed_card(self, activity: dict[str, Any]) -> str | None:
+        """The publication reference of the message a press was on.
+
+        Built from the invoke the same way `post_rich` built the one it handed
+        back: the region, the conversation, and the activity the press names.
+        Same three parts, so the string is the one the card or the status was
+        stored under and the cross-check downstream is an equality rather than a
+        reconstruction that has to be forgiven its differences.
+        """
+        service_url = str(activity.get("serviceUrl", "")).strip()
+        conversation_id = str((activity.get("conversation") or {}).get("id", ""))
+        activity_id = str(activity.get("replyToId") or "")
+        if not (service_url and conversation_id and activity_id):
+            return None
+        return _publication_ref(service_url, conversation_id, activity_id)
+
+    async def tell_actor(
+        self,
+        channel_id: str,
+        actor_ref: str,
+        actor_name: str,
+        thread_ref: str | None,
+        text: str,
+    ) -> None:
+        """Tell one person what came of what they pressed, where they alone see it.
+
+        A press is told in the answer to the press itself, which Teams shows to
+        whoever pressed and to nobody else — it costs the conversation nothing
+        and reaches them whether or not the bot has ever been able to message
+        them. It is left here for the press to carry rather than sent from here,
+        because the invoke it answers is not something this method can see.
+
+        A typed answer has no press to answer, so it falls back to the base:
+        said in the card's own post, where everyone reading it sees a notice
+        addressed to someone else. That is the platform's limit rather than a
+        choice — a Teams bot cannot say something to one member of a channel
+        unprompted.
+        """
+        notices = _PRESS_NOTICE.get()
+        if notices is not None:
+            notices.append(text)
+            return
+        await super().tell_actor(channel_id, actor_ref, actor_name, thread_ref, text)
+
+    def _command_in(self, probe: str, *, is_targeted: bool) -> str | None:
+        """The command this message runs, or None if it is ordinary text.
+
+        Two ways a command arrives, and both need a name Switch knows.
+
+        **Prefixed** — `!help`, or `/help`. The prefix alone used to be enough,
+        which meant any message opening with a slash was swallowed: paste a
+        path and you got "unknown command" instead of your message. Telegram
+        already guards against that; this is the same guard.
+
+        **Bare, on a targeted message** — Teams' `/` picker prepends the slash
+        itself and inserts the command's bare name, so `activity.text` is
+        `help`, not `/help`. That is why the slash-triggered list in the shipped
+        manifest declares titles without one, matching Microsoft's own samples.
+        A bare name is only read as a command when the message was targeted at
+        this bot: outside that, "help" in a channel is somebody talking.
+        """
+        if not probe:
+            return None
+        first = probe.split(None, 1)[0]
+        name = self._command_name(first)
+        if name in COMMANDS_BY_NAME:
+            # Known, however it was written: `!help`, `/help`, or the bare
+            # `help` the picker inserts.
+            return name if first[:1] in _COMMAND_PREFIXES or is_targeted else None
+        # Unknown. Whether that is worth answering depends on which prefix was
+        # used, because the two mean different things to a person.
+        #
+        # `!` is Switch's own and means nothing else, so `!list-agent` is a
+        # misspelt command and deserves to be told so.
+        #
+        # `/` is not Switch's — it opens paths, dates and fractions, and Teams
+        # delivers those as ordinary text. Reading every one as a command is
+        # how `/Users/ada/notes.md` came back "unknown command" instead of
+        # reaching an agent. So an unknown `/name` is left as what it looks
+        # like: a message.
+        return name if first.startswith("!") else None
+
+    async def _deliver(
+        self,
+        *,
+        channel_id: str,
+        channel_type: ChannelType,
+        sender_id: str,
+        sender_name: str,
+        text: str,
+        message_ref: str,
+        root_id: str | None,
+        channel_name: str | None,
+        self_mention_token: str | None = None,
+        command_text: str | None = None,
+        is_targeted: bool = False,
+    ) -> None:
+        """Route a parsed inbound message to the command or message callback.
+
+        Shared by the Bot Framework activity path and the Graph capture path so
+        both apply the same ``!``-command detection and translation.
+
+        ``command_text`` is the message with a leading bot @mention removed; it is
+        used only to detect and parse ``!``-commands (a channel command arrives as
+        ``@Bot !cmd``), while ``text`` — mention intact — is what a plain message
+        is bridged as. Defaults to ``text`` when the caller has nothing to strip."""
+        # The post this message sits in — itself, when it opened the post.
+        # Remembered so an untied reply lands under the question rather than
+        # starting a conversation of its own; see _post_to_answer_in.
+        await self._remember_post(
+            channel_id,
+            root_id or message_ref,
+            # The caller was told the type; do not re-derive it from the id.
+            is_channel=channel_type in ("channel_public", "channel_private"),
+        )
+        command_probe = (command_text if command_text is not None else text).strip()
+        command = self._command_in(command_probe, is_targeted=is_targeted)
+        if command is not None and self._on_command is not None:
+            parts = command_probe.split(None, 1)
+            await self._on_command(
+                InboundCommand(
+                    channel_id=channel_id,
+                    channel_type=channel_type,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    command=command,
+                    args=parts[1].strip() if len(parts) > 1 else "",
+                    message_ref=message_ref,
+                    root_id=root_id,
+                    channel_name=channel_name,
+                )
+            )
+            return
+
+        if self._on_message is not None:
+            await self._on_message(
+                InboundMessage(
+                    channel_id=channel_id,
+                    channel_type=channel_type,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    content=self.translate_inbound(text),
+                    message_ref=message_ref,
+                    root_id=root_id,
+                    channel_name=channel_name,
+                    self_mention_token=self_mention_token,
+                )
+            )
+
+    async def _dispatch_conversation_update(
+        self, activity: dict[str, Any], channel_id: str, chat_type: ChannelType | None
+    ) -> None:
+        members_added = activity.get("membersAdded") or []
+        if not members_added:
+            # Deletions, renames and departures don't need the type; skip the read.
+            return
+        channel_type = await self._inbound_channel_type(channel_id, chat_type)
+        recipient = activity.get("recipient") or {}
+        bot_id = str(recipient.get("id", ""))
+        channel_name = await self._resolve_channel_name(activity, channel_id)
+
+        for member in members_added:
+            member_id = str(member.get("id", ""))
+            if member_id == bot_id:
+                # The bot was added to a channel/team → start capturing all of
+                # its messages via a Graph subscription (channels only; chats are
+                # captured through the Bot Framework path).
+                team_id = self._team_of_channel.get(channel_id)
+                if self._me.shared and team_id:
+                    await self._switch_joined_team(team_id)
+                if channel_type in ("channel_public", "channel_private"):
+                    await self._ensure_channel_subscription(channel_id)
+                if self._on_app_joined is not None:
+                    await self._on_app_joined(
+                        InboundAppJoin(
+                            channel_id=channel_id,
+                            channel_type=channel_type,
+                            channel_name=channel_name,
+                        )
+                    )
+            elif self._on_user_joined is not None:
+                joiner_id = str(member.get("aadObjectId") or member_id)
+                await self._on_user_joined(
+                    InboundUserJoin(
+                        channel_id=channel_id,
+                        channel_type=channel_type,
+                        external_user_id=joiner_id,
+                        external_username=await self._sender_handle(
+                            joiner_id, str(member.get("name") or "")
+                        ),
+                        channel_name=channel_name,
+                    )
+                )
+
+    @staticmethod
+    def _channel_name(activity: dict[str, Any]) -> str | None:
+        """The channel's name as the activity gives it, if it gives it.
+
+        Prefer the channel's own name over the team's: the team's is the same
+        for every channel in it, which makes a poor room title. Teams omits
+        both more often than not — see `_resolve_channel_name`.
+        """
+        channel_data = activity.get("channelData") or {}
+        channel = channel_data.get("channel") or {}
+        team = channel_data.get("team") or {}
+        name = channel.get("name") or team.get("name")
+        return str(name) if name else None
+
+    async def _resolve_channel_name(
+        self, activity: dict[str, Any], channel_id: str
+    ) -> str | None:
+        """The channel's name, asking Graph when the activity does not say.
+
+        Without this the caller has nothing to name an auto-created room after
+        and falls back to the channel id, so a room ends up titled
+        `19:7641f9de326b4…` — in the room list, in the sidebar, and in every
+        session opened against it. Graph knows the name; one read per channel,
+        cached, is a cheap price for a room somebody can recognise.
+        """
+        name = self._channel_name(activity)
+        if name:
+            return name
+        cached = self._channel_names.get(channel_id)
+        if cached is not None:
+            return cached or None
+        if self._read_recently_failed(channel_id):
+            return None
+        await self._read_channel(channel_id)
+        return self._channel_names.get(channel_id) or None
+
+    async def _read_channel(self, channel_id: str) -> dict[str, Any] | None:
+        """Read a channel from Graph once and cache what the adapter needs.
+
+        Three things come off this call — the display name, without which a room
+        is titled after a `19:…` id; the conversation layout, which decides
+        whether an untied reply is steered into a post; and whether the channel
+        is private, which an activity never says. They are cached together
+        because they arrive together: asking twice would double the traffic for
+        nothing.
+
+        Returns None when the read could not be made or failed. A failure is
+        remembered so the read is not retried on every message, but only for
+        `_CHANNEL_READ_RETRY_AFTER` — a Graph blip, or a permission granted
+        minutes later, must not pin a channel to "nameless, posts layout" for
+        the life of the process. That is the same shape as the bug that made
+        capture die at a restart, and it is not worth repeating for a cheaper
+        symptom.
+        """
+        if not self._is_channel(channel_id):
+            return None
+        try:
+            return await self._fetch_channel(channel_id)
+        except Exception:
+            logger.warning(
+                "Could not read Teams channel %s; until this succeeds a room "
+                "created for it is named after its id and saved as private, and "
+                "replies there are threaded as if it used the posts layout",
+                channel_id,
+                exc_info=True,
+            )
+            self._channel_read_failed_at[channel_id] = time.monotonic()
+            return None
+
+    async def _fetch_channel(self, channel_id: str) -> dict[str, Any]:
+        """Read a channel from Graph and cache its privacy, name and layout;
+        raises on failure."""
+        if self._graph is None:
+            raise RuntimeError("Teams adapter not started")
+        team_id = self._team_of_channel.get(channel_id) or self._config.team_id
+        if not team_id:
+            raise BridgeOperationError(
+                f"Switch does not know which team Teams channel {channel_id} is "
+                "in. Add the Switch app to that team, or message the channel, so "
+                "Switch can learn it."
+            )
+        channel = await self._graph.get_channel(team_id=team_id, channel_id=channel_id)
+        channel_type = _channel_type_of(channel)
+        self._channel_read_failed_at.pop(channel_id, None)
+        self._channel_type[channel_id] = channel_type
+        self._channel_names[channel_id] = str(channel.get("displayName") or "")
+        self._channel_layouts[channel_id] = str(channel.get("layoutType") or "")
+        await self._report_channel_type(channel_id, channel_type)
+        return channel
+
+    async def _report_channel_type(
+        self, channel_id: str, channel_type: ChannelType
+    ) -> None:
+        """Pass a channel's type to the bridge to correct its saved rooms. A
+        failure is logged, not raised: the adapter still acts on the type, and
+        the room is corrected at the next startup refresh."""
+        if self._on_channel_type_learned is None:
+            return
+        try:
+            await self._on_channel_type_learned(channel_id, channel_type)
+        except Exception:
+            logger.warning(
+                "Could not record Teams channel %s as %s on its room",
+                channel_id,
+                channel_type,
+                exc_info=True,
+            )
+
+    def _read_recently_failed(self, channel_id: str) -> bool:
+        failed_at = self._channel_read_failed_at.get(channel_id)
+        if failed_at is None:
+            return False
+        if time.monotonic() - failed_at < _CHANNEL_READ_RETRY_AFTER:
+            return True
+        del self._channel_read_failed_at[channel_id]
+        return False
+
+    def _self_mention_token(self, activity: dict[str, Any]) -> str | None:
+        recipient = activity.get("recipient") or {}
+        bot_id = str(recipient.get("id", ""))
+        for entity in activity.get("entities") or []:
+            if entity.get("type") == "mention":
+                mentioned = entity.get("mentioned") or {}
+                if str(mentioned.get("id", "")) == bot_id:
+                    return bot_id
+        return None
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """Rewrite Teams ``<at>…</at>`` mention markup to ``@<name>`` text."""
+        return _render_mentions(text).strip()
+
+    @staticmethod
+    def _disclosed_attachment_note(descriptors: list[str]) -> str:
+        """A visible note naming inbound attachments that were not relayed.
+
+        Teams inbound file/image relay is not yet implemented; rather than drop
+        media silently (which would violate the fail-loud rule and mislead the
+        agent), we bridge the text and append this disclosure. Empty when there
+        is nothing to disclose."""
+        if not descriptors:
+            return ""
+        if len(descriptors) == 1:
+            return f"\n\n_📎 an attachment was not relayed: {descriptors[0]}_"
+        joined = ", ".join(descriptors)
+        return f"\n\n_📎 {len(descriptors)} attachments were not relayed: {joined}_"
+
+    @staticmethod
+    def _activity_attachment_descriptors(activity: dict[str, Any]) -> list[str]:
+        """Names of real file/image attachments on a Bot Framework activity.
+
+        Excludes ``text/*`` attachments, which carry the message's own HTML/text
+        body rather than a user-supplied file."""
+        out: list[str] = []
+        for att in activity.get("attachments") or []:
+            content_type = str(att.get("contentType", ""))
+            if content_type.startswith("text/"):
+                continue
+            name = str(att.get("name") or "").strip()
+            out.append(name or content_type or "attachment")
+        return out
+
+    @staticmethod
+    def _graph_attachment_descriptors(chat_message: dict[str, Any]) -> list[str]:
+        """Names of attachments + inline hosted images on a Graph chat message."""
+        out: list[str] = []
+        for att in chat_message.get("attachments") or []:
+            name = str(att.get("name") or "").strip()
+            content_type = str(att.get("contentType", ""))
+            out.append(name or content_type or "attachment")
+        hosted = chat_message.get("hostedContents") or []
+        if hosted:
+            out.append(f"{len(hosted)} inline image(s)")
+        return out
+
+    # ── Graph capture (subscriptions + notifications) ────────────────────────
+
+    @staticmethod
+    def _expiration_iso() -> str:
+        expiry = datetime.now(UTC) + _SUBSCRIPTION_TTL
+        return expiry.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _channel_from_resource(resource: str) -> str:
+        """Extract the channel id from a subscription's ``resource`` string
+        (``teams/{team}/channels/{channel}/messages``)."""
+        match = re.search(r"channels/([^/]+)/messages", resource)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _team_from_resource(resource: str) -> str:
+        """The team id in a subscription's ``resource`` string."""
+        match = re.match(r"teams/([^/]+)/channels/", resource)
+        return match.group(1) if match else ""
+
+    async def _ensure_channel_subscription(self, channel_id: str) -> None:
+        """Create a Graph change-notification subscription for a channel's
+        messages, so the bridge captures every post — not just @mentions.
+
+        Requires the encryption certificate + private key (Graph encrypts the
+        message body) and the channel's team id. A missing prerequisite is a
+        loud log, not a crash: the bot still joins, capture is simply degraded.
+
+        Wanted before it is checked for, so a channel whose subscription was
+        adopted at start, and later lost, is still one the repair loop owes.
+
+        A quiet copy hands the channel, and the team it knows it is in, to the
+        process holding the bridge, which makes the subscription.
+        """
+        if not self._listening:
+            self._hand_to_holder(
+                {
+                    "action": "capture",
+                    "channel_id": channel_id,
+                    "team_id": self._capture_team(channel_id) or "",
+                }
+            )
+            return
+        self._capture_wanted.add(channel_id)
+        if self._graph is None or self._withdrawing:
+            return
+        identity = self._me
+        team_id = self._capture_team(channel_id)
+        if identity.shared and team_id:
+            in_team = await self._switch_in_team(team_id)
+            if in_team is False:
+                await self._park_capture(channel_id, team_id)
+                return
+            if in_team is None and channel_id not in self._subscriptions:
+                self._note_capture_failure(
+                    channel_id, f"could not check that Switch is in team {team_id}"
+                )
+                return
+        if channel_id in self._subscriptions:
+            return
+        keyring = identity.keyring
+        if keyring is None:
+            self._note_capture_failure(
+                channel_id,
+                "encryption certificate not configured on the Teams bridge",
+            )
+            return
+        if not team_id:
+            self._note_capture_failure(channel_id, "team id unknown")
+            return
+
+        async with self._sub_lock:
+            if not self._adopted:
+                await self._adopt_existing_subscriptions()
+                if not self._adopted:
+                    self._note_capture_failure(
+                        channel_id,
+                        "the subscriptions Graph already holds could not be read",
+                    )
+                    return
+            if channel_id in self._subscriptions or self._withdrawing:
+                return
+            try:
+                sub = await self._graph.create_subscription(
+                    resource=f"teams/{team_id}/channels/{channel_id}/messages",
+                    notification_url=identity.notification_url,
+                    lifecycle_notification_url=identity.notification_url,
+                    client_state=identity.client_state,
+                    expiration_iso=self._expiration_iso(),
+                    encryption_certificate=keyring.certificate_der_b64,
+                    encryption_certificate_id=keyring.certificate_id,
+                )
+            except Exception as exc:
+                self._note_capture_failure(channel_id, f"{type(exc).__name__}: {exc}")
+                return
+            self._subscriptions[channel_id] = str(sub.get("id", ""))
+            self._subscription_team[channel_id] = team_id
+            expiry = _parse_graph_time(sub.get("expirationDateTime"))
+            if expiry is not None:
+                self._subscription_expiry[channel_id] = expiry
+            recovered = self._capture_failures.pop(channel_id, None) is not None
+            logger.info(
+                "%s Teams channel %s messages (subscription %s)",
+                "Capture recovered for" if recovered else "Subscribed to",
+                channel_id,
+                self._subscriptions[channel_id],
+            )
+
+    def _note_capture_failure(self, channel_id: str, summary: str) -> None:
+        """Record that a channel still has no capture, logging without repeating.
+
+        ``_repair_loop`` retries for as long as the bridge runs, so a channel
+        that can never be subscribed would otherwise write the same error
+        forever. The first failure is logged in full; after that only a *change*
+        in what Graph says is worth a line, and it is worth a lot — a 403
+        turning into a 400 is a permission problem turning into an unreachable
+        endpoint, which is the one thing a reader needs to know.
+        """
+        previous = self._capture_failures.get(channel_id)
+        self._capture_failures[channel_id] = summary
+        if previous is None:
+            logger.error(
+                "Failed to create Graph subscription for channel %s (%s); "
+                "capture is degraded and will be retried",
+                channel_id,
+                summary,
+            )
+        elif previous != summary:
+            logger.warning(
+                "Graph subscription for channel %s is still failing, now with: %s",
+                channel_id,
+                summary,
+            )
+        else:
+            logger.debug(
+                "Graph subscription for channel %s still failing: %s",
+                channel_id,
+                summary,
+            )
+
+    async def _repair_loop(self) -> None:
+        """Keep retrying channels that should be captured and are not.
+
+        A subscription can fail for reasons that pass on their own, and the two
+        that bite are both startup: Graph validates the notification URL by
+        calling it, which a load balancer will refuse for the first minute or so
+        after a new pod starts, and an app's Graph roles are fixed when its token
+        is issued, so consent granted while the bridge is running is invisible
+        until the token is replaced. Both used to leave capture dead until
+        someone restarted the process — and a restart is what caused the first
+        one, so it could just as easily fail again.
+
+        Backs off while a channel keeps failing so a genuinely broken one does
+        not hammer Graph, and returns to the short interval as soon as something
+        succeeds.
+        """
+        delay = _REPAIR_MIN_INTERVAL_SECONDS
+        while True:
+            await asyncio.sleep(delay)
+            try:
+                await self._recheck_teams()
+            except Exception:
+                logger.exception("Teams team membership recheck failed this round")
+            missing = [c for c in self._capture_wanted if c not in self._subscriptions]
+            if not missing:
+                delay = _REPAIR_MIN_INTERVAL_SECONDS
+                continue
+            try:
+                for channel_id in missing:
+                    await self._ensure_channel_subscription(channel_id)
+            except Exception:
+                logger.exception("Teams capture repair failed this round")
+            if any(c not in self._subscriptions for c in missing):
+                delay = min(delay * 2, _REPAIR_MAX_INTERVAL_SECONDS)
+            else:
+                delay = _REPAIR_MIN_INTERVAL_SECONDS
+
+    async def _handle_http_notifications(self, request: web.Request) -> web.Response:
+        # Subscription-creation handshake: Graph calls the endpoint with a
+        # ``validationToken`` that must be echoed back verbatim as text/plain.
+        validation_token = request.query.get("validationToken")
+        if validation_token is not None:
+            return web.Response(
+                status=200, text=validation_token, content_type="text/plain"
+            )
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.Response(status=400, text="invalid json")
+
+        for item in payload.get("value", []):
+            try:
+                await self.receive_notification(item)
+            except Exception:
+                logger.exception("Failed to handle Graph change notification")
+
+        return web.Response(status=202)
+
+    async def receive_notification(self, item: dict[str, Any]) -> None:
+        """Handle one Graph change notification addressed to this bridge.
+
+        The one entry point for notifications, whichever way they arrived. On
+        the distributed app the deployment's route has already checked Graph's
+        validation tokens and routed the item by the organisation they vouch
+        for; what is checked here holds either way — the organisation's own
+        `clientState`, and that the subscription is one this bridge made (on
+        a quiet copy, a removal is left for the holder to check).
+        """
+        # Authenticate origin BEFORE acting on anything — data notifications and
+        # lifecycle events alike. clientState is the bring-your-own bridge's only
+        # origin control (the encryption proves integrity, not origin), so an
+        # unverified lifecycle event (e.g. a forged reauthorizationRequired)
+        # must not be honoured.
+        identity = self._me
+        # Load-bearing on the distributed app: a batch of lifecycle
+        # notifications carries no validation tokens, so the deployment's
+        # route lets it through on the organisation it names, and these two
+        # checks are all that stand between a forged one and a renewal or a
+        # recreated subscription.
+        if not identity.accepts_client_state(item.get("clientState")):
+            logger.warning("Rejected Graph notification: clientState mismatch")
+            return
+        subscription_id = str(item.get("subscriptionId", ""))
+        # A quiet copy relays a removal to the holder without first knowing
+        # the subscription. It adopts none at start, and Graph no longer lists
+        # one it has removed, so reading them again cannot find it either: the
+        # check would refuse every removal that reached this process, and the
+        # holder would leave capture off until its repair loop noticed. The
+        # holder recreates only a subscription it holds, so it decides.
+        relays_removal = (
+            not self._listening and item.get("lifecycleEvent") == "subscriptionRemoved"
+        )
+        if (
+            identity.shared
+            and not relays_removal
+            and not await self._knows_subscription(subscription_id)
+        ):
+            logger.warning(
+                "Rejected a Graph notification for subscription %s, which the "
+                "bridge for organisation %s did not make%s",
+                subscription_id,
+                identity.org_tenant_id,
+                ""
+                if self._adopted
+                else " — as far as it can tell: the subscriptions Graph holds "
+                "could not be read",
+            )
+            return
+
+        if item.get("lifecycleEvent"):
+            await self._handle_lifecycle_event(item)
+            return
+
+        encrypted = item.get("encryptedContent")
+        if not encrypted:
+            return
+        if identity.keyring is None:
+            logger.error(
+                "Received encrypted Graph notification but no private key is "
+                "configured to decrypt it"
+            )
+            return
+
+        chat_message = identity.keyring.decrypt(encrypted)
+        await self._deliver_graph_message(chat_message)
+
+    def _owns_subscription(self, subscription_id: str) -> bool:
+        return bool(subscription_id) and subscription_id in self._subscriptions.values()
+
+    async def _knows_subscription(self, subscription_id: str) -> bool:
+        """Whether a notification's subscription is one this bridge made.
+
+        Until the subscriptions Graph holds have been read once, every one of
+        them is unknown — and the notifications they deliver have already been
+        answered, so they would be lost until the repair loop next reads them.
+        An unknown one is a reason to read them now.
+        """
+        # A quiet copy reads them again for one it does not know, cooldown
+        # permitting: the holder may have made it since this copy last read.
+        if self._owns_subscription(subscription_id) or (
+            self._adopted and self._listening
+        ):
+            return self._owns_subscription(subscription_id)
+        async with self._sub_lock:
+            now = time.monotonic()
+            due = (
+                self._adopt_on_demand_at is None
+                or now - self._adopt_on_demand_at >= _ADOPT_ON_DEMAND_COOLDOWN_SECONDS
+            )
+            if (not self._adopted or not self._listening) and due:
+                # Spaced out, so a run of unknown ones — Graph failing, or
+                # someone holding the organisation's clientState — is not one
+                # listing each.
+                self._adopt_on_demand_at = now
+                await self._adopt_existing_subscriptions()
+        return self._owns_subscription(subscription_id)
+
+    async def _handle_lifecycle_event(self, item: dict[str, Any]) -> None:
+        event = item.get("lifecycleEvent")
+        subscription_id = str(item.get("subscriptionId", ""))
+        if not self._listening:
+            self._hand_to_holder(
+                {
+                    "action": "lifecycle",
+                    "event": str(event),
+                    "subscription_id": subscription_id,
+                }
+            )
+            return
+        if event == "reauthorizationRequired":
+            await self._renew_subscription(
+                self._channel_of_subscription(subscription_id), subscription_id
+            )
+        elif event == "subscriptionRemoved":
+            # Graph dropped the subscription (e.g. a transient permission/quota
+            # issue). Recreate it rather than only logging — otherwise channel
+            # capture silently lapses until the next full restart.
+            await self._recreate_removed_subscription(subscription_id)
+        else:
+            logger.info(
+                "Teams subscription %s lifecycle event: %s",
+                subscription_id,
+                event,
+            )
+
+    async def receive_relayed(self, request: Mapping[str, str]) -> None:
+        """What a quiet copy in another process relayed here, the holder:
+        each the same call the quiet copy would have made had it held the
+        bridge. Checked there as it would have been here: the activity's
+        token, or the notification's `clientState` and subscription."""
+        action = request.get("action")
+        if action == "capture":
+            channel_id = request["channel_id"]
+            team_id = request.get("team_id")
+            if team_id:
+                await self._learn_channel_team(channel_id, team_id)
+            await self._ensure_channel_subscription(channel_id)
+        elif action == "team_joined":
+            await self._switch_joined_team(request["team_id"])
+        elif action == "team_left":
+            await self._switch_left_team(request["team_id"])
+        elif action == "lifecycle":
+            await self._handle_lifecycle_event(
+                {
+                    "lifecycleEvent": request["event"],
+                    "subscriptionId": request["subscription_id"],
+                }
+            )
+        else:
+            logger.warning("Ignoring a relayed Teams request %r", request)
+
+    def _channel_of_subscription(self, subscription_id: str) -> str | None:
+        return next(
+            (c for c, s in self._subscriptions.items() if s == subscription_id),
+            None,
+        )
+
+    async def _recreate_removed_subscription(self, subscription_id: str) -> None:
+        channel_id = self._channel_of_subscription(subscription_id)
+        if channel_id is None:
+            logger.info(
+                "Teams subscriptionRemoved for unknown subscription %s; ignoring",
+                subscription_id,
+            )
+            return
+        logger.warning(
+            "Teams subscription %s for channel %s was removed; recreating",
+            subscription_id,
+            channel_id,
+        )
+        # Drop the dead mapping so _ensure_channel_subscription rebuilds it.
+        self._forget_subscription(channel_id)
+        await self._ensure_channel_subscription(channel_id)
+
+    async def _deliver_graph_message(self, chat_message: dict[str, Any]) -> None:
+        if chat_message.get("messageType", "message") != "message":
+            return
+
+        message_id = str(chat_message.get("id", ""))
+        if self._seen_activity(message_id):
+            return
+
+        sender = chat_message.get("from") or {}
+        application = sender.get("application") or {}
+        if application:
+            # Drop our own bot's posts (they are captured too) to avoid a loop.
+            if str(application.get("id", "")) == self._me.app_id:
+                return
+            sender_id = str(application.get("id", ""))
+            sender_name = str(application.get("displayName") or sender_id)
+        else:
+            user = sender.get("user") or {}
+            sender_id = str(user.get("id", ""))
+            sender_name = await self._sender_handle(
+                sender_id, str(user.get("displayName") or "")
+            )
+
+        identity = chat_message.get("channelIdentity") or {}
+        channel_id = str(identity.get("channelId", ""))
+        if not channel_id:
+            return
+
+        body = chat_message.get("body") or {}
+        raw_content = str(body.get("content", ""))
+        is_html = str(body.get("contentType", "")).lower() == "html"
+        content = self._graph_text(raw_content) if is_html else raw_content
+        content += self._disclosed_attachment_note(
+            self._graph_attachment_descriptors(chat_message)
+        )
+
+        self_mention_token = self._graph_self_mention_token(chat_message)
+        if self_mention_token is not None:
+            stripped = _strip_leading_mention(raw_content)
+            command_text = self._graph_text(stripped) if is_html else stripped
+        else:
+            command_text = content
+
+        reply_to = chat_message.get("replyToId")
+        root_id = str(reply_to) if reply_to and str(reply_to) != message_id else None
+
+        await self._deliver(
+            channel_id=channel_id,
+            channel_type=await self._inbound_channel_type(channel_id, None),
+            sender_id=sender_id,
+            sender_name=sender_name,
+            text=content,
+            message_ref=message_id,
+            root_id=root_id,
+            channel_name=None,
+            self_mention_token=self_mention_token,
+            command_text=command_text,
+        )
+
+    def _graph_self_mention_token(self, chat_message: dict[str, Any]) -> str | None:
+        """Return a truthy token when a Graph channel message @mentions our bot.
+
+        Graph carries mentions in ``chat_message["mentions"]``; a bot mention is
+        one whose ``mentioned.application.id`` matches our app id. Mirrors the
+        Bot Framework path's ``_self_mention_token`` so both capture paths flag a
+        bot mention identically."""
+        app_id = self._me.app_id
+        for mention in chat_message.get("mentions") or []:
+            mentioned = mention.get("mentioned") or {}
+            application = mentioned.get("application") or {}
+            if str(application.get("id", "")) == app_id:
+                return app_id
+        return None
+
+    @staticmethod
+    def _graph_text(content: str) -> str:
+        """Flatten a Graph channel message's HTML body to plain text."""
+        text = _BR_TAG.sub("\n", content)
+        text = _render_mentions(text)
+        text = _HTML_TAG.sub("", text)
+        return html.unescape(text).strip()

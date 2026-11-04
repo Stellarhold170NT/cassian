@@ -1,0 +1,430 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import logging
+import re
+import time
+from contextlib import AbstractContextManager, nullcontext
+from typing import Annotated, Any
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+import httpx
+from authlib.integrations.starlette_client import OAuth, OAuthError
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from starlette.responses import JSONResponse, RedirectResponse
+
+from switch_core.config import SwitchConfig
+from switch_core.db.models import TENANT_ZERO_ID, User
+from switch_core.db.stores.user_store import (
+    OidcIdentityConflictError,
+    OidcIdentityRaceError,
+    UserStore,
+)
+from switch_core.gateway.auth import initial_tenant_claim, set_session_cookie
+from switch_core.gateway.dependencies import (
+    get_config,
+    get_session_factory,
+    get_system_session,
+    get_user_store,
+)
+from switch_core.tenant_context import tenant_scope
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+# Module-level OAuth registry. The single gateway client is registered once at
+# app construction (see register_oidc_client) when OIDC is configured.
+oauth = OAuth()
+_CLIENT_NAME = "gateway_oidc"
+
+# Marks the second leg of the hop to the callback's host (`_callback_host_hop`),
+# so a proxy that rewrites the Host header costs one redirect and not a loop.
+_ON_CALLBACK_HOST = "on_callback_host"
+
+
+def register_oidc_client(config: SwitchConfig) -> None:
+    """Register the gateway OIDC client from config.
+
+    Endpoints (authorize / token / jwks / issuer) are discovered from the
+    provider's well-known metadata, so this works against any standards
+    compliant IdP (Okta, Keycloak, Auth0, …) — bring-your-own.
+    """
+    oauth.register(
+        name=_CLIENT_NAME,
+        server_metadata_url=config.gateway_oidc_metadata_url,
+        client_id=config.gateway_oidc_client_id,
+        client_secret=config.gateway_oidc_client_secret,
+        client_kwargs={"scope": config.gateway_oidc_scopes},
+    )
+
+
+def _client() -> Any:
+    # authlib is untyped here; the returned StarletteOAuth2App exposes
+    # authorize_redirect / authorize_access_token / userinfo.
+    client = oauth.create_client(_CLIENT_NAME)
+    if client is None:
+        raise HTTPException(status_code=404, detail="OIDC login is not configured")
+    return client
+
+
+def _callback_host_hop(request: Request, redirect_url: str | None) -> str | None:
+    """Where to restart a sign-in begun on another host than the callback's.
+
+    The flow's state is kept in a cookie on the host the browser starts on, and
+    the identity provider returns the browser to `redirect_url`. A server that
+    answers on two hosts, its own serving the dashboard beside a separate
+    dashboard host the provider still returns to, would lose the state on the
+    way back. Hostnames only: a cookie is shared across ports, and a proxy may
+    drop the port from the Host header. None to start the flow here.
+    """
+    if not redirect_url:
+        return None
+    callback = urlsplit(redirect_url)
+    if callback.hostname == request.url.hostname:
+        return None
+    if request.query_params.get(_ON_CALLBACK_HOST):
+        logger.warning(
+            "OIDC login reached %s after being sent to %s, the host the identity "
+            "provider returns to; a proxy may be rewriting the Host header. "
+            "Starting the sign-in here, where it may lose its state on return.",
+            request.url.hostname,
+            callback.hostname,
+        )
+        return None
+    # The sign-in's own parameters go with it: a sign-in option, or the
+    # hand-back to an app on this computer, starts over there unchanged.
+    query = [
+        (key, value)
+        for key, value in request.query_params.multi_items()
+        if key != _ON_CALLBACK_HOST
+    ]
+    query.append((_ON_CALLBACK_HOST, "1"))
+    return urlunsplit(
+        (
+            callback.scheme,
+            callback.netloc,
+            request.url_for("oidc_login").path,
+            urlencode(query),
+            "",
+        )
+    )
+
+
+# ── Handing a sign-in back to an app on this computer ────────────────────────
+#
+# Switch Console signs in through the system browser: it listens on the
+# loopback address, opens `/auth/oidc/login` with `return_to` pointing there,
+# and the browser comes back to it with a one-time code instead of a session
+# cookie the app could not read. The code is only good with the verifier the
+# app kept to itself (its SHA-256 is the `challenge` it sent), and only for a
+# couple of minutes, so a code seen by anything else on the way is useless.
+
+_HANDOFF_SESSION_KEY = "oidc_handoff"
+_HANDOFF_PATH = "/switch-sign-in"
+_HANDOFF_TTL_SECONDS = 120
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost"})
+_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
+_CHALLENGE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_VERIFIER = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+
+
+def _loopback_return_to(value: str) -> str:
+    """`value` if it is the app's loopback listener, else a refusal: the code
+    goes only to this computer, never to an address someone else chose."""
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        port = None
+        parts = None
+    if (
+        parts is None
+        or parts.scheme != "http"
+        or parts.hostname not in _LOOPBACK_HOSTS
+        or port is None
+        or parts.username is not None
+        or parts.password is not None
+        or parts.path != _HANDOFF_PATH
+        or parts.query
+        or parts.fragment
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"return_to must be http://127.0.0.1:<port>{_HANDOFF_PATH}",
+        )
+    return value
+
+
+def _challenge_of(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+
+
+@router.get("/auth/oidc/login", name="oidc_login")
+async def oidc_login(
+    request: Request,
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    provider: str | None = None,
+    return_to: str | None = None,
+    state: str | None = None,
+    challenge: str | None = None,
+):
+    """Start a sign-in. `provider` picks one of the configured login options;
+    `return_to`, `state` and `challenge` together hand the result back to an
+    app on this computer rather than setting a cookie in this browser."""
+    if not config.gateway_oidc_enabled:
+        raise HTTPException(status_code=404, detail="OIDC login is not configured")
+    client = _client()
+    hop = _callback_host_hop(request, config.gateway_oidc_redirect_url)
+    if hop is not None:
+        return RedirectResponse(url=hop, status_code=302)
+    params: dict[str, str] = {}
+    if provider is not None:
+        option = next(
+            (o for o in config.gateway_oidc_login_options if o.id == provider), None
+        )
+        if option is None:
+            raise HTTPException(
+                status_code=400, detail=f"Unknown sign-in option: {provider}"
+            )
+        params = dict(option.params)
+    handoff = (return_to, state, challenge)
+    if any(part is not None for part in handoff):
+        if return_to is None or state is None or challenge is None:
+            raise HTTPException(
+                status_code=400,
+                detail="return_to, state and challenge are given together",
+            )
+        if not _TOKEN.match(state) or not _CHALLENGE.match(challenge):
+            raise HTTPException(status_code=400, detail="Malformed state or challenge")
+        request.session[_HANDOFF_SESSION_KEY] = {
+            "return_to": _loopback_return_to(return_to),
+            "state": state,
+            "challenge": challenge,
+        }
+    else:
+        request.session.pop(_HANDOFF_SESSION_KEY, None)
+    # The redirect URI must exactly match the one registered with the IdP.
+    # Behind a reverse proxy / Tailscale the request URL's scheme+host can't be
+    # trusted, so prefer the explicitly configured value.
+    redirect_uri = config.gateway_oidc_redirect_url or str(
+        request.url_for("oidc_callback")
+    )
+    return await client.authorize_redirect(request, redirect_uri, **params)
+
+
+@router.get("/auth/oidc/callback", name="oidc_callback")
+async def oidc_callback(
+    request: Request,
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    session: Annotated[AsyncSession, Depends(get_system_session)],
+    session_factory: Annotated[
+        async_sessionmaker[AsyncSession], Depends(get_session_factory)
+    ],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+) -> RedirectResponse:
+    # `get_system_session`: nobody is signed in yet, so there is no principal
+    # to take a tenant from — the tenant this route writes into is chosen
+    # below, deliberately.
+    if not config.gateway_oidc_enabled:
+        raise HTTPException(status_code=404, detail="OIDC login is not configured")
+    client = _client()
+    try:
+        # Server-side code→token exchange + id_token signature/nonce/aud
+        # validation against the discovered JWKS.
+        token = await client.authorize_access_token(request)
+    except OAuthError as exc:
+        logger.warning("OIDC callback failed: %s", exc)
+        raise HTTPException(status_code=401, detail="OIDC authentication failed")
+
+    claims = token.get("userinfo")
+    if not claims:
+        try:
+            claims = await client.userinfo(token=token)
+        except KeyError as exc:
+            # authlib's userinfo() looks up metadata["userinfo_endpoint"],
+            # which OIDC discovery makes optional. We only reach this call
+            # because token["userinfo"] was falsy, which authlib sets only
+            # when both an id_token and the stored nonce were present — so
+            # that can mean no id_token came back, or one did but the nonce
+            # didn't match. Either way, a provider that also has no
+            # userinfo_endpoint leaves no way to read claims at all — a
+            # configuration mistake (the wrong issuer for this deployment),
+            # not a transient upstream fault, so retrying won't help. Not a
+            # 500: that's for something unanticipated, and this is diagnosed
+            # precisely enough to name.
+            logger.error(
+                "OIDC callback failed: the provider published no "
+                "userinfo_endpoint and no claims were available from the "
+                "token, so there is nowhere to read claims from (%s)",
+                exc,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "OIDC provider has no userinfo endpoint and no claims "
+                    "were available from the token"
+                ),
+            ) from exc
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            # A non-2xx response, a transport failure (timeout, connection
+            # refused), or a 200 whose body isn't JSON (a proxy or captive
+            # portal in front of the provider) — the provider's fault, not
+            # the caller's.
+            logger.error("OIDC userinfo request failed: %s", exc)
+            raise HTTPException(
+                status_code=502, detail="OIDC provider did not respond"
+            ) from exc
+    email = claims.get("email")
+    sub = claims.get("sub")
+    if not email or not sub:
+        logger.error("OIDC claims missing email/sub (got %s)", sorted(claims))
+        raise HTTPException(
+            status_code=401, detail="OIDC token missing email or sub claim"
+        )
+    # Provisioning trusts the email, so an unverified (attacker-set) one must
+    # not be accepted — unless the deployment vouches for its IdP's addresses.
+    email_verified = claims.get("email_verified")
+    verified = email_verified is True or str(email_verified).lower() == "true"
+    if not verified:
+        if config.gateway_oidc_require_email_verified:
+            logger.warning(
+                "OIDC login rejected: email_verified=%r (sub %s). If this IdP's "
+                "addresses are authoritative, set "
+                "GATEWAY_OIDC_REQUIRE_EMAIL_VERIFIED=false.",
+                email_verified,
+                sub,
+            )
+            raise HTTPException(status_code=401, detail="OIDC email is not verified")
+        logger.warning(
+            "OIDC email_verified=%r accepted (sub %s): the email claim is trusted "
+            "because GATEWAY_OIDC_REQUIRE_EMAIL_VERIFIED is false.",
+            email_verified,
+            sub,
+        )
+    name = claims.get("name") or email.split("@")[0]
+
+    # A returning identity is looked up on the immutable issuer+subject, never
+    # the mutable email; email only decides which account a *new* identity
+    # lands in, and only once it's verified (see get_or_create_oidc_user).
+    iss = claims.get("iss") or config.gateway_oidc_issuer_url
+    if not iss:
+        raise HTTPException(status_code=401, detail="OIDC token missing issuer")
+    # A first sign-in provisions the account just in time. Where it lands is
+    # `gateway_signup_mode`'s decision. Under "default_tenant" it joins tenant
+    # zero, named here rather than left to `TenantScoped`'s fallback, which
+    # would produce the same row by accident rather than by decision. Under
+    # the self-service modes it joins nothing: `users` and `oidc_identities`
+    # are global, so provisioning needs no tenant bound, and the newcomer is
+    # sent to onboarding to create a workspace or accept an invitation.
+    join_tenant = config.gateway_signup_mode == "default_tenant"
+    scope: AbstractContextManager[None] = (
+        tenant_scope(TENANT_ZERO_ID) if join_tenant else nullcontext()
+    )
+    with scope:
+        try:
+            user = await user_store.get_or_create_oidc_user(
+                session,
+                iss=iss,
+                email=email,
+                name=name,
+                sub=sub,
+                email_verified=verified,
+                join_tenant=join_tenant,
+            )
+        except OidcIdentityConflictError as exc:
+            logger.warning("OIDC identity conflict: %s", exc)
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OidcIdentityRaceError as exc:
+            # Transient contention, not a rejected security decision (see the
+            # exception's docstring) — 503 so an operator's dashboards can tell
+            # this apart from the 409s above rather than lumping a retry storm
+            # in with attack signal.
+            logger.warning("OIDC identity resolution raced: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Login is temporarily contended, please try again",
+                headers={"Retry-After": "1"},
+            ) from exc
+        await session.commit()
+
+    # Verify-at-login only: we don't persist the IdP tokens.
+    handoff = request.session.pop(_HANDOFF_SESSION_KEY, None)
+    if isinstance(handoff, dict):
+        # The app on this computer that started the sign-in takes it from
+        # here: the browser goes back to it with a code, and no cookie.
+        code = config.keyring.encrypt(
+            json.dumps(
+                {
+                    "user_id": user.id,
+                    "challenge": handoff["challenge"],
+                    "exp": int(time.time()) + _HANDOFF_TTL_SECONDS,
+                }
+            )
+        )
+        query = urlencode({"code": code, "state": handoff["state"]})
+        return RedirectResponse(url=f"{handoff['return_to']}?{query}", status_code=303)
+    # Land the browser back on the SPA with our own session cookie set: on this
+    # host, where the cookie is, unless FRONTEND_BASE_URL names the dashboard's
+    # origin. Not `dashboard_base_url`, whose default is the server's public
+    # origin, which on a split deployment is not the host the provider
+    # returned to.
+    response = RedirectResponse(url=config.frontend_base_url or "/", status_code=303)
+    set_session_cookie(
+        response,
+        user,
+        config.keyring,
+        config.gateway_cookie_secure,
+        await initial_tenant_claim(session_factory, user_store, user),
+    )
+    return response
+
+
+class HandoffExchange(BaseModel):
+    code: str
+    verifier: str
+
+
+@router.post("/auth/oidc/exchange")
+async def oidc_exchange(
+    req: HandoffExchange,
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    session: Annotated[AsyncSession, Depends(get_system_session)],
+    session_factory: Annotated[
+        async_sessionmaker[AsyncSession], Depends(get_session_factory)
+    ],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+) -> JSONResponse:
+    """Trade a code a sign-in handed back to this computer for a session:
+    only with the verifier its challenge was made from, and only while fresh."""
+    refused = HTTPException(status_code=400, detail="The sign-in code is not valid")
+    if len(req.code) > 4096 or not _VERIFIER.match(req.verifier):
+        raise refused
+    try:
+        payload = json.loads(config.keyring.decrypt(req.code))
+    except Exception as exc:
+        raise refused from exc
+    if not isinstance(payload, dict) or int(payload.get("exp", 0)) < int(time.time()):
+        raise refused
+    if not hmac.compare_digest(
+        str(payload.get("challenge", "")), _challenge_of(req.verifier)
+    ):
+        raise refused
+    user = await session.get(User, str(payload.get("user_id", "")))
+    if user is None:
+        raise refused
+    response = JSONResponse({"ok": True})
+    set_session_cookie(
+        response,
+        user,
+        config.keyring,
+        config.gateway_cookie_secure,
+        await initial_tenant_claim(session_factory, user_store, user),
+    )
+    return response

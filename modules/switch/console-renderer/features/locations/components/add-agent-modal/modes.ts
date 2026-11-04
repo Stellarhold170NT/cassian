@@ -1,0 +1,157 @@
+import { useCallback, useEffect, useState } from 'react';
+import { useThirdPartyAvatarsEnabled } from '@renderer/lib/stores/use-avatar-settings';
+import { isThirdPartyAvatarUrl, randomAgentAvatarUrl } from '@shared/core/agents/agent-avatar';
+import { AGENT_NAME_PATTERN, slugifyAgentNamePart } from '@shared/core/agents/agent-slug';
+import { NEW_AGENT_PERMISSIONS } from '@shared/core/agents/agents';
+import type { AgentProviderId } from '@shared/core/providers/agent-provider-registry';
+import { defaultAgentPolicy } from '@shared/core/switch-servers/owner-policy';
+import type { AddressingPolicy } from '@shared/core/switch-servers/switch-servers';
+
+export function usePickMode() {
+  const [path, setPath] = useState('');
+  const [serverId, setServerId] = useState<string | null>(null);
+  const [providerId, setProviderId] = useState<AgentProviderId | null>(null);
+
+  return {
+    path,
+    handlePathChange: setPath,
+    serverId,
+    setServerId,
+    providerId,
+    setProviderId,
+  };
+}
+
+export type PickModeState = ReturnType<typeof usePickMode>;
+
+/**
+ * Form state for creating a brand-new Switch agent in a directory. Collects the
+ * Switch agent name and description (advanced definition attributes are gathered
+ * separately in the Advanced section). Switch Console always registers the agent
+ * as a managed, session-addressable identity — there is no run-mode or
+ * notify-handle choice (CHOO-1440).
+ *
+ * Neither field is derived from the working directory. The name is how the
+ * agent is addressed in rooms and the description is what other people read to
+ * know what it is for; a directory basename answers neither question, and
+ * rewriting both when the directory changed moved text the user had already
+ * looked at and accepted.
+ *
+ * One instance serves both run locations. There used to be two — one for a
+ * local agent, one for a remote one — and switching between them swapped which
+ * was on screen, so the name and description the user had typed vanished.
+ */
+export function useConfigureAgentForm(serverId: string | null) {
+  const [agentName, setAgentNameFolded] = useState('');
+  // What was typed, before the identifier folded it to lowercase. The slug
+  // offer hands this back as the display name, so the capitals in a typed
+  // "Switch Dev" outlive an identifier that cannot hold them.
+  const [typedName, setTypedName] = useState('');
+  // The label chat platforms render the agent under. Optional: an agent with
+  // none is shown under its identifier.
+  const [displayName, setDisplayNameRaw] = useState('');
+  const [displayNameTouched, setDisplayNameTouched] = useState(false);
+  const [description, setDescription] = useState('');
+  // What the agent is for, in its own words (CHOO-2228). Optional: an agent
+  // with none runs on its provider's defaults, and the description stands in
+  // where a provider needs a prompt.
+  const [instructions, setInstructions] = useState('');
+  const [autoApprove, setAutoApprove] = useState<boolean>(NEW_AGENT_PERMISSIONS.autoApprove);
+  const [autoMode, setAutoMode] = useState<boolean>(NEW_AGENT_PERMISSIONS.autoMode);
+  // Scoped addressing policy (CHOO-1585). null = open; a new agent starts on
+  // the default, its owner and the owner's agents. Applied via a follow-up PUT
+  // after creation.
+  const [addressingPolicy, setAddressingPolicy] = useState<AddressingPolicy | null>(() =>
+    defaultAgentPolicy()
+  );
+  // The agent's icon (CHOO-2171). A new agent opens on a random bot rather than
+  // one drawn from its name: the name is empty at that point, so a name-derived
+  // seed is the same constant for everybody, and two agents that end up sharing
+  // a name have no reason to share a face. Null still means "whatever the name
+  // generates" — that is what the ✕ in the picker returns to.
+  const [initialIconUrl] = useState(randomAgentAvatarUrl);
+  const [iconUrl, setIconUrl] = useState<string | null>(initialIconUrl);
+  const thirdPartyAvatarsEnabled = useThirdPartyAvatarsEnabled(serverId);
+
+  // The random bot above is drawn before anything is known about where the
+  // agent will land, so a server that turns out to disable third-party
+  // avatars has to lose it retroactively — sent as-is, it would be the one
+  // DiceBear URL this form ever created without the server's permission.
+  // Nothing else changes here while the server is still unknown or allows
+  // them: this only fires once the answer is a confirmed no.
+  useEffect(() => {
+    if (thirdPartyAvatarsEnabled === false && iconUrl !== null && isThirdPartyAvatarUrl(iconUrl)) {
+      setIconUrl(null);
+    }
+  }, [thirdPartyAvatarsEnabled, iconUrl]);
+
+  const setDisplayName = useCallback((value: string) => {
+    setDisplayNameRaw(value);
+    setDisplayNameTouched(true);
+  }, []);
+
+  /**
+   * Uppercase is the one thing the charset rejects that the reader never means
+   * — nobody wants a capital in a routing handle they did not know was one —
+   * so it is folded as they type rather than held against them. Everything
+   * else the charset refuses is left alone for the rejection banner and its
+   * slug offer to answer, because rewriting text under the cursor is worse
+   * than an error.
+   */
+  const setAgentName = useCallback((value: string) => {
+    setTypedName(value);
+    setAgentNameFolded(value.replace(/[A-Z]/g, (c) => c.toLowerCase()));
+  }, []);
+
+  const nameIsValid = AGENT_NAME_PATTERN.test(agentName);
+  const nameIsRejected = agentName.length > 0 && !nameIsValid;
+  // A rejected name the app can repair itself is an offer, not a dead end. Only
+  // an offer: rewriting as the user types moves text out from under them. Empty
+  // when nothing of the name survives slugging, and there is nothing to offer.
+  const suggestedName = nameIsRejected ? slugifyAgentNamePart(agentName) : '';
+  const isValid = nameIsValid && description.trim().length > 0;
+
+  /**
+   * Take the offered slug as the name, keeping the text it was slugged from as
+   * the display name. "Switch Dev" is both the label someone wants and the
+   * thing the charset rejects, so the slug must not be all that survives it.
+   * A display name the user wrote themselves is an answer, not a guess, and
+   * stands.
+   */
+  const acceptSuggestedName = useCallback(() => {
+    if (suggestedName === '') return;
+    if (!displayNameTouched) setDisplayNameRaw(typedName);
+    setAgentName(suggestedName);
+  }, [typedName, displayNameTouched, suggestedName, setAgentName]);
+
+  return {
+    agentName,
+    setAgentName,
+    nameIsValid,
+    nameIsRejected,
+    suggestedName,
+    acceptSuggestedName,
+    displayName,
+    setDisplayName,
+    description,
+    setDescription,
+    instructions,
+    setInstructions,
+    autoApprove,
+    setAutoApprove,
+    autoMode,
+    setAutoMode,
+    addressingPolicy,
+    setAddressingPolicy,
+    iconUrl,
+    setIconUrl,
+    /** Whether the icon on screen is still one this app drew, as opposed to one
+     * the user went and chose. Only the caption cares; the value sent to the
+     * server is `iconUrl` either way. */
+    iconIsGenerated: iconUrl === null || iconUrl === initialIconUrl,
+    thirdPartyAvatarsEnabled,
+    isValid,
+  };
+}
+
+export type ConfigureAgentFormState = ReturnType<typeof useConfigureAgentForm>;

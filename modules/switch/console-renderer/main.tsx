@@ -1,0 +1,71 @@
+import ReactDOM from 'react-dom/client';
+import { setupNavigationGuards, views } from '@renderer/app/view-registry';
+import { prefetchAppSettingsKey } from '@renderer/features/settings/use-app-settings-key';
+import './index.css';
+import 'devicon/devicon.min.css';
+import 'katex/dist/katex.min.css';
+import { setupAppCommandProvider } from '@renderer/lib/commands/app-commands';
+import {
+  setupViewCommandProvider,
+  type ViewCommandProviders,
+} from '@renderer/lib/commands/registry';
+import { wireExternalLinkRequests } from '@renderer/lib/external-link-requests';
+import { rpc } from '@renderer/lib/ipc';
+import { wireMouseNavigation } from '@renderer/lib/layout/mouse-navigation';
+import { viewStateCache } from '@renderer/lib/stores/view-state-cache';
+import { log } from '@renderer/utils/logger';
+import { initSoundPlayer } from '@renderer/utils/soundPlayer';
+import { setAgentProviderCatalogue } from '@shared/core/providers/agent-provider-registry';
+import type { NavigationSnapshot, SidebarSnapshot } from '@shared/view-state';
+import { App } from './App';
+import { renderBootstrapFailure } from './bootstrap-failure';
+import { ErrorBoundary } from './lib/components/error-boundary';
+import { appState } from './lib/stores/app-state';
+
+async function bootstrap() {
+  // Before anything else: stores and views read provider metadata synchronously.
+  setAgentProviderCatalogue(await rpc.providers.catalogue());
+  wireExternalLinkRequests();
+
+  appState.update.start();
+  initSoundPlayer();
+
+  const [navResult, sidebarResult, allViewState] = await Promise.all([
+    rpc.viewState.get('navigation') as Promise<NavigationSnapshot> | null,
+    rpc.viewState.get('sidebar'),
+    rpc.viewState.getAll(),
+    appState.locations.load(),
+    prefetchAppSettingsKey('interface'),
+    prefetchAppSettingsKey('telemetry'),
+  ]);
+
+  viewStateCache.populate(allViewState as Record<string, unknown>);
+
+  setupNavigationGuards();
+  // Restored even with nothing to restore, so the screen the app settles on is
+  // always the one it announces having opened. A snapshot is only written once
+  // something changes, so an install where nobody navigates away from home has
+  // none — and skipping the call would leave that install having opened no
+  // screen at all.
+  appState.navigation.restoreSnapshot(navResult ?? {});
+  setupAppCommandProvider();
+  setupViewCommandProvider(views as unknown as ViewCommandProviders);
+  wireMouseNavigation();
+  if (sidebarResult) {
+    appState.sidebar.restoreSnapshot(sidebarResult as Partial<SidebarSnapshot>);
+  } else {
+    appState.sidebar.expandAllLocations();
+  }
+
+  // Avoid double-mount in dev which can duplicate session subscriptions
+  ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+bootstrap().catch((error: unknown) => {
+  log.error('Renderer bootstrap failed:', error);
+  renderBootstrapFailure(document.getElementById('root') ?? document.body, error);
+});

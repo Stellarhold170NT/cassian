@@ -1,0 +1,330 @@
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel
+
+from switch_core.bridges.agent.protocol.types import (
+    AgentEvent,
+    AgentStatus,
+    IntegrationProfile,
+    LlmCallReport,
+    ModelSpec,
+    ToolCallReport,
+    ToolSpec,
+)
+
+# ── Registration ──────────────────────────────────────────────────────────────
+
+
+class RegisterAgentRequest(BaseModel):
+    name: str
+    description: str
+    icon_url: str | None = None
+    display_name: str | None = None
+    connector_type: str
+    integration_profile: IntegrationProfile
+    tools: list[ToolSpec] = []
+    models: list[ModelSpec] = []
+    metadata: dict[str, Any] = {}
+    overwrite: bool = False
+
+
+class RegisterAgentResponse(BaseModel):
+    id: str
+    api_key: str
+
+
+class RegisterKnownAgentRequest(BaseModel):
+    agent_type: str
+    name: str
+    description: str
+    icon_url: str | None = None
+    display_name: str | None = None
+    options: dict[str, Any] = {}
+    # When set, register this agent as a child of `parent_agent_id` (e.g. a
+    # Claude Code subagent under the user's main agent). None = top-level.
+    parent_agent_id: str | None = None
+    overwrite: bool = False
+
+
+class BulkSubagentSpec(BaseModel):
+    """One Claude Code subagent to register under a parent agent.
+
+    `subagent_name` is the bare Claude Code subagent identifier (the `name`
+    frontmatter field, used for the `--agent <name>` launch flag); the Switch
+    agent name is derived server-side as `<parent-name>.<subagent_name>`.
+    """
+
+    subagent_name: str
+    description: str
+
+
+class RegisterKnownAgentBulkRequest(BaseModel):
+    """Register many subagents under one parent agent in a single call.
+
+    `options` is the shared base (e.g. `channels_enabled`, `repo_dir`) applied
+    to every subagent; the per-subagent `subagent_name`
+    is merged in on top. Brings a user's existing `.claude/agents/*.md`
+    subagents into Switch in one step.
+    """
+
+    agent_type: str
+    parent_agent_id: str
+    options: dict[str, Any] = {}
+    subagents: list[BulkSubagentSpec]
+    overwrite: bool = False
+
+
+class BulkRegisterResult(BaseModel):
+    subagent_name: str
+    name: str
+    id: str
+    api_key: str
+
+
+class RegisterKnownAgentBulkResponse(BaseModel):
+    results: list[BulkRegisterResult]
+
+
+class UpdateAgentRequest(BaseModel):
+    description: str | None = None
+    integration_profile: IntegrationProfile | None = None
+    metadata: dict[str, Any] | None = None
+
+
+# ── Messages ──────────────────────────────────────────────────────────────────
+
+
+class SendMessageRequest(BaseModel):
+    room_id: str
+    content: str
+    metadata: dict[str, Any] = {}
+
+
+class TypingRequest(BaseModel):
+    room_id: str
+    is_typing: bool
+
+
+class ConnectionRenewRequest(BaseModel):
+    room_id: str
+
+
+class ConnectionSubscribeRequest(BaseModel):
+    """Claim (or release) a room on an open connection (CHOO-1857)."""
+
+    connection_id: str
+    room_id: str
+    # Evict whichever connection currently holds the room. Off by default: the
+    # usual cause of a collision is a stale process, and rejecting surfaces it.
+    takeover: bool = False
+    # The incarnation the caller believes it holds. A connection id alone says
+    # nothing about *which* client is on it, so without this a client that has
+    # already been displaced can still rewrite the winner's rooms. Optional
+    # because a client built before the fence sends none, which keeps the
+    # unchecked behaviour it has always had.
+    generation: int | None = None
+
+
+class ConnectionPlacementsRequest(BaseModel):
+    """Every session placement on an open connection, replacing what it had."""
+
+    connection_id: str
+    #: Session id to the Switch room id it is working in. Rooms are distinct;
+    #: a session the connection placed before and omits here is unplaced.
+    placements: dict[str, str]
+    #: The incarnation the caller believes it holds, fenced as on subscribe.
+    generation: int | None = None
+
+
+class ConnectionBeatRequest(BaseModel):
+    """The heartbeat of a connection held over the event stream (CHOO-1857).
+
+    Kept for clients built before the WebSocket, whose socket carries the
+    heartbeat itself, for a compatibility window. Proves the client is alive.
+    Clients also send how far they have read (`cursor`, `position`); the
+    server does not read it, because a client resumes from the position it
+    sends when it reopens.
+    """
+
+    connection_id: str
+    #: The incarnation of the connection this client is attached to, as the
+    #: server told it on `connection_state`. Fences the tick: a client that has
+    #: been displaced still holds the id and the token, and is otherwise
+    #: indistinguishable from the one that replaced it. Null is accepted only
+    #: while the connection's holder is a client built before the fence existed
+    #: (unknown, not current); from a holder that declares the revision which
+    #: carries it, a tick without one is refused.
+    generation: int | None = None
+
+
+class StatusRequest(BaseModel):
+    room_id: str
+    presence: Literal["online", "offline"] | None = None
+    status: str | None = None
+    detail: str | None = None
+
+
+class RuntimeStateRequest(BaseModel):
+    room_id: str
+    # The canonical runtime state. Connectors map provider-specific states onto
+    # these (e.g. completed → idle, error → awaiting-input) before reporting.
+    state: Literal["working", "awaiting-input", "idle"]
+    # Message id (`thread_id`) of the addressed message that kicked off this
+    # turn, when it was in a thread, so the bridge surfaces the state in that
+    # thread. Omit / null when the agent was addressed at the conversation root.
+    thread_id: str | None = None
+    # Message id of the latest message the connector has actually delivered to
+    # the agent's session. The bridge repositions the runtime indicator when
+    # this changes, so it only ever moves on evidence the agent has the
+    # message — not merely because one arrived. Report the same value on a
+    # periodic refresh; only a genuine change moves the indicator.
+    anchor_event_id: str | None = None
+    # A `switchdash://session?…` deeplink Switch Console builds so the bridged
+    # working / awaiting-input message can link back to its session. Relayed
+    # verbatim to the channel; null for connectors that don't manage a UI.
+    deeplink_url: str | None = None
+    # A short, human-readable line describing what the agent is doing right now
+    # (e.g. "Editing room-connection.ts", "Running git push"). The connector
+    # (Switch Console) decides granularity and wording; the bridge surfaces it in
+    # place on the live "working on it…" message. Only meaningful while
+    # `state == "working"`; null falls back to the generic "working on it…".
+    detail: str | None = None
+    # Which session-control commands this managed session can execute, e.g.
+    # {"reset": true, "compact": true, "interrupt": true}. Reported by
+    # Switch Console for sessions it controls; null for connectors that can't be
+    # controlled (a session_dependent command then resolves to unsupported).
+    control_capabilities: dict[str, bool] | None = None
+
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+
+
+class AddToolRequest(BaseModel):
+    name: str
+    description: str
+    parameters: dict[str, Any] | None = None
+
+
+class AddToolResponse(BaseModel):
+    id: str
+    name: str
+    agent_id: str
+
+
+class AddModelRequest(BaseModel):
+    name: str
+    description: str
+
+
+class AddModelResponse(BaseModel):
+    id: str
+    name: str
+    agent_id: str
+
+
+# ── Events ────────────────────────────────────────────────────────────────────
+
+
+class EventResponse(BaseModel):
+    events: list[AgentEvent]
+
+
+class HistoryMessage(BaseModel):
+    sender: str
+    sender_name: str
+    body: str
+    timestamp: int | None = None
+
+
+class HistoryResponse(BaseModel):
+    events: list[HistoryMessage]
+    has_more: bool
+
+
+# ── Participants ──────────────────────────────────────────────────────────────
+
+
+class ParticipantInfo(BaseModel):
+    type: Literal["agent", "user"]
+    agent_id: str | None = None
+    name: str
+    status: AgentStatus | None = None
+
+
+class ParticipantsResponse(BaseModel):
+    participants: list[ParticipantInfo]
+
+
+# ── Mediation ────────────────────────────────────────────────────────────────
+
+
+class PreToolCallRequest(BaseModel):
+    room_id: str
+    tool_name: str
+    arguments: dict[str, Any]
+    request_id: str
+
+
+class PreToolCallResponse(BaseModel):
+    verdict: Literal["proceed", "blocked", "modified"]
+    reason: str | None = None
+    modified_arguments: dict[str, Any] | None = None
+
+
+class PreLlmRequestRequest(BaseModel):
+    room_id: str
+    model: str
+    messages: list[dict[str, Any]]
+    request_id: str
+
+
+class PreLlmRequestResponse(BaseModel):
+    verdict: Literal["proceed", "blocked", "modified"]
+    reason: str | None = None
+    modified_messages: list[dict[str, Any]] | None = None
+
+
+class PostToolResultRequest(BaseModel):
+    room_id: str
+    tool_name: str
+    result: Any
+    request_id: str
+
+
+class PostToolResultResponse(BaseModel):
+    verdict: Literal["ok", "blocked", "redacted"]
+    reason: str | None = None
+    result: Any | None = None
+
+
+class PostLlmResponseRequest(BaseModel):
+    room_id: str
+    model: str
+    response: Any
+    usage: dict[str, Any] | None = None
+    request_id: str
+
+
+class PostLlmResponseResponse(BaseModel):
+    verdict: Literal["ok", "blocked", "redacted"]
+    reason: str | None = None
+    result: Any | None = None
+
+
+# ── Reporting ────────────────────────────────────────────────────────────────
+
+
+class ReportEventsRequest(BaseModel):
+    room_id: str
+    events: list[ToolCallReport | LlmCallReport]
+
+
+class FeatureFlagInfo(BaseModel):
+    key: str
+    enabled: bool
+
+
+class FeatureFlagListResponse(BaseModel):
+    flags: list[FeatureFlagInfo]

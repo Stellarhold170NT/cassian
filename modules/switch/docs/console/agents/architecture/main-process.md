@@ -1,0 +1,70 @@
+# Main Process
+
+## Structure
+
+The main process is organized into domain modules under `src/main/core/`. Each domain typically has a `controller.ts` (RPC handlers) and service/implementation files.
+
+## Domain Modules (`src/main/core/`)
+
+Two names in this list are easy to misread, because one of them changed meaning:
+
+- **agents** is the *Switch agent* domain — an agent identity bound to a provider. It is
+  **not** the CLI-tool registry.
+- **providers** is the CLI-tool registry (claude, codex, …). Upstream called that concept
+  an "agent"; it was renamed to free the name for the Switch-agent concept above.
+
+- **agent-hooks** — per-tool trust services (`claude-trust-service.ts`, `codex-trust-service.ts`, `cursor-trust-service.ts`, `dir-trust-service.ts`), agent-event status derivation and OS notifications (`derive-agent-status.ts`, `notification.ts`). Terminal sessions and their HTTP hook server were removed; SDK sessions report status through `src/main/core/sdk-host/`
+- **agent-runtime** — Provider adapters, launch profiles and status mapping
+- **agents** — The Switch-agent domain: create/rename/delete, directory detection (`detect.ts`), onboarding, remote agent discovery and reconciliation, Switch credential/settings files
+- **app** — App lifecycle service and controller
+- **dependencies** — CLI agent detection, probing, install runner, version/update services, and their remote counterparts (`remote-dependency-manager.ts`, `ssh-install-runner.ts`)
+- **embedded-controller** — "Run managed agents on this computer", per signed-in Switch server: enrolls this Console as an agent controller of kind `console` through the gateway session, keeps the credential in the encrypted secrets store (never on disk in plaintext), and runs the `@switch-console/agent-controller` CLI as a child (`process.execPath` with `ELECTRON_RUN_AS_NODE=1`, bundled to `dist-sidecar/agent-controller.mjs`), handing it the credential on stdin. Console's own agents are not involved. Unlike Console's local hosts, the managed agents' watchers are detached and outlive Console; they reconnect when the controller is started again. Every start passes the server's current API URL as `--server` (the controller moves its stored identity to it), and editing a server's API URL restarts a running controller. Exit code 2 (a configuration error) is shown as an error and not retried
+- **execution-context** — Where a command runs: `local-execution-context.ts` vs `ssh-execution-context.ts`
+- **fs** — Filesystem operations with provider pattern (`impl/local-fs.ts`)
+- **locations** — An agent's working directory on a host. Replaces the upstream project/workspace split; provider pattern plus lifecycle scripts
+- **managed-switch-server** — A Switch Console-managed Switch server: on this computer natively (PostgreSQL and switch-core as background processes, `native/`; Mattermost optional, in Docker), or via Docker Compose on a remote host and for local servers set up before native mode
+- **prompt-library** — Prompt library service and controller
+- **providers** — CLI-provider plugin registry (`plugin-registry.ts`), agent payload builder, plugin filesystem, argv parity test
+- **remote-hosts** — SSH host records, reachability probing (`host-reachability-service.ts`), and host setup
+- **resource-monitor** — System resource monitoring
+- **search** — Search service
+- **secrets** — Encrypted app secret storage
+- **sessions** — Session CRUD (create, delete, rename, provision)
+- **settings** — App settings service and schema, provider settings (separate controller)
+- **shared** — Shared main-process utilities (OAuth flow)
+- **sdk-host** — Deployment and client for the persistent local/SSH SDK host
+- **ssh** — SSH config, connection, lifecycle, and transport
+- **switch-rooms** — Room connections, the auto-session watcher, Switch credentials, notification polling
+- **switch-servers** — Switch server records, gateway client, auth, room creation
+- **switch-setup** — First-run Switch setup, local and remote (`remote-switch-setup.ts`)
+- **telemetry** — The consent gate, the closed event catalogue, and `relay-client.ts`, which posts one OTLP log record per event to the company's public relay (which forwards to Amplitude and Datadog, and holds their keys, so the app ships none). The three session/agent events are subscribed in `telemetry-listeners.ts`; the other three (app launched, server added, connector installed) have no hook bus to subscribe to and call `trackEvent` at their own site
+- **terminal-shell** — Noninteractive installer shell resolution
+- **terminals** — Noninteractive lifecycle command coordination
+- **updates** — Auto-update service
+- **utils** — Cross-domain main-process helpers (exec, TTL cache, compensation)
+- **view-state** — Persisted view/UI state
+
+## Other Main Process Areas
+
+- `src/main/app/` — Menu, protocol handler, deeplinks, window creation, app identity
+- `src/main/lib/` — Logger and file logger, log context (`AsyncLocalStorage`) and enrichment, events, rate limiter, retry, semver
+- `src/main/db/` — Database schema, client, initialization, versioned columns
+- `src/main/utils/` — Shell environment, shell escaping, child process env, external links
+
+The `Result<T, E>` type is **not** in `src/main/lib/`. It lives in the `@switch-console/shared`
+workspace package (`packages/shared/src/result.ts`) and is imported as
+`import { ok, err, type Result } from '@switch-console/shared'`.
+
+## IPC / RPC Structure
+
+- All domain controllers are assembled into a typed RPC router in `src/main/rpc.ts`.
+- RPC primitives live in `src/shared/lib/ipc/rpc.ts` (`createRPCRouter`, `createRPCController`, `createRPCClient`).
+- Event primitives live in `src/shared/lib/ipc/events.ts`.
+- The preload bridge (`src/preload/index.ts`) exposes only `invoke`, `eventSend`, `eventOn`, and `getPathForFile`; there are no other manual IPC handlers.
+
+## When Editing Here
+
+- Check `agents/conventions/main-patterns.md` for controller, service, Result type, and event patterns.
+- Check `agents/conventions/ipc.md` for the RPC controller pattern and typing rules.
+- Check `agents/risky-areas/sdk-sessions.md` before touching SDK host or provider spawn behavior.
+- Check `agents/risky-areas/database.md` before changing persistence or migrations.

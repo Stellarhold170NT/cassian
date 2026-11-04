@@ -1,0 +1,89 @@
+import type { AgentConnectionKind } from '@shared/core/agents/agent-connection';
+import type { AgentProviderId } from '@shared/core/providers/agent-provider-registry';
+
+export type LocationViewSnapshot = {
+  activeView: string;
+  sessionViewTab: 'active' | 'archived';
+};
+
+export type NavigationSnapshot = {
+  currentViewId: string;
+  viewParams: Record<string, unknown>;
+};
+
+export type SidebarSessionSortBy = 'created-at' | 'updated-at';
+
+/** How the room-focused sidebar orders rooms. Rooms are places rather than
+ * work, so they sort by name by default; `updated-at` means the most recent
+ * session activity in the room. */
+export type SidebarRoomSortBy = 'name' | 'created-at' | 'updated-at';
+
+/** How the sidebar groups sessions: by agent (agent → room → sessions) or by
+ * room (room → agents → sessions). */
+export type SidebarGrouping = 'agent' | 'room';
+
+/** Persisted sidebar UI state; fields may be absent in older DB blobs. */
+export type SidebarSnapshot = {
+  expandedLocationIds?: string[];
+  /**
+   * Manual order of the top-level agents in the agent-focused grouping, by
+   * agent id. Superseded `locationOrder`, which keyed the same intent by
+   * location and so could not order two agents sharing one.
+   */
+  agentOrder?: string[];
+  sessionOrderByLocation?: Record<string, string[]>;
+  sessionSortBy?: SidebarSessionSortBy;
+  grouping?: SidebarGrouping;
+  /** Expanded room keys in room-focused grouping (room id, or '__unassigned__'). */
+  expandedRoomKeys?: string[];
+  /**
+   * Collapsed sub-group keys for the second level of the grouped views — rooms
+   * under an agent (agent-focused) and agents under a room (room-focused).
+   * Stored as collapsed (not expanded) so these levels default to open.
+   */
+  collapsedGroupKeys?: string[];
+  /** Manual order of the top-level rooms in the room-focused grouping. */
+  roomOrder?: string[];
+  /**
+   * Optional left-sidebar filters. Each dimension is additive and composes with
+   * the others (AND across dimensions, OR within one). An empty array / false
+   * means that dimension is not filtering.
+   */
+  filterConnections?: AgentConnectionKind[];
+  filterProviderIds?: AgentProviderId[];
+  filterHasLiveSession?: boolean;
+  /**
+   * Room-focused filters, kept apart from the agent ones above: the two views
+   * filter different things, so a dimension set in one must not silently narrow
+   * the other. `filterBridgeTypes` holds bridge types (`slack`, …) plus the
+   * sentinel {@link UNBRIDGED_FILTER_VALUE} for rooms with no messaging app.
+   */
+  roomSortBy?: SidebarRoomSortBy;
+  filterBridgeTypes?: string[];
+  filterRoomHasLiveSession?: boolean;
+  /**
+   * Whether the first-run setup checklist is collapsed to its header row.
+   * Collapsing is a "not now", distinct from dismissing it entirely — that is a
+   * setting (`onboarding.showChecklist`), because it has to be undoable from
+   * somewhere the checklist itself no longer occupies.
+   */
+  onboardingChecklistCollapsed?: boolean;
+  /**
+   * Whether a sidebar agent row shows the small mark of the provider it runs
+   * on, beside its name. The agent's own icon took over the row's leading slot
+   * (CHOO-2171), and this mark is what still answers "what does this actually
+   * run?" — so it is on unless the reader turns it off, and absent from an
+   * older blob reads as on.
+   */
+  hideProviderMark?: boolean;
+  /**
+   * Expanded cloud-agent group keys. Tracked inverted from local agent groups
+   * (which are collapsed): a cloud row is expanded only when named here, so
+   * they default to collapsed.
+   */
+  expandedCloudGroups?: string[];
+};
+
+/** `filterBridgeTypes` entry standing for "no messaging app", which has no
+ * bridge type of its own but is a thing you want to filter for. */
+export const UNBRIDGED_FILTER_VALUE = '__unbridged__';

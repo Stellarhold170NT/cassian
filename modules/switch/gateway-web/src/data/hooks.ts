@@ -1,0 +1,419 @@
+import { useCallback, useEffect, useState } from "react";
+import {
+  ApiError,
+  type ConnectorAppScope,
+  type ConnectorApps,
+  fetchConnectorApps,
+  type AgentDetail,
+  type AgentSummary,
+  type Budget,
+  type CurrentTenant,
+  type UsageTotal,
+  type ApiKeyDetail,
+  type BridgeDetail,
+  type BridgeTypeInfo,
+  type ExternalUserSummary,
+  type DocumentDetail,
+  type DocumentSummary,
+  type InboundLinkedRoomDetail,
+  type InstallablePlatforms,
+  type InstalledApp,
+  type KnownAgentType,
+  type LinkedRoomDetail,
+  type RoomGraphData,
+  type EcosystemGraphData,
+  type PackageDetail,
+  type ReferenceDetail,
+  type ReferenceTypeDetail,
+  type ReferenceTypeInfo,
+  type ResourceRoom,
+  type RoomDetail,
+  type RoomGroupDetail,
+  type RoomSummary,
+  type TemplateSummary,
+  type UserInfo,
+  fetchAgent,
+  fetchAgents,
+  fetchApiKeys,
+  fetchBudgets,
+  fetchCurrentTenant,
+  fetchUsage,
+  fetchAllExternalUsers,
+  fetchBridges,
+  fetchBridgeTypes,
+  fetchBridgeUsers,
+  fetchDocumentRooms,
+  fetchDocuments,
+  fetchInboundLinkedRooms,
+  fetchInstallablePlatforms,
+  fetchInstalledApps,
+  fetchKnownAgentTypes,
+  fetchLinkedRooms,
+  fetchRoomGraph,
+  fetchEcosystemGraph,
+  fetchPackage,
+  fetchPackageDocuments,
+  fetchPackageReferences,
+  fetchPackageRooms,
+  fetchPackages,
+  fetchOwnedReferenceTypes,
+  fetchReferenceRooms,
+  fetchReferenceTypes,
+  fetchReferences,
+  fetchRoom,
+  fetchRoomGroups,
+  fetchRoomDocument,
+  fetchRoomDocuments,
+  fetchRoomPackages,
+  fetchRoomReferences,
+  fetchRooms,
+  fetchTemplates,
+  type TemplateFilter,
+  fetchUsers,
+} from "./api";
+
+export interface UseQueryResult<T> {
+  data: T | null;
+  loading: boolean;
+  error: string | null;
+  refetch: () => void;
+}
+
+function useQuery<T>(fetcher: () => Promise<T | null>): UseQueryResult<T> {
+  const [data, setData] = useState<T | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+
+  const refetch = useCallback(() => setTick((t) => t + 1), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+
+    fetcher().then((result) => {
+      if (cancelled) return;
+      if (result === null) {
+        setError("Failed to fetch data");
+      } else {
+        setData(result);
+        setError(null);
+      }
+      setLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fetcher, tick]);
+
+  return { data, loading, error, refetch };
+}
+
+export function useRooms(
+  search?: string,
+  includeArchived?: boolean,
+): UseQueryResult<RoomSummary[]> {
+  const fetcher = useCallback(
+    () => fetchRooms(search, includeArchived),
+    [search, includeArchived],
+  );
+  return useQuery(fetcher);
+}
+
+export function useRoom(roomId: string | undefined): UseQueryResult<RoomDetail> {
+  const fetcher = useCallback(
+    () => (roomId ? fetchRoom(roomId) : Promise.resolve(null)),
+    [roomId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useAgents(): UseQueryResult<AgentSummary[]> {
+  return useQuery(fetchAgents);
+}
+
+export function useAgent(
+  agentId: string | undefined,
+): UseQueryResult<AgentDetail> {
+  const fetcher = useCallback(
+    () => (agentId ? fetchAgent(agentId) : Promise.resolve(null)),
+    [agentId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useRoomGroups(): UseQueryResult<RoomGroupDetail[]> {
+  return useQuery(fetchRoomGroups);
+}
+
+export function useBridges(): UseQueryResult<BridgeDetail[]> {
+  return useQuery(fetchBridges);
+}
+export function useBridgeTypes(): UseQueryResult<BridgeTypeInfo[]> {
+  return useQuery(fetchBridgeTypes);
+}
+
+export function useBridgeUsers(
+  bridgeId: string | undefined,
+): UseQueryResult<ExternalUserSummary[]> {
+  const fetcher = useCallback(
+    () => (bridgeId ? fetchBridgeUsers(bridgeId) : Promise.resolve(null)),
+    [bridgeId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useAllExternalUsers(): UseQueryResult<ExternalUserSummary[]> {
+  return useQuery(fetchAllExternalUsers);
+}
+
+// Empty on every deployment that registered no app of its own, which is most
+// of them — the page reads that as "there is nothing to install here", not as
+// a failure.
+export function useInstallablePlatforms(): UseQueryResult<InstallablePlatforms> {
+  return useQuery(fetchInstallablePlatforms);
+}
+
+export function useInstalledApps(): UseQueryResult<InstalledApp[]> {
+  return useQuery(fetchInstalledApps);
+}
+
+export function useKnownAgentTypes(): UseQueryResult<KnownAgentType[]> {
+  return useQuery(fetchKnownAgentTypes);
+}
+
+/** The connector apps of `scope`: the server's, which only its operator
+ * reads, or the current organization's, which only its org admins do. A 404
+ * is the routes not being mounted: `notEnabled` says so. */
+export function useConnectorApps(
+  scope: ConnectorAppScope,
+  notEnabled: string,
+): UseQueryResult<ConnectorApps> {
+  const [data, setData] = useState<ConnectorApps | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+  const refetch = useCallback(() => setTick((t) => t + 1), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchConnectorApps(scope).then(
+      (result) => {
+        if (cancelled) return;
+        setData(result);
+        setError(null);
+        setLoading(false);
+      },
+      (err: unknown) => {
+        if (cancelled) return;
+        setError(
+          err instanceof ApiError && err.status === 404
+            ? notEnabled
+            : err instanceof Error
+              ? err.message
+              : String(err),
+        );
+        setLoading(false);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [scope, notEnabled, tick]);
+
+  return { data, loading, error, refetch };
+}
+
+export function useUsers(): UseQueryResult<UserInfo[]> {
+  return useQuery(fetchUsers);
+}
+
+export function useApiKeys(): UseQueryResult<ApiKeyDetail[]> {
+  return useQuery(fetchApiKeys);
+}
+
+export function useReferences(): UseQueryResult<ReferenceDetail[]> {
+  return useQuery(fetchReferences);
+}
+
+export function useDocuments(): UseQueryResult<DocumentSummary[]> {
+  return useQuery(fetchDocuments);
+}
+
+export function useReferenceTypes(): UseQueryResult<ReferenceTypeInfo[]> {
+  return useQuery(fetchReferenceTypes);
+}
+
+export function useOwnedReferenceTypes(): UseQueryResult<ReferenceTypeDetail[]> {
+  return useQuery(fetchOwnedReferenceTypes);
+}
+
+export function useLinkedRooms(
+  roomId: string | undefined,
+): UseQueryResult<LinkedRoomDetail[]> {
+  const fetcher = useCallback(
+    () => (roomId ? fetchLinkedRooms(roomId) : Promise.resolve(null)),
+    [roomId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useInboundLinkedRooms(
+  roomId: string | undefined,
+): UseQueryResult<InboundLinkedRoomDetail[]> {
+  const fetcher = useCallback(
+    () => (roomId ? fetchInboundLinkedRooms(roomId) : Promise.resolve(null)),
+    [roomId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useRoomGraph(): UseQueryResult<RoomGraphData> {
+  return useQuery(fetchRoomGraph);
+}
+
+export function useEcosystemGraph(): UseQueryResult<EcosystemGraphData> {
+  return useQuery(fetchEcosystemGraph);
+}
+
+export function useRoomReferences(
+  roomId: string | undefined,
+): UseQueryResult<ReferenceDetail[]> {
+  const fetcher = useCallback(
+    () => (roomId ? fetchRoomReferences(roomId) : Promise.resolve(null)),
+    [roomId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useRoomDocuments(
+  roomId: string | undefined,
+): UseQueryResult<DocumentSummary[]> {
+  const fetcher = useCallback(
+    () => (roomId ? fetchRoomDocuments(roomId) : Promise.resolve(null)),
+    [roomId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useRoomDocument(
+  roomId: string | undefined,
+  documentId: string | undefined,
+): UseQueryResult<DocumentDetail> {
+  const fetcher = useCallback(
+    () =>
+      roomId && documentId
+        ? fetchRoomDocument(roomId, documentId)
+        : Promise.resolve(null),
+    [roomId, documentId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useReferenceRooms(
+  referenceId: string | undefined,
+): UseQueryResult<ResourceRoom[]> {
+  const fetcher = useCallback(
+    () => (referenceId ? fetchReferenceRooms(referenceId) : Promise.resolve(null)),
+    [referenceId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useDocumentRooms(
+  documentId: string | undefined,
+): UseQueryResult<ResourceRoom[]> {
+  const fetcher = useCallback(
+    () => (documentId ? fetchDocumentRooms(documentId) : Promise.resolve(null)),
+    [documentId],
+  );
+  return useQuery(fetcher);
+}
+
+export function usePackages(): UseQueryResult<PackageDetail[]> {
+  return useQuery(fetchPackages);
+}
+
+export function usePackage(
+  packageId: string | undefined,
+): UseQueryResult<PackageDetail> {
+  const fetcher = useCallback(
+    () => (packageId ? fetchPackage(packageId) : Promise.resolve(null)),
+    [packageId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useRoomPackages(
+  roomId: string | undefined,
+): UseQueryResult<PackageDetail[]> {
+  const fetcher = useCallback(
+    () => (roomId ? fetchRoomPackages(roomId) : Promise.resolve(null)),
+    [roomId],
+  );
+  return useQuery(fetcher);
+}
+
+export function usePackageRooms(
+  packageId: string | undefined,
+): UseQueryResult<ResourceRoom[]> {
+  const fetcher = useCallback(
+    () => (packageId ? fetchPackageRooms(packageId) : Promise.resolve(null)),
+    [packageId],
+  );
+  return useQuery(fetcher);
+}
+
+export function usePackageReferences(
+  packageId: string | undefined,
+): UseQueryResult<ReferenceDetail[]> {
+  const fetcher = useCallback(
+    () => (packageId ? fetchPackageReferences(packageId) : Promise.resolve(null)),
+    [packageId],
+  );
+  return useQuery(fetcher);
+}
+
+export function usePackageDocuments(
+  packageId: string | undefined,
+): UseQueryResult<DocumentSummary[]> {
+  const fetcher = useCallback(
+    () => (packageId ? fetchPackageDocuments(packageId) : Promise.resolve(null)),
+    [packageId],
+  );
+  return useQuery(fetcher);
+}
+
+export function useTemplates(
+  filter: TemplateFilter = {},
+): UseQueryResult<TemplateSummary[]> {
+  const { q, kind, owner_id } = filter;
+  const fetcher = useCallback(
+    () => fetchTemplates({ q, kind, owner_id }),
+    [q, kind, owner_id],
+  );
+  return useQuery(fetcher);
+}
+
+export function useCurrentTenant(): UseQueryResult<CurrentTenant> {
+  return useQuery(fetchCurrentTenant);
+}
+
+export function useBudgets(tenantId: string): UseQueryResult<Budget[]> {
+  const fetcher = useCallback(() => fetchBudgets(tenantId), [tenantId]);
+  return useQuery(fetcher);
+}
+
+export function useUsage(
+  tenantId: string,
+  since: Date,
+  until: Date,
+): UseQueryResult<UsageTotal[]> {
+  const fetcher = useCallback(
+    () => fetchUsage(tenantId, since, until),
+    [tenantId, since, until],
+  );
+  return useQuery(fetcher);
+}

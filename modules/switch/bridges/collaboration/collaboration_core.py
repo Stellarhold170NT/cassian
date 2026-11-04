@@ -1,0 +1,3108 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import logging
+import re
+import time
+import uuid
+from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import TYPE_CHECKING, TypeVar
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.aliases import AliasError, validate_alias_format
+from switch_core.attachments import parse_attachment_group
+from switch_core.bridges.agent.commands import stop_control_frame
+from switch_core.bridges.collaboration.adapter import (
+    AgentIdentity,
+    AgentPresentation,
+    PlatformAdapter,
+    SupportsSharedConnection,
+    agent_identity,
+)
+from switch_core.bridges.collaboration.models import (
+    ChannelType,
+    InboundAgentJoin,
+    InboundAppJoin,
+    InboundCommand,
+    InboundInteraction,
+    InboundMessage,
+    InboundUserJoin,
+    OutboundAttachment,
+)
+from switch_core.bridges.collaboration.session.refusal import InboundActor, Refused
+from switch_core.bridges.collaboration.session.renderers import INTERRUPT_ACTION
+from switch_core.clients.actor import Actor, ClientConfig
+from switch_core.clients.admin_messages import (
+    ADMIN_MARKER,
+    PLATFORM_MARKER,
+    SENDER_IS_APP_MARKER,
+    AdminMessageType,
+    platform_on_behalf_of,
+)
+from switch_core.clients.mentions import mention_regex, strip_emphasis
+from switch_core.db.models import BridgeMessageMap, Client, ExternalUser
+from switch_core.db.session_scope import tenant_session
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.bridge_message_map_store import BridgeMessageMapStore
+from switch_core.db.stores.client_store import ClientStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.room_store import (
+    LINKED_CHANNEL_NAME_KEY,
+    RoomStore,
+)
+from switch_core.db.tenant_lookup import tenant_of_room
+from switch_core.logging_context import log_context
+from switch_core.observability.catalogue import (
+    BRIDGE_CALL_DURATION,
+    BRIDGE_ERRORS,
+    BRIDGE_EVENTS_IN,
+    BRIDGE_EVENTS_OUT,
+)
+from switch_core.observability.metrics import metrics
+from switch_core.process_lease import LEASE_TTL, RENEW_EVERY_SECONDS
+from switch_core.provisioning import Provisioning
+from switch_core.room_service import RoomCreateConfig
+from switch_core.room_wide_mention import is_room_wide_mention
+from switch_core.session_activity.bridge_answers import ApprovalAnswers
+from switch_core.session_activity.listener import AgentSessionActivityListener
+from switch_core.session_activity.publisher import (
+    AgentSessionActivityPublisher,
+)
+from switch_core.session_activity.service import (
+    AgentSessionActivityService,
+    PlatformPerson,
+)
+from switch_core.sessions.attachments import normalise_mime_type
+from switch_core.sessions.errors import SessionError
+from switch_core.tenant_context import no_tenant, tenant_scope
+from switch_core.transport import (
+    InboundMedia as TransportMedia,
+)
+from switch_core.transport import (
+    InboundMessage as TransportMessage,
+)
+from switch_core.transport import (
+    RoomRef,
+    TransportError,
+    writes_derived_from,
+)
+from switch_core.trust.client import (
+    NullTrustClient,
+    TrustClient,
+    check_message,
+    trust_annotation,
+    trust_redaction_notice,
+)
+
+if TYPE_CHECKING:
+    from switch_core.bridges.agent.protocol.agent_connections import (
+        AgentConnectionRegistry,
+    )
+    from switch_core.clients.client_lifecycle_service import ClientLifecycleService
+    from switch_core.clients.workspace_consumer import WorkspaceConsumer
+    from switch_core.events import CommandEvent
+    from switch_core.room_service import RoomService
+
+
+logger = logging.getLogger(__name__)
+
+_InboundEventT = TypeVar(
+    "_InboundEventT",
+    InboundInteraction,
+    InboundMessage,
+    InboundCommand,
+    InboundAgentJoin,
+    InboundUserJoin,
+    InboundAppJoin,
+)
+
+# How long to wait for a freshly-invited external-user human actor to actually join a
+# room before giving up on relaying its message.
+HUMAN_JOIN_TIMEOUT = 30.0
+
+# How long to hold an incomplete outbound attachment group before relaying the
+# parts that arrived, flagged as incomplete (see _schedule_outbound_group_flush).
+OUTBOUND_GROUP_TIMEOUT_SECONDS = 5.0
+
+# How old a claim on a room message going out (`_claim_outbound`) must be,
+# still with no post, before it is taken to be from a holder that died
+# between claiming and posting, and claimed again. Under the soonest the next
+# holder can read the message after such a death: the process lease lapsing
+# (`LEASE_TTL` after its last renewal, which came at most `RENEW_EVERY_SECONDS`
+# before the claim). Only one process holds the bridge at a time, so no live
+# post in flight is ever read by another holder this soon.
+_UNPOSTED_CLAIM_LAPSES_AFTER = timedelta(
+    seconds=LEASE_TTL.total_seconds() - 2 * RENEW_EVERY_SECONDS
+)
+
+# How long to wait for the person behind a human actor's client row that
+# another process has just written, before giving up on telling whose it is.
+# That process writes the `ExternalUser` right after the client.
+_HUMAN_ACTOR_MINTING_SECONDS = 2.0
+
+
+def _is_thread_reply(content: Mapping[str, object]) -> bool:
+    relates = content.get("m.relates_to")
+    return isinstance(relates, dict) and relates.get("rel_type") == "m.thread"
+
+
+@dataclass
+class _PendingOutboundGroup:
+    """Files of a multi-attachment message seen so far, keyed by group index."""
+
+    total: int
+    # The room the group is in (its transport id) and the lowest `messages.seq`
+    # among its files so far: the bridge's progress in the room is held back
+    # to before it until the group is posted (`held_from`), so whoever holds
+    # the bridge next posts it if this process stops first.
+    room_id: str
+    from_seq: int
+    parts: dict[int, OutboundAttachment] = field(default_factory=dict)
+    # The room event of each file, by group index.
+    event_ids: dict[int, str] = field(default_factory=dict)
+    caption: str | None = None
+
+
+_LOBBY_DEPRECATION_NOTICE = (
+    "👋 This isn't where you talk to agents — direct messages to the Switch "
+    "app aren't routed to anyone. Head to a channel and @-mention an agent "
+    "there to start collaborating."
+)
+
+
+def _no_agents_notice(slash_hint: str | None) -> str:
+    """The agentless-room notice, carrying only the invite forms this bridge has.
+
+    The `!` form works everywhere. The slash form does not — whether it exists
+    at all, and how an argument is spelled, are both per-platform — so the
+    adapter supplies that line, or none on a platform with no slash commands.
+    """
+    typed = "• `!invite-agent @agent-name` — type it here in the channel"
+    invites = f"{typed}, or\n• {slash_hint}." if slash_hint else f"{typed}."
+    return (
+        "👋 I've linked this channel to a new Switch room, but there are no agents "
+        "in it yet — so no one is here to respond to messages.\n\n"
+        "**To add an agent**, invite one by name (swap in the agent you want):\n"
+        f"{invites}\n\n"
+        "Once an agent is in the room, @-mention it here and it'll pick up the "
+        "conversation."
+    )
+
+
+def _post_source(bridge_id: str, channel_id: str, message_ref: str) -> str:
+    """What a platform post's room rows are numbered from: the post's own
+    reference on its channel of this bridge, the same each time the platform
+    delivers it.
+
+    A platform may deliver one post twice. Slack sends a Socket Mode event
+    again when its acknowledgement did not arrive, as when the process holding
+    the bridge stopped between storing the post and acknowledging it, and a
+    webhook platform retries a delivery it saw fail. The second delivery finds
+    the rows written and writes nothing new."""
+    return f"{bridge_id}\x1f{channel_id}\x1f{message_ref}"
+
+
+class CollaborationCore:
+    # Tests assemble a CollaborationCore with `__new__`; these read as "not wired",
+    # and the bridge as held here, as it is in a deployment of one process.
+    _activity_publisher: AgentSessionActivityPublisher | None = None
+    _approval_answers: ApprovalAnswers | None = None
+    _active: bool = True
+
+    def __init__(
+        self,
+        *,
+        bridge_id: str,
+        bridge_tenant_id: str,
+        bridge_type: str,
+        bridge_display_name: str,
+        adapter: PlatformAdapter,
+        room_store: RoomStore,
+        external_user_store: ExternalUserStore,
+        bridge_message_map_store: BridgeMessageMapStore,
+        agent_store: AgentStore,
+        client_store: ClientStore,
+        room_service: RoomService,
+        client_lifecycle: ClientLifecycleService,
+        provisioning: Provisioning,
+        session_factory: async_sessionmaker[AsyncSession],
+        id_server_name: str,
+        workspace_consumer_transport_user_id: str,
+        max_attachment_bytes: int,
+        session_activity_listener: AgentSessionActivityListener,
+        session_activity_service: AgentSessionActivityService,
+        connections: AgentConnectionRegistry,
+        active: bool,
+        trust_client: TrustClient = NullTrustClient(),
+    ) -> None:
+        self._bridge_id = bridge_id
+        # Whether this process holds the bridge (`ownership.py`): it listens to
+        # the platform, relays the rooms out to it and draws session activity
+        # there. Every other process runs the bridge too, quietly, to serve
+        # the requests and webhooks that reach it.
+        self._active = active
+        # The tenant of this bridge's own row. Read once here because it is
+        # immutable, but never *bound* for the life of anything: each unit of
+        # work binds it at the point it acts, and room-scoped work binds the
+        # room's tenant instead. The schema makes those the same value —
+        # `rooms` has a composite foreign key to `collaboration_bridges` on
+        # `tenant_id` — but the code does not lean on that, so a room whose
+        # tenant somehow differs is still handled under its own.
+        self._bridge_tenant_id = bridge_tenant_id
+        self._bridge_type = bridge_type
+        self._bridge_display_name = bridge_display_name
+        self._adapter = adapter
+        self._room_store = room_store
+        self._external_user_store = external_user_store
+        self._bridge_message_map_store = bridge_message_map_store
+        self._agent_store = agent_store
+        self._client_store = client_store
+        self._room_service = room_service
+        self._client_lifecycle = client_lifecycle
+        self._provisioning = provisioning
+        self._session_factory = session_factory
+        self._id_server_name = id_server_name
+        self._workspace_consumer_transport_user_id = (
+            workspace_consumer_transport_user_id
+        )
+        self._max_attachment_bytes = max_attachment_bytes
+        self._trust_client = trust_client
+
+        self._channel_to_room: dict[str, tuple[str, str]] = {}
+        self._room_to_channel: dict[tuple[str, str], str] = {}
+        # Switch room id -> its tenant. Filled by `add_room_mapping`, which is
+        # the one way a room enters the channel maps at all, so a room that
+        # has a channel mapping always has a tenant here — including rooms
+        # created long after this bridge started. See `_room_tenant`.
+        self._room_tenants: dict[str, str] = {}
+        self._human_actors: dict[str, str] = {}
+        # External user ids whose stored name is known not to be a platform id,
+        # so the placeholder repair does not re-ask the database once per
+        # message. One-way, so a cached answer cannot go stale — see
+        # _repair_placeholder_username.
+        self._names_known_good: set[str] = set()
+        # Senders known to be people on this bridge, and senders known not to
+        # be: a person first seen by another process is found in the database
+        # once (`_is_human_sender`), and an agent is asked about once.
+        self._human_user_ids: set[str] = set()
+        self._not_human_user_ids: set[str] = set()
+        self._channel_locks: dict[str, asyncio.Lock] = {}
+        self._human_actor_locks: dict[str, asyncio.Lock] = {}
+        # Channels Switch is itself provisioning right now (outbound room
+        # creation / bridge change). The bot auto-joins a channel the instant
+        # it is created, which fires an inbound join before the room↔channel
+        # mapping is committed — auto-room-creation for such a channel would
+        # spawn a duplicate room. Handlers skip adoption while a channel is in
+        # this set. See begin_provisioning / end_provisioning.
+        self._provisioning_channels: set[str] = set()
+        # Outbound multi-attachment messages still assembling, with their
+        # safety-net timers. Cleared on completion or timeout so a group that
+        # never completes cannot leak.
+        self._outbound_groups: dict[str, _PendingOutboundGroup] = {}
+        self._outbound_group_timers: dict[str, asyncio.TimerHandle] = {}
+        # Incomplete groups whose timeout is posting what arrived. Out of
+        # `_outbound_groups`, so a late file of one starts a group of its own,
+        # and still holding the room's progress back until posted.
+        self._flushing_outbound_groups: list[_PendingOutboundGroup] = []
+        # Room-event -> external-post anchors written synchronously right after
+        # room_send, before the durable _record_message_map commit, so a fast
+        # command reply relayed during that DB await still resolves the command's
+        # thread root instead of dropping to the channel root. Popped on commit.
+        # Same race class as _provisioning_channels. See _prerecord_message_map.
+        self._pending_message_maps: dict[str, str] = {}
+        # Identity provisioning runs in the background — see _create_agent_identities.
+        self._identity_task: asyncio.Task[None] | None = None
+        # Agents given an identity by this copy of the bridge, so one deleted
+        # by another process is let go of here too.
+        self._provisioned_agents: dict[str, AgentIdentity] = {}
+        # The tenant's agents as this copy last read them, by agent id, and
+        # which agent each client is, kept up to date by reading only the
+        # agents a change names (`_update_agent_identities`). None until a
+        # run has read them all.
+        self._agent_view: dict[str, AgentIdentity] | None = None
+        self._agent_of_client: dict[str, str] = {}
+        # Whether every agent has to be read again, and the clients whose
+        # agents do, for the provisioning run going or the next one.
+        self._identities_stale = False
+        self._identities_owed: set[str] = set()
+        self._channel_type_refresh_task: asyncio.Task[None] | None = None
+        # Turns and request cards from the tables the host reports to, pushed
+        # as they change. Only where the platform draws session activity.
+        self._connections = connections
+        self._session_activity_service = session_activity_service
+        self._activity_publisher = (
+            AgentSessionActivityPublisher(
+                adapter=adapter,
+                bridge_id=bridge_id,
+                bridge_type=bridge_type,
+                tenant_id=bridge_tenant_id,
+                listener=session_activity_listener,
+                session_factory=session_factory,
+                agent_online=connections.is_live,
+            )
+            if adapter.draws_session_activity
+            else None
+        )
+        self._approval_answers = (
+            ApprovalAnswers(
+                bridge_id=bridge_id,
+                service=session_activity_service,
+                session_factory=session_factory,
+                identify=self._identify_actor,
+                is_first_reply=adapter.is_first_reply,
+            )
+            if adapter.draws_session_activity
+            else None
+        )
+
+    @property
+    def adapter(self) -> PlatformAdapter:
+        return self._adapter
+
+    def relays_room(self, room_id: str) -> bool:
+        """Whether a message in this Switch room reaches the platform now.
+
+        A bridge is registered before `start` has loaded its channel map, and a
+        room it has no channel for is dropped by `handle_outbound_message`, so
+        being registered is not the same as relaying."""
+        return self._find_channel(room_id=room_id) is not None
+
+    @property
+    def tenant_id(self) -> str:
+        return self._bridge_tenant_id
+
+    @property
+    def bridge_type(self) -> str:
+        """The collaboration platform this bridge talks to."""
+        return self._bridge_type
+
+    @contextmanager
+    def _counted_outbound(self, kind: str) -> Iterator[None]:
+        """Count one relay out to the platform, time it, and count its failure.
+
+        Placed around the relay call rather than at the top of the handler: a
+        handler returns early for a human actor's own echo and for a room with no
+        channel mapping, and neither of those is a message anybody sent
+        outwards.
+
+        The duration is the platform's round trip, and it is the only place in
+        this process where an external API's latency is visible at all. A room
+        that feels unresponsive is usually Slack taking two seconds rather than
+        anything here being wrong, and without this the two are the same
+        picture — a healthy server, relays being counted, and people waiting.
+
+        Only a relay that succeeded is timed. A call that raised took however
+        long its own failure took, which is a different distribution living
+        under the same name; `switch.bridge.errors` is where that shows.
+        """
+        metrics().increment(
+            BRIDGE_EVENTS_OUT,
+            {"bridge": "collaboration", "platform": self._bridge_type, "kind": kind},
+        )
+        started = time.perf_counter()
+        try:
+            yield
+        except Exception:
+            metrics().increment(
+                BRIDGE_ERRORS,
+                {
+                    "bridge": "collaboration",
+                    "platform": self._bridge_type,
+                    "direction": "outbound",
+                },
+            )
+            raise
+        metrics().observe(
+            BRIDGE_CALL_DURATION,
+            {"bridge": "collaboration", "platform": self._bridge_type, "kind": kind},
+            (time.perf_counter() - started) * 1000.0,
+        )
+
+    def _traced(
+        self, kind: str, handler: Callable[[_InboundEventT], Awaitable[None]]
+    ) -> Callable[[_InboundEventT], Awaitable[None]]:
+        """Give each inbound platform event its own id in the logs, count it,
+        and bind the tenant the event belongs to.
+
+        An event fans out across room lookup, identity provisioning and the
+        transport, so without this the lines from two events arriving at once
+        cannot be told apart. Applied where the adapter is wired up rather than
+        inside each handler, so every inbound path gets it — and the same
+        choke point is where the tenant is bound, so a handler needs no
+        session-opening call site of its own to remember it.
+
+        This is what makes the platform irrelevant. An adapter is free to
+        deliver from anywhere: Mattermost's websocket runs on an OS thread and
+        hands the coroutine over with `asyncio.run_coroutine_threadsafe`,
+        which starts it in an *empty* context, while Slack's dispatches from a
+        task that inherited whatever created it. Binding here rather than
+        relying on what the handler inherits means both arrive at the same
+        tenant, so which platform a message came in on stops being able to
+        decide where its room lands.
+
+        A channel with no room yet — auto-room-creation, still to come in the
+        handler — binds the **bridge's** tenant. There is no room to ask, but
+        there is nothing ambient about the answer either: a room this bridge
+        creates belongs to the tenant that owns the bridge, and the schema
+        agrees (`rooms` keys to `collaboration_bridges` on `tenant_id`).
+        """
+
+        async def traced(event: _InboundEventT) -> None:
+            event_id = uuid.uuid4().hex[:16]
+            with log_context(
+                request_id=f"{self._bridge_type}-{event_id}",
+                bridge="collaboration",
+                platform=self._bridge_type,
+            ):
+                metrics().increment(
+                    BRIDGE_EVENTS_IN,
+                    {
+                        "bridge": "collaboration",
+                        "platform": self._bridge_type,
+                        "event": kind,
+                    },
+                )
+                room_ids = self._channel_to_room.get(event.channel_id)
+                tenant_id = (
+                    self._bridge_tenant_id
+                    if room_ids is None
+                    else await self._room_tenant(room_ids[0])
+                )
+                # `room_ids` is (Switch room id, transport room id); the log
+                # field is the first. None until the mapping exists, which is
+                # the honest reading for a channel whose room the handler is
+                # about to create.
+                room_id = room_ids[0] if room_ids else None
+                with tenant_scope(tenant_id), log_context(room_id=room_id):
+                    try:
+                        await handler(event)
+                    except Exception:
+                        # Counted here and re-raised unchanged: whoever handles
+                        # it above still does. An inbound handler that fails is
+                        # a message a person sent and nobody received, which is
+                        # invisible from the platform's side.
+                        metrics().increment(
+                            BRIDGE_ERRORS,
+                            {
+                                "bridge": "collaboration",
+                                "platform": self._bridge_type,
+                                "direction": "inbound",
+                            },
+                        )
+                        raise
+
+        return traced
+
+    async def start(self) -> None:
+        await self._load_channel_map()
+        await self._load_existing_human_actors()
+        self._adapter.set_channel_migration_handler(self._handle_channel_migrated)
+        self._adapter.set_channel_type_handler(self._record_channel_type)
+        self._adapter.set_channel_rename_handler(self._handle_channel_named)
+        self._adapter.set_agent_presentation_resolver(self._agent_presentation)
+        # A bridge on a shared connection that started before the connection
+        # was up is attached later (when it comes up, or on its first event).
+        # Provisioning that ran at start unattached would have failed, so it is
+        # re-run on attach.
+        if isinstance(self._adapter, SupportsSharedConnection):
+            self._adapter.set_on_attached(self._provision_identities_on_attach)
+        if self._approval_answers is not None:
+            self._adapter.set_interaction_handler(
+                self._traced("interaction", self._handle_inbound_interaction)
+            )
+        if self._activity_publisher is not None:
+            self._adapter.set_activity_resolver(
+                self._activity_publisher.activity_shown_at
+            )
+        await self._adapter.start(
+            on_message=self._traced("message", self._handle_inbound_message),
+            on_command=self._traced("command", self._handle_inbound_command),
+            on_agent_joined=self._traced(
+                "agent_joined", self._handle_agent_joined_channel
+            ),
+            on_user_joined=self._traced(
+                "user_joined", self._handle_user_joined_channel
+            ),
+            on_app_joined=self._traced("app_joined", self._handle_app_joined_channel),
+        )
+        if self._active:
+            await self._ensure_channel_captures()
+            if self._activity_publisher is not None:
+                self._activity_publisher.start()
+        # Deliberately not awaited. Provisioning is one call per agent against
+        # the platform, and a rate-limited platform makes that minutes of
+        # mostly waiting — which would hold up the bridge coming online, and
+        # with it every other bridge behind it at startup and any request that
+        # restarts one. Messages do not depend on it: an agent is addressable
+        # by name whether or not its platform identity exists yet. Every
+        # process provisions, the adapter deciding how much a quiet one needs.
+        # Not yet on a shared connection that is not attached: every agent's
+        # call would fail, and attaching provisions them all. Guarded, since
+        # an attach while the adapter started may have begun a run already.
+        if not self._awaiting_shared_connection():
+            self._provision_identities_on_attach()
+        # Not awaited either: one platform read per channel, and nothing waits
+        # on it. Only where the bridge is held: one process is enough.
+        if self._active:
+            self._channel_type_refresh_task = asyncio.create_task(
+                self._run_channel_type_refresh()
+            )
+
+    @property
+    def active(self) -> bool:
+        """Whether this process holds the bridge and listens for it."""
+        return self._active
+
+    def agents_changed(self, client_ids: Collection[str] | None = None) -> None:
+        """Agents were registered, renamed or deleted in this bridge's tenant,
+        maybe by another process: give the new ones their platform identities
+        here and let go of the deleted ones'. Only the agents of `client_ids`
+        are read again, or every agent when None. A run already going reads
+        them once it is done, in case it read them before the change."""
+        if client_ids is None or self._agent_view is None:
+            self._identities_stale = True
+        else:
+            self._identities_owed.update(client_ids)
+        if not self._awaiting_shared_connection():
+            self._start_identity_run()
+
+    def _awaiting_shared_connection(self) -> bool:
+        """Whether the bridge waits to be attached to its platform's shared
+        connection, which provisions the agents' identities once it is."""
+        return (
+            isinstance(self._adapter, SupportsSharedConnection)
+            and self._adapter.awaiting_shared_connection()
+        )
+
+    async def stop(self) -> None:
+        try:
+            if self._activity_publisher is not None:
+                await self._activity_publisher.stop()
+        finally:
+            # Closed whatever the publisher raised: the bridge's lease is let
+            # go of once this returns or raises, and the next holder's
+            # platform connection must not run beside this one.
+            if self._identity_task and not self._identity_task.done():
+                self._identity_task.cancel()
+            self._identity_task = None
+            if (
+                self._channel_type_refresh_task
+                and not self._channel_type_refresh_task.done()
+            ):
+                self._channel_type_refresh_task.cancel()
+            self._channel_type_refresh_task = None
+            await self._adapter.stop()
+
+    # ── Startup loading ──────────────────────────────────────────────────────
+
+    async def _load_channel_map(self) -> None:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            rooms = await self._room_store.get_by_bridge(session, self._bridge_id)
+        for room in rooms:
+            if room.external_channel_id:
+                self.add_room_mapping(
+                    room.id,
+                    room.transport_room_id,
+                    room.external_channel_id,
+                    room.tenant_id,
+                )
+
+    async def _room_tenant(self, room_id: str) -> str:
+        """The tenant `room_id` belongs to, resolved and cached.
+
+        Cached by room id rather than assumed to be this bridge's own tenant:
+        nothing here relies on a bridge never carrying rooms in more than one
+        tenant, only on a given room's tenant never changing once it exists —
+        the same invariant `_channel_to_room` already relies on for the
+        channel mapping.
+
+        A miss should not happen — `add_room_mapping` fills the tenant along
+        with the channel mapping, and this is only ever asked about a room
+        that has one — but if it does, the answer comes from the exemption
+        (`db/tenant_lookup.py`) rather than from a read of the row. Asking
+        "which tenant is this room in" while a tenant is bound would either
+        confirm the guess or return nothing, and the second reads as "no such
+        room" for a room that exists in another tenant. The whole point of
+        resolving is that the answer is not known yet.
+
+        This is the shape the exemption is for. The fallback needed one field
+        of one row, and the field was the tenant; it now reads no row at all.
+        """
+        cached = self._room_tenants.get(room_id)
+        if cached is not None:
+            return cached
+        tenant_id = await tenant_of_room(self._session_factory, room_id)
+        if tenant_id is None:
+            raise ValueError(f"Room not found: {room_id}")
+        self._room_tenants[room_id] = tenant_id
+        return tenant_id
+
+    async def _load_existing_human_actors(self) -> None:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            users = await self._external_user_store.get_by_bridge(
+                session, self._bridge_id
+            )
+            client_records = {
+                user.client_id: await self._client_store.get(session, user.client_id)
+                for user in users
+            }
+
+        self._adapter.prime_mention_targets(
+            {user.external_username: user.external_user_id for user in users}
+        )
+
+        for user in users:
+            self._human_actors[user.external_user_id] = user.client_id
+
+            client = self._client_lifecycle.get(user.client_id)
+            if client is None:
+                record = client_records.get(user.client_id)
+                if record:
+                    client = self._client_lifecycle.start_client(record)
+
+            if client:
+                self._human_user_ids.add(client.transport_user_id)
+
+    def _provision_identities_on_attach(self) -> None:
+        """Run identity provisioning when a shared connection attaches.
+
+        A shared bridge started before the connection was up skipped the
+        start-time run, as it had no connection yet. Attaching gives it one,
+        so provision now — a fresh background task, not awaited, for the same
+        reason `start` gives. `start` and `agents_changed` begin their runs
+        here too, for the guard below.
+
+        Guarded against overwriting a still-running task. A run spends most
+        of its life in the agent read (`_create_agent_identities` awaits
+        `get_all` before the per-agent loop), and an attach can land while the
+        adapter is starting, before `start` asks for its own run, so a second
+        call during a run must not spawn a second provisioner: two concurrent
+        `create_agent_identity` calls can double a role through its
+        check-then-create window, and overwriting the handle would orphan the
+        task `stop` cancels. A run still going reaches the per-agent loop
+        against the connection as it is by then; one that has finished is
+        replaced.
+        """
+        self._identities_stale = True
+        self._start_identity_run()
+
+    def _start_identity_run(self) -> None:
+        if self._identity_task is not None and not self._identity_task.done():
+            return
+        self._identity_task = asyncio.create_task(self._run_agent_identities())
+
+    async def _run_agent_identities(self) -> None:
+        """Wrapper for the background provisioning task.
+
+        A bare create_task swallows whatever the coroutine raises, so anything
+        escaping the per-agent handling below would vanish without trace.
+        Cancellation is ordinary shutdown and says so quietly.
+
+        `no_tenant` for the same reason the bridge's own task does it: this is
+        a task, and a task keeps whatever context created it. The work inside
+        binds the bridge's tenant for itself."""
+        with no_tenant():
+            await self._run_agent_identities_unbound()
+
+    async def _run_agent_identities_unbound(self) -> None:
+        try:
+            while True:
+                if self._identities_stale:
+                    self._identities_stale = False
+                    self._identities_owed = set()
+                    await self._create_agent_identities()
+                elif self._identities_owed:
+                    owed, self._identities_owed = self._identities_owed, set()
+                    try:
+                        await self._update_agent_identities(owed)
+                    except BaseException:
+                        # Read again by the next run, whatever starts it.
+                        self._identities_owed |= owed
+                        raise
+                else:
+                    break
+        except asyncio.CancelledError:
+            logger.info(
+                "%s identity provisioning cancelled before finishing",
+                self._bridge_type,
+            )
+            raise
+        except Exception:
+            logger.exception(
+                "%s identity provisioning stopped unexpectedly", self._bridge_type
+            )
+
+    async def _create_agent_identities(self) -> None:
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            agents = await self._agent_store.get_all(session)
+        current = {agent.id: agent_identity(agent) for agent in agents}
+        self._agent_view = current
+        self._agent_of_client = {agent.client_id: agent.id for agent in agents}
+        await self._sync_agent_identities(current, sorted(self._provisioned_agents))
+
+    async def _update_agent_identities(self, client_ids: set[str]) -> None:
+        """`_create_agent_identities` for the agents of `client_ids` only:
+        their rows are read and the rest of the tenant's agents are taken as
+        this copy last read them, which with thousands of agents is the
+        difference between reading one row per change and every row."""
+        if self._agent_view is None:
+            await self._create_agent_identities()
+            return
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            agents = await self._agent_store.get_by_client_ids(
+                session, sorted(client_ids)
+            )
+        found = {agent.client_id: agent for agent in agents}
+        view = self._agent_view
+        changed: set[str] = set()
+        for client_id in client_ids:
+            agent = found.get(client_id)
+            known = self._agent_of_client.pop(client_id, None)
+            if known is not None:
+                view.pop(known, None)
+                changed.add(known)
+            if agent is not None:
+                self._agent_of_client[client_id] = agent.id
+                view[agent.id] = agent_identity(agent)
+                changed.add(agent.id)
+        await self._sync_agent_identities(
+            view, sorted(changed & self._provisioned_agents.keys())
+        )
+
+    async def _sync_agent_identities(
+        self, current: dict[str, AgentIdentity], compared: list[str]
+    ) -> None:
+        """Bring the platform in line with `current`, the tenant's agents:
+        the agents of `compared` this copy gave an identity to are renamed,
+        relabelled or let go of to match it, then every agent's identity is
+        provisioned."""
+        # Deleted, renamed or relabelled since the last run here, wherever that
+        # was served: a change served by another process reaches this copy of
+        # the bridge only through a re-read.
+        for agent_id in compared:
+            before = self._provisioned_agents[agent_id]
+            after = current.get(agent_id)
+            try:
+                if after is None:
+                    await self._adapter.remove_agent_identity(before)
+                elif after.name != before.name:
+                    await self._adapter.rename_agent_identity(before.name, after)
+                elif after != before:
+                    await self._adapter.update_agent_identity(after)
+            except Exception:
+                logger.exception(
+                    "Failed to bring the %s identity of agent %s up to date",
+                    self._bridge_type,
+                    before.name,
+                )
+            if after is None:
+                del self._provisioned_agents[agent_id]
+
+        failures = await self._adapter.sync_agent_identities(list(current.values()))
+        failed = {name for name, _ in failures}
+        for name, exc in failures:
+            logger.error(
+                "Failed to provision %s identity for agent %s: %s",
+                self._bridge_type,
+                name,
+                exc,
+                exc_info=exc,
+            )
+        for identity in current.values():
+            if identity.name not in failed:
+                self._provisioned_agents[identity.agent_id] = identity
+
+        # Counts calls that returned, not identities that now exist: an adapter
+        # that cannot provision at all reports that itself. Reporting the agent
+        # count regardless of failures would read as success on a run where
+        # every one of them failed.
+        if failures:
+            logger.warning(
+                "Provisioned %s identities for %d agents; %d failed",
+                self._bridge_type,
+                len(current),
+                len(failures),
+            )
+        else:
+            logger.info(
+                "Provisioned %s identities for %d agents",
+                self._bridge_type,
+                len(current),
+            )
+
+    async def _ensure_channel_captures(self) -> None:
+        """Ask the adapter to (re)establish server-side message capture for this
+        bridge's channels. Runs on startup so capture self-heals after a restart
+        or a notification-URL change (e.g. a rotated tunnel). A no-op for
+        adapters that don't use expiring subscriptions."""
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            rooms = await self._room_store.get_by_bridge(session, self._bridge_id)
+        channels: list[tuple[str, str]] = []
+        for room in rooms:
+            if room.external_channel_id and room.channel_type:
+                channels.append((room.external_channel_id, room.channel_type))
+        if channels:
+            await self._adapter.ensure_channel_subscriptions(channels)
+
+    async def _run_channel_type_refresh(self) -> None:
+        """Wrapper for the background channel-type refresh; see
+        `_run_agent_identities` for why it exists and unbinds the tenant."""
+        with no_tenant():
+            try:
+                await self._refresh_channel_types()
+            except asyncio.CancelledError:
+                logger.info(
+                    "%s channel type refresh cancelled before finishing",
+                    self._bridge_type,
+                )
+                raise
+            except Exception:
+                logger.exception(
+                    "%s channel type refresh stopped unexpectedly", self._bridge_type
+                )
+
+    async def _refresh_channel_types(self) -> None:
+        """Have the adapter re-read the type of every channel this bridge's
+        live rooms are bound to, so quiet channels are corrected too."""
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            rooms = await self._room_store.get_by_bridge(session, self._bridge_id)
+        channel_ids = sorted(
+            {
+                room.external_channel_id
+                for room in rooms
+                if room.external_channel_id
+                and room.archived_at is None
+                and room.channel_type in ("channel_public", "channel_private")
+            }
+        )
+        if channel_ids:
+            await self._adapter.refresh_channel_types(channel_ids)
+
+    async def _record_channel_type(
+        self, channel_id: str, channel_type: ChannelType
+    ) -> None:
+        """Correct rooms bound to a channel whose saved privacy the platform
+        contradicts. It matters beyond the label: moving a room to another
+        bridge keeps its saved type, so a private room saved as public would
+        get a public channel there."""
+        if channel_type not in ("channel_public", "channel_private"):
+            return
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            corrected = await self._room_store.correct_channel_type(
+                session,
+                bridge_id=self._bridge_id,
+                external_channel_id=channel_id,
+                channel_type=channel_type,
+            )
+            await session.commit()
+        for room_id in corrected:
+            logger.warning(
+                "Room %s was saved with the wrong privacy; %s reports its "
+                "channel %s as %s, and the room now says so",
+                room_id,
+                self._bridge_type,
+                channel_id,
+                channel_type,
+            )
+
+    async def _handle_channel_named(
+        self, channel_id: str, old_name: str, new_name: str
+    ) -> None:
+        """The platform reports this channel's name (renamed from `old_name`,
+        or unchanged). The room linked to it follows when it is named after
+        the channel (`NAME_SOURCE_KEY` "channel"), or, from before that was
+        kept, when its name is exactly the one it was made with from the old
+        channel name. Any other room keeps its name, and the channel's is
+        recorded for whoever wants to take it (`/rooms/{id}/sync-name`)."""
+        bridge_name = self._bridge_display_name
+        name = f"{bridge_name}: {new_name}"
+        with tenant_scope(self._bridge_tenant_id):
+            async with tenant_session(
+                self._session_factory, self._bridge_tenant_id
+            ) as session:
+                room = await self._room_store.get_by_external_channel(
+                    session, bridge_id=self._bridge_id, external_channel_id=channel_id
+                )
+            if room is None:
+                return
+            metadata = room.metadata_ or {}
+            if room.name != name and await self._room_service.follow_channel_name(
+                room.id, name, new_name, f"{bridge_name}: {old_name}"
+            ):
+                return
+            if metadata.get(LINKED_CHANNEL_NAME_KEY) != new_name:
+                await self._room_service.record_channel_name(room.id, new_name)
+
+    # ── Inbound (platform → room) ───────────────────────────────────────────
+
+    async def _agent_presentation(self, agent_name: str) -> AgentPresentation | None:
+        """How an agent is presented — its label and its icon — off one row.
+
+        Installed on the adapter as its presentation resolver. A name matching
+        no agent — an alias, or a bot the platform reports that Switch does not
+        own — yields None rather than an error, since the caller only wants to
+        know whether to override what it already has. Either field being None
+        within a hit means the same thing one field down: the agent was given
+        no value, and the adapter's default stands.
+
+        Installed on the adapter, so it is called from the adapter's own task
+        with nothing bound rather than through `_traced` — hence the explicit
+        bind. Agent names are unique per tenant, not globally, so an unscoped
+        read here would raise `MultipleResultsFound` the day a second tenant
+        has an agent of the same name.
+        """
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            agent = await self._agent_store.get_by_name(session, agent_name)
+        if agent is None:
+            return None
+        return AgentPresentation(
+            display_name=agent.display_name, icon_url=agent.icon_url
+        )
+
+    async def _is_registered_agent(self, name: str) -> bool:
+        """Whether `name` is a registered Switch agent. Switch creates each
+        bridge bot with username == agent name, so a bridged agent's bot
+        account resolves here — letting us keep it out of the external-user
+        path while leaving third-party bots and humans alone."""
+        async with self._session_factory() as session:
+            agent = await self._agent_store.get_by_name(session, name)
+        return agent is not None
+
+    async def _maybe_guide_self_mention(
+        self, msg: InboundMessage, room_id: str
+    ) -> None:
+        """When a user tags the bridge bot itself but the bot is not an alias
+        for any agent in this room, post guidance instead of letting the
+        mention fall through silently. A bot mention that IS an alias routes to
+        the aliased agent via the normal path, so it is left alone."""
+        token = msg.self_mention_token
+        if token is None:
+            return
+        async with self._session_factory() as session:
+            if await self._room_store.get_agent_id_by_alias(session, room_id, token):
+                return
+            agent_ids = await self._room_store.get_agent_ids(session, room_id)
+            agents: list[tuple[str, str]] = []
+            for aid in agent_ids:
+                agent = await self._agent_store.get(session, aid)
+                if agent is not None:
+                    agents.append((agent.name, agent.description))
+
+        app_mention = self._adapter.render_app_mention(token)
+        if agents:
+            agent_list = "\n".join(
+                f"• @{name} — {description}" for name, description in agents
+            )
+        else:
+            agent_list = "_No agents are in this channel yet._"
+        content = (
+            f"👋 You tagged {app_mention} directly — I'm not linked to an agent "
+            "in this channel yet.\n\n"
+            f"**Agents you can tag directly:**\n{agent_list}"
+        )
+        # The `!set-alias` shortcut only makes sense when the bot handle is a
+        # valid alias token. Some platforms (e.g. Teams) use a bot id containing
+        # characters an alias can't hold (a `:`), so we omit the line there —
+        # tagging an agent by name (above) works regardless.
+        try:
+            validate_alias_format(token)
+        except AliasError:
+            pass
+        else:
+            content += (
+                "\n\n**To make me an agent's entry point**, copy the line below and "
+                "swap in the agent's name — after that, tagging me here routes to "
+                f"that agent:\n!set-alias @agent_name {app_mention}"
+            )
+        thread_root_id = msg.root_id or msg.message_ref
+        await self._adapter.admin_message(
+            msg.channel_id,
+            content,
+            thread_root_id,
+            message_type=AdminMessageType.SELF_MENTION_UNALIASED.value,
+        )
+
+    async def _resolve_self_mention_target(
+        self, msg: InboundMessage, room_id: str
+    ) -> str | None:
+        """The agent a bot @mention should address, or None.
+
+        A bot mention resolves to an agent when the bot handle is that agent's
+        room alias (matching Slack's behaviour), or — the common single-agent
+        case — when the room holds exactly one agent. Zero or several unaliased
+        agents are ambiguous, so we return None and let the caller post guidance.
+        """
+        token = msg.self_mention_token
+        if token is None:
+            return None
+        async with self._session_factory() as session:
+            agent_id = await self._room_store.get_agent_id_by_alias(
+                session, room_id, token
+            )
+            if agent_id is None:
+                agent_ids = await self._room_store.get_agent_ids(session, room_id)
+                if len(agent_ids) == 1:
+                    agent_id = agent_ids[0]
+            if agent_id is None:
+                return None
+            agent = await self._agent_store.get(session, agent_id)
+        return agent.name if agent is not None else None
+
+    async def _handle_lobby_message(self, msg: InboundMessage) -> None:
+        """The Slack app's DM ("lobby") is deprecated for talking to agents.
+        Reply with a pointer to the onboarding docs instead of routing."""
+        thread_root_id = msg.root_id or msg.message_ref
+        await self._adapter.admin_message(
+            msg.channel_id, _LOBBY_DEPRECATION_NOTICE, thread_root_id
+        )
+
+    async def _handle_inbound_message(self, msg: InboundMessage) -> None:
+        logger.debug(
+            "[BRIDGE-IN] channel=%s sender=%s content=%s",
+            msg.channel_id,
+            msg.sender_name,
+            msg.content[:80],
+        )
+        if await self._is_registered_agent(msg.sender_name):
+            # A bridged Switch agent's own message echoed back from the platform.
+            # The agent posts natively in the Switch room (that is where agents
+            # see each other), so re-importing the echo would double-post it and spawn a
+            # duplicate "user" identity for the agent. Drop it. Note
+            # this is by *name*, so genuine third-party bots and humans still
+            # bridge in normally.
+            logger.debug(
+                "[BRIDGE-IN] dropping echo from Switch agent %s", msg.sender_name
+            )
+            return
+        if msg.channel_type == "lobby":
+            # The Slack app's DM ("lobby") is deprecated as a place to talk to
+            # agents: point the user at the docs instead of auto-creating a room
+            # and routing the message. Only Slack im/mpim map to "lobby".
+            await self._handle_lobby_message(msg)
+            return
+        # An answer typed in words. Almost no message is one, and the check is a
+        # parse before it is a query, so this costs a channel nothing. It does
+        # not consume the message: the room still sees what was said.
+        await self._handle_text_answer(msg)
+        room_ids = self._channel_to_room.get(msg.channel_id)
+        if room_ids is None:
+            lock = self._channel_locks.setdefault(msg.channel_id, asyncio.Lock())
+            async with lock:
+                room_ids = self._channel_to_room.get(msg.channel_id)
+                if room_ids is None:
+                    room_ids = await self._create_room_for_channel(
+                        channel_id=msg.channel_id,
+                        channel_type=msg.channel_type,
+                        agent_name=msg.agent_name,
+                        sender_name=msg.sender_name,
+                        channel_name=msg.channel_name,
+                    )
+            if room_ids is None:
+                return
+
+        room_id, transport_room_id = room_ids
+
+        # A bot @mention carries no agent name in its text (the platform tags the
+        # bot, not the agent). Resolve which agent it addresses so we can inject
+        # an `@<agent>` the addressing layer matches on; if it can't be resolved,
+        # fall back to guidance.
+        mention_target: str | None = None
+        if msg.self_mention_token is not None:
+            mention_target = await self._resolve_self_mention_target(msg, room_id)
+            if mention_target is None:
+                await self._maybe_guide_self_mention(msg, room_id)
+
+        await self._repair_placeholder_username(msg.sender_id, msg.sender_name)
+        human_actor = await self._ensure_human_in_room(
+            external_user_id=msg.sender_id,
+            external_username=msg.sender_name,
+            room_id=room_id,
+            transport_room_id=transport_room_id,
+        )
+        if human_actor is None:
+            return
+
+        content = self._adapter.translate_inbound(msg.content)
+        if mention_target is not None and (
+            mention_regex(mention_target).search(strip_emphasis(content)) is None
+        ):
+            content = f"@{mention_target} {content}"
+        logger.debug(
+            "[BRIDGE-IN] writing to room=%s as human=%s attachments=%d",
+            transport_room_id,
+            human_actor.transport_user_id,
+            len(msg.attachments),
+        )
+
+        # Bridge threads inbound: if the external post replied into a thread,
+        # resolve that external root to the room event we bridged for it.
+        thread_root_id: str | None = None
+        if msg.root_id is not None:
+            thread_root_id = await self._event_for_external_post(msg.root_id)
+            if thread_root_id is None:
+                logger.warning(
+                    "[BRIDGE-IN] no room message mapped for external root %s; "
+                    "posting top-level in room %s",
+                    msg.root_id,
+                    transport_room_id,
+                )
+
+        # An attachment the platform offered but we could not relay must be
+        # visible in the room, not swallowed. Append it to the message body so
+        # both the agent and the humans see that a file went missing.
+        if msg.attachment_failures:
+            notes = "\n".join(
+                f"_attachment not relayed: {failure.filename} — {failure.reason}_"
+                for failure in msg.attachment_failures
+            )
+            content = f"{content}\n{notes}" if content.strip() else notes
+
+        if not msg.attachments:
+            check = await check_message(
+                self._trust_client,
+                role="user",
+                content=content,
+                room_id=room_id,
+            )
+            # A REDACTED verdict with nothing to redact with is not safe to
+            # treat as a pass: sending the original content then would be
+            # indistinguishable from not checking at all, so it is handled
+            # like a block.
+            if check.blocked or (
+                check.outcome == "redacted" and check.redacted_content is None
+            ):
+                logger.warning(
+                    "[BRIDGE-IN] message from %s not relayed — Switch Trust "
+                    "outcome=%s (policy=%s) — room %s",
+                    msg.sender_name,
+                    check.outcome,
+                    check.policy_id,
+                    transport_room_id,
+                )
+                await self._post_trust_notice(
+                    msg,
+                    "🚫 Your message was blocked by Switch Trust and was not "
+                    "delivered to the room. You can still see it, but agents "
+                    "can't access it.",
+                    AdminMessageType.TRUST_BLOCKED,
+                )
+                return
+            if check.redacted_content is not None:
+                content = check.redacted_content
+            annotation = trust_annotation(check)
+            if annotation is not None:
+                content = f"{content}\n\n{annotation}"
+            with writes_derived_from(
+                human_actor.client_id,
+                _post_source(self._bridge_id, msg.channel_id, msg.message_ref),
+            ):
+                event_id = await human_actor.send_message(
+                    transport_room_id,
+                    content,
+                    format="markdown",
+                    thread_root_id=thread_root_id,
+                    metered=True,
+                    extra_content=(
+                        {SENDER_IS_APP_MARKER: True} if msg.sender_is_app else None
+                    ),
+                )
+            if event_id is None:
+                logger.error(
+                    "[BRIDGE-IN] failed to relay message from %s into room %s — "
+                    "it will not reach the room",
+                    msg.sender_name,
+                    transport_room_id,
+                )
+                return
+            # Tell the sender what happened only now that the message is
+            # actually confirmed to have reached the room — posting this
+            # beforehand risks telling them their message was flagged/
+            # redacted when it never got there at all.
+            if check.redacted_content is not None:
+                redaction_notice = trust_redaction_notice(check)
+                if redaction_notice is not None:
+                    await self._post_trust_notice(
+                        msg, redaction_notice, AdminMessageType.TRUST_REDACTED
+                    )
+            if annotation is not None:
+                # The room itself never relays a human-authored event back out
+                # to a platform (see handle_outbound_message's human-sender
+                # skip), so without this the sender would never see the
+                # annotation their own client just appended to their message.
+                notice_type = (
+                    AdminMessageType.TRUST_ALERTED
+                    if check.outcome == "alerted"
+                    else AdminMessageType.TRUST_ERRORED
+                )
+                await self._post_trust_notice(msg, annotation, notice_type)
+            # Record the correlation so a later reply (either direction) threads.
+            await self._record_message_map(
+                external_channel_id=msg.channel_id,
+                transport_event_id=event_id,
+                external_post_id=msg.message_ref,
+            )
+            return
+
+        # Caption convention: the text rides as the caption on the first
+        # attachment so "text + one image" reaches the agent as a single event;
+        # remaining attachments are sent as bare media events. The first media
+        # event stands in for the post for threading / correlation purposes.
+        caption = content if content.strip() else None
+        first_event_id: str | None = None
+        total = len(msg.attachments)
+        # A platform post hands us all its files at once, so the group is known
+        # up front — no waiting on the receiving side to learn how many to
+        # expect. The room carries them as `total` events sharing this id.
+        # Derived from the post, as the files' rows are: a second delivery of
+        # a post whose first stopped partway writes the files still missing
+        # into the same group, which then completes.
+        source = _post_source(self._bridge_id, msg.channel_id, msg.message_ref)
+        group_id = str(uuid.uuid5(uuid.NAMESPACE_URL, source)) if total > 1 else None
+        for index, attachment in enumerate(msg.attachments):
+            media_uri = await human_actor.upload_media(
+                attachment.data, attachment.mimetype, attachment.filename
+            )
+            msgtype = (
+                "m.image" if attachment.mimetype.startswith("image/") else "m.file"
+            )
+            # Numbered from the post and the file's place in it, as the text
+            # above is, so a second delivery of the post writes no file twice.
+            with writes_derived_from(human_actor.client_id, f"{source}\x1f{index}"):
+                event_id = await human_actor.send_media(
+                    transport_room_id,
+                    media_uri,
+                    attachment.filename,
+                    attachment.mimetype,
+                    len(attachment.data),
+                    msgtype=msgtype,
+                    caption=caption if index == 0 else None,
+                    thread_root_id=thread_root_id,
+                    group=(
+                        {"id": group_id, "index": index, "total": total}
+                        if group_id is not None
+                        else None
+                    ),
+                    metered=True,
+                )
+            if event_id is None:
+                logger.error(
+                    "[BRIDGE-IN] failed to relay attachment %s from %s into room %s",
+                    attachment.filename,
+                    msg.sender_name,
+                    transport_room_id,
+                )
+            if index == 0:
+                first_event_id = event_id
+
+        if first_event_id is not None:
+            await self._record_message_map(
+                external_channel_id=msg.channel_id,
+                transport_event_id=first_event_id,
+                external_post_id=msg.message_ref,
+            )
+
+    async def _post_trust_notice(
+        self, msg: InboundMessage, body: str, message_type: AdminMessageType
+    ) -> None:
+        """Tell the sender's platform what Switch Trust did with their message
+        — blocked, redacted, alerted, or errored. Never lets a failed notice
+        take the inbound message down with it — mirrors
+        `AgentCore._post_trust_blocked_notice`."""
+        try:
+            await self._adapter.admin_message(
+                msg.channel_id,
+                body,
+                msg.root_id or msg.message_ref,
+                message_type=message_type.value,
+            )
+        except Exception:
+            logger.warning(
+                "Could not post a Switch Trust notice to channel %s",
+                msg.channel_id,
+                exc_info=True,
+            )
+
+    async def _handle_inbound_command(self, cmd: InboundCommand) -> None:
+        room_ids = self._channel_to_room.get(cmd.channel_id)
+        if room_ids is None:
+            lock = self._channel_locks.setdefault(cmd.channel_id, asyncio.Lock())
+            async with lock:
+                room_ids = self._channel_to_room.get(cmd.channel_id)
+                if room_ids is None:
+                    room_ids = await self._create_room_for_channel(
+                        channel_id=cmd.channel_id,
+                        channel_type=cmd.channel_type,
+                        agent_name=cmd.agent_name,
+                        sender_name=cmd.sender_name,
+                        channel_name=cmd.channel_name,
+                    )
+            if room_ids is None:
+                return
+        room_id, transport_room_id = room_ids
+
+        human_actor = await self._ensure_human_in_room(
+            external_user_id=cmd.sender_id,
+            external_username=cmd.sender_name,
+            room_id=room_id,
+            transport_room_id=transport_room_id,
+        )
+        if human_actor is None:
+            return
+
+        # Where the command's result should thread. A command typed inside an
+        # existing thread must thread under that thread's ROOT post (root_id) —
+        # the command post itself is a mid-thread reply and a reply cannot be a
+        # Mattermost RootId. A top-level command starts its own thread, rooted
+        # at the command post (message_ref).
+        thread_root_post = cmd.root_id or cmd.message_ref
+        existing_root: str | None = None
+        if thread_root_post is not None:
+            existing_root = await self._event_for_external_post(thread_root_post)
+
+        content: dict[str, object] = {
+            "command": cmd.command,
+            "args": self._adapter.translate_inbound(cmd.args),
+            "user_id": human_actor.transport_user_id,
+            "user_name": cmd.sender_name,
+        }
+        # If the thread root is already bridged, relate the command event to it
+        # so the result threads onto the existing room root (which resolves
+        # back to a valid Mattermost root post). Otherwise the command event
+        # itself anchors the thread (mapping recorded below).
+        if existing_root is not None:
+            content["m.relates_to"] = {
+                "rel_type": "m.thread",
+                "event_id": existing_root,
+            }
+
+        # A command post the platform delivers again (`_post_source`) is
+        # written, and so run, once. One without a post id cannot be told
+        # apart from another, and is written each time.
+        derived_from = (
+            contextlib.nullcontext()
+            if cmd.message_ref is None
+            else writes_derived_from(
+                human_actor.client_id,
+                _post_source(self._bridge_id, cmd.channel_id, cmd.message_ref),
+            )
+        )
+        try:
+            with derived_from:
+                event_id = await human_actor.send_event(
+                    transport_room_id, "com.switch.command", content
+                )
+        except TransportError as exc:
+            logger.error(
+                "Failed to bridge command %s into %s: %s",
+                cmd.command,
+                transport_room_id,
+                exc,
+            )
+            return
+
+        # No bridged room event for the thread root yet: map the command event
+        # to it so a result threaded under the command resolves back to a valid
+        # Mattermost root post (the command post for a top-level command, or the
+        # thread root for an in-thread command whose root we hadn't recorded).
+        if existing_root is None and thread_root_post is not None:
+            # Anchor in memory before the DB write: the write awaits a query that
+            # yields the loop, and a fast reply (e.g. !help) relayed in that gap
+            # would miss the row and land at the channel root. Popped on commit.
+            self._prerecord_message_map(event_id, thread_root_post)
+            try:
+                await self._record_message_map(
+                    external_channel_id=cmd.channel_id,
+                    transport_event_id=event_id,
+                    external_post_id=thread_root_post,
+                )
+            finally:
+                self._pending_message_maps.pop(event_id, None)
+
+    async def _handle_agent_joined_channel(self, join: InboundAgentJoin) -> None:
+        lock = self._channel_locks.setdefault(join.channel_id, asyncio.Lock())
+        async with lock:
+            await self._handle_agent_joined_channel_locked(join)
+
+    async def _handle_agent_joined_channel_locked(self, join: InboundAgentJoin) -> None:
+        logger.debug("Handling agent join to channel %s", join.channel_id)
+        async with self._session_factory() as session:
+            agent = await self._agent_store.get_by_name(session, join.agent_name)
+        if agent is None:
+            # Agent joins can arrive for a name we no longer recognise (e.g. a
+            # stale bot->agent mapping in the adapter for a deleted agent). Skip
+            # it rather than letting room provisioning fail on an unknown agent
+            # name downstream.
+            logger.warning(
+                "Ignoring agent join for unknown agent '%s' on channel %s",
+                join.agent_name,
+                join.channel_id,
+            )
+            return
+        existing = self._channel_to_room.get(join.channel_id)
+        if existing is not None:
+            logger.debug("Room already exist, add %s to channel", join.agent_name)
+            room_id, _ = existing
+            await self._room_service.add_agents_to_room(
+                room_id, agent_names=[join.agent_name], added_by_kind="system"
+            )
+            return
+
+        await self._create_room_for_channel(
+            channel_id=join.channel_id,
+            channel_type=join.channel_type,
+            agent_name=join.agent_name,
+            channel_name=join.channel_name,
+        )
+
+    async def _handle_app_joined_channel(self, join: InboundAppJoin) -> None:
+        """The bridge app itself was added to a channel. Auto-create the room
+        immediately so the channel is bridged from the moment of invite — even
+        if no agent can be associated (see _create_room_for_channel)."""
+        lock = self._channel_locks.setdefault(join.channel_id, asyncio.Lock())
+        async with lock:
+            if self._channel_to_room.get(join.channel_id) is not None:
+                logger.debug(
+                    "App joined channel %s but room already exists", join.channel_id
+                )
+                return
+            await self._create_room_for_channel(
+                channel_id=join.channel_id,
+                channel_type=join.channel_type,
+                channel_name=join.channel_name,
+            )
+
+    async def _handle_channel_migrated(self, old_id: str, new_id: str) -> None:
+        """The platform reissued a channel's id: move the room onto the new one.
+
+        Only the id changes — it is the same conversation, with the same people
+        and the same history — so the room follows it rather than a second room
+        being created beside it. Without this the room stays bound to an id
+        nothing arrives from again, while sends keep working because the
+        platform forwards them: the bridge looks alive and is deaf.
+        """
+        lock = self._channel_locks.setdefault(old_id, asyncio.Lock())
+        async with lock:
+            # Reached from the adapter's own task rather than through
+            # `_traced`, so nothing is bound: this is one unit of work for one
+            # bridge, and it binds that bridge's tenant to find its room.
+            async with tenant_session(
+                self._session_factory, self._bridge_tenant_id
+            ) as session:
+                room = await self._room_store.get_by_external_channel(
+                    session, self._bridge_id, old_id
+                )
+                if room is None:
+                    logger.info(
+                        "Channel %s migrated to %s but no room is bound to it",
+                        old_id,
+                        new_id,
+                    )
+                    return
+                occupant = await self._room_store.get_by_external_channel(
+                    session, self._bridge_id, new_id
+                )
+                if occupant is not None:
+                    # The unique index would reject the update anyway. Report it
+                    # rather than leaving both rooms looking correct: one of them
+                    # is bound to an id that is now dead.
+                    logger.error(
+                        "Channel %s migrated to %s, but room %s is already bound "
+                        "to %s. Room %s is left on the old id and will not "
+                        "receive anything from the chat",
+                        old_id,
+                        new_id,
+                        occupant.id,
+                        new_id,
+                        room.id,
+                    )
+                    return
+            async with tenant_session(self._session_factory, room.tenant_id) as session:
+                await self._room_store.update_external_channel(session, room.id, new_id)
+                await session.commit()
+
+            self._channel_to_room.pop(old_id, None)
+            self.add_room_mapping(
+                room.id, room.transport_room_id, new_id, room.tenant_id
+            )
+            logger.warning(
+                "Re-pointed room %s from channel %s to %s after the platform "
+                "reissued the id",
+                room.id,
+                old_id,
+                new_id,
+            )
+
+        await self._adapter.admin_message(
+            new_id,
+            "This chat has been given a new id by the platform. Its Switch room "
+            "has been moved onto it, so messages here reach the agents again.",
+        )
+
+    # ── Auto-room creation ────────────────────────────────────────────────────
+
+    async def _adopt_existing_room(self, channel_id: str) -> tuple[str, str] | None:
+        """If a room already exists in the DB for this channel on this bridge,
+        register it in the in-memory map and return its (room_id,
+        transport_room_id). Returns None if no such room exists. Idempotent."""
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            room = await self._room_store.get_by_external_channel(
+                session, self._bridge_id, channel_id
+            )
+        if room is None:
+            return None
+        self.add_room_mapping(
+            room.id, room.transport_room_id, channel_id, room.tenant_id
+        )
+        logger.debug("Adopted existing room %s for channel %s", room.id, channel_id)
+        return (room.id, room.transport_room_id)
+
+    async def _create_room_for_channel(
+        self,
+        *,
+        channel_id: str,
+        channel_type: ChannelType,
+        agent_name: str | None = None,
+        sender_name: str | None = None,
+        channel_name: str | None = None,
+    ) -> tuple[str, str] | None:
+        # Callers hold the per-channel lock. Guard against provisioning a
+        # duplicate room for a channel that is already (or is being) bridged:
+        #  1. Switch is itself provisioning this channel right now — the mapping
+        #     is on its way; do not race it with a second room.
+        #  2. A room already exists for this channel in the DB (committed by a
+        #     concurrent create_room, or present since a prior run but not yet
+        #     loaded into the in-memory map). Adopt it instead of creating.
+        if channel_id in self._provisioning_channels:
+            logger.debug(
+                "Skipping auto-room-creation for channel %s: Switch is provisioning it",
+                channel_id,
+            )
+            return self._channel_to_room.get(channel_id)
+
+        existing = await self._adopt_existing_room(channel_id)
+        if existing is not None:
+            return existing
+
+        agent_ids = await self._resolve_agents_for_channel(channel_id, channel_type)
+
+        bridge_name = self._bridge_display_name
+        if channel_type == "direct":
+            parts = [p for p in (sender_name, agent_name) if p]
+            label = " / ".join(parts) if parts else channel_id[:16]
+            name = f"{bridge_name}: {label}"
+            description = f"{bridge_name} DM — {label}"
+        else:
+            channel_label = channel_name or channel_id[:16]
+            name = f"{bridge_name}: {channel_label}"
+            description = f"Auto-bridged from {bridge_name} channel {channel_label}"
+
+        config = RoomCreateConfig(
+            name=name,
+            description=description,
+            agent_ids=agent_ids,
+            channel_type=channel_type,
+            bridge_id=self._bridge_id,
+            external_channel_id=channel_id,
+            # Adopted from a channel that appeared on the platform, not asked
+            # for by anyone in Switch.
+            created_by_kind="system",
+            named_after_channel=(
+                channel_name if channel_type != "direct" and channel_name else None
+            ),
+        )
+
+        try:
+            result = await self._room_service.create_room(config)
+        except IntegrityError:
+            # Backstop: the (bridge_id, external_channel_id) unique index
+            # rejected a concurrent duplicate. Adopt the room that won the race.
+            logger.warning(
+                "Duplicate room creation for channel %s rejected by unique "
+                "constraint; adopting existing room",
+                channel_id,
+            )
+            adopted = await self._adopt_existing_room(channel_id)
+            if adopted is None:
+                logger.error(
+                    "Unique constraint rejected room for channel %s but no "
+                    "existing room found to adopt",
+                    channel_id,
+                )
+            return adopted
+        except Exception:
+            logger.exception("Failed to auto-create room for channel %s", channel_id)
+            return None
+        room = result.room
+
+        self.add_room_mapping(
+            room.id, room.transport_room_id, channel_id, room.tenant_id
+        )
+        logger.info(
+            "Auto-created %s room %s for %s channel %s",
+            channel_type,
+            room.transport_room_id,
+            bridge_name,
+            channel_id,
+        )
+
+        if not agent_ids:
+            # create_room invited the bridge client before returning, so posting
+            # now cannot predate its join. admin_message goes straight to the
+            # channel via the platform API (not through the room), so it surfaces
+            # regardless — but the ordering keeps the room consistent.
+            logger.warning(
+                "Auto-created room %s for channel %s has no agents", room.id, channel_id
+            )
+            await self._adapter.admin_message(
+                channel_id,
+                _no_agents_notice(self._adapter.slash_invite_hint()),
+                message_type=AdminMessageType.NO_AGENTS,
+            )
+
+        return (room.id, room.transport_room_id)
+
+    async def _resolve_agents_for_channel(
+        self, channel_id: str, channel_type: ChannelType
+    ) -> list[str]:
+        agent_names = await self._adapter.get_channel_agent_names(channel_id)
+
+        async with self._session_factory() as session:
+            if agent_names:
+                agents = await self._agent_store.get_all(session)
+                agent_by_name = {a.name: a.id for a in agents}
+                return [agent_by_name[n] for n in agent_names if n in agent_by_name]
+
+            agents = await self._agent_store.get_all(session)
+            if channel_type == "lobby":
+                return [a.id for a in agents]
+            return []
+
+    async def resolve_external_user_id_map(
+        self, user_names: list[str]
+    ) -> dict[str, str]:
+        """Map each requested username to its external user id on this bridge.
+
+        Only resolvable names appear in the returned dict; names with no
+        matching external user on this bridge are omitted (and logged), so the
+        caller can diff against the input to learn which ones failed.
+
+        When the DB lookup misses, falls back to an exact match in the
+        platform directory, so a person who has never messaged through Switch
+        still resolves. A hit is persisted (an ``ExternalUser`` row and its
+        human actor), so room membership, addressing and export all see the same
+        person this resolution found.
+        """
+        async with self._session_factory() as session:
+            users = await self._external_user_store.get_by_bridge(
+                session, self._bridge_id
+            )
+        name_to_ext_id = {u.external_username: u.external_user_id for u in users}
+        resolved: dict[str, str] = {}
+        for name in user_names:
+            ext_id = name_to_ext_id.get(name)
+            if ext_id:
+                resolved[name] = ext_id
+            else:
+                # Exact match on username or email only: a fuzzy directory
+                # hit is a real person, and being wrong invites a stranger
+                # into a private channel.
+                try:
+                    results = await self.adapter.search_directory_users(name)
+                    match = next(
+                        (
+                            r
+                            for r in results
+                            if r.username == name
+                            or (r.email is not None and r.email.lower() == name.lower())
+                        ),
+                        None,
+                    )
+                    if match:
+                        ext = await self.ensure_external_user(
+                            external_user_id=match.external_user_id,
+                            external_username=match.username,
+                        )
+                        resolved[name] = ext.external_user_id
+                        continue
+                except (NotImplementedError, RuntimeError):
+                    pass
+                logger.warning(
+                    "No external user found for username '%s' on bridge %s",
+                    name,
+                    self._bridge_id,
+                )
+        return resolved
+
+    async def resolve_external_user_ids(self, user_names: list[str]) -> list[str]:
+        resolved = await self.resolve_external_user_id_map(user_names)
+        return list(resolved.values())
+
+    async def ensure_users_in_room(
+        self,
+        room_id: str,
+        transport_room_id: str,
+        user_names: list[str],
+    ) -> None:
+        """For each resolvable name in `user_names`, ensure a running human actor
+        client exists and is joined to the room.
+
+        Resolution goes through `resolve_external_user_id_map`, the same
+        answer the channel-invite path uses, so a person the platform
+        directory can find is added here too. Unresolvable names are skipped
+        (the resolver logs them); the on_user_joined callback or the inbound
+        message path picks them up later."""
+        resolved = await self.resolve_external_user_id_map(user_names)
+        for ext_id in resolved.values():
+            async with self._session_factory() as session:
+                ext_user = await self._external_user_store.get_by_external_id(
+                    session, self._bridge_id, ext_id
+                )
+            if ext_user is None:
+                logger.error(
+                    "External user %s resolved on bridge %s but has no record",
+                    ext_id,
+                    self._bridge_id,
+                )
+                continue
+            await self._ensure_human_in_room(
+                external_user_id=ext_user.external_user_id,
+                external_username=ext_user.external_username,
+                room_id=room_id,
+                transport_room_id=transport_room_id,
+            )
+
+    async def _ensure_human_in_room(
+        self,
+        *,
+        external_user_id: str,
+        external_username: str,
+        room_id: str,
+        transport_room_id: str,
+    ) -> Actor[ClientConfig] | None:
+        """Get-or-create the human actor for this external user and ensure it has
+        actually joined the room. Returns the running human actor, or None if it
+        couldn't be brought up or didn't join in time. Idempotent."""
+        client_id = self._human_actors.get(external_user_id)
+        if client_id is None:
+            client_id = await self._create_human_actor(
+                external_user_id, external_username
+            )
+        human_actor = self._client_lifecycle.get(client_id)
+        if human_actor is None:
+            logger.error(
+                "Human actor %s not running for external user %s",
+                client_id,
+                external_user_id,
+            )
+            return None
+        await human_actor.wait_ready()
+        try:
+            await self._room_service.ensure_client_in_room(room_id, client_id)
+        except Exception:
+            logger.exception(
+                "Failed to add human actor %s to room %s", client_id, room_id
+            )
+            return None
+
+        # A human actor runs no consumer, so nothing of its own accepts the
+        # invitation: provisioning records the membership itself. A message
+        # written before that row lands predates the join and is filtered by
+        # the room's readers, so the message that triggered the provisioning
+        # would be lost. Block until the membership is observed.
+        if not await human_actor.wait_joined(transport_room_id, HUMAN_JOIN_TIMEOUT):
+            logger.error(
+                "Human actor %s (external user %s) did not join room %s within %ss — "
+                "cannot relay its message",
+                human_actor.transport_user_id,
+                external_user_id,
+                transport_room_id,
+                HUMAN_JOIN_TIMEOUT,
+            )
+            return None
+        return human_actor
+
+    async def _handle_inbound_interaction(
+        self, interaction: InboundInteraction
+    ) -> None:
+        """Someone operated a control on a message this bridge posted."""
+        if interaction.action_id == INTERRUPT_ACTION:
+            await self._handle_stop_press(interaction)
+            return
+        if self._approval_answers is None:
+            return
+        answered = await self._approval_answers.for_press(interaction)
+        if isinstance(answered, Refused):
+            await self._tell_refused(
+                interaction, answered, thread_ref=interaction.thread_ref
+            )
+
+    async def _handle_stop_press(self, interaction: InboundInteraction) -> None:
+        """Someone pressed Stop on the message showing a turn.
+
+        Two things are taken from the press: which message it was on, and who
+        the platform says pressed it. The session and room come from the turn
+        behind that message; the turn to stop is the one the control named
+        when it was drawn, and a press naming a turn that is no longer running
+        is refused rather than stopping whatever runs now. The press is then
+        judged like the room's own `!interrupt`, by the agent's addressing
+        policy, and relayed to the session over its agent's stream.
+        """
+        publisher = self._activity_publisher
+        if publisher is None or interaction.message_ref is None:
+            return
+
+        async def tell(text: str) -> None:
+            await self._adapter.tell_actor(
+                interaction.channel_id,
+                interaction.sender_id,
+                interaction.sender_name,
+                interaction.thread_ref,
+                text,
+            )
+
+        target = await publisher.stop_target(
+            interaction.channel_id, interaction.message_ref
+        )
+        if target is None:
+            logger.warning(
+                "Ignoring a stop press in %s on bridge %s: message %s shows no "
+                "turn this bridge can still reach.",
+                interaction.channel_id,
+                self._bridge_id,
+                interaction.message_ref,
+            )
+            await tell(
+                "That message is no longer connected to a live session, so "
+                "there is nothing here to stop."
+            )
+            return
+        actor_id = await self._identify_actor(interaction)
+        if actor_id is None:
+            logger.warning(
+                "Ignoring a stop press on session %s: no Switch identity for %s "
+                "on bridge %s.",
+                target.session_id,
+                interaction.sender_id,
+                self._bridge_id,
+            )
+            await tell(
+                "Switch does not know who this account belongs to, and "
+                "stopping an agent is only ever recorded against someone it "
+                "can name."
+            )
+            return
+        if (
+            target.running_turn_id is None
+            or target.running_turn_id != interaction.value
+        ):
+            await tell(
+                "The agent was not stopped (TURN_NOT_RUNNING): the turn that "
+                "control was drawn for is no longer running."
+            )
+            return
+        try:
+            await self._session_activity_service.authorize_room_control(
+                target.agent_id,
+                target.room_id,
+                PlatformPerson(actor_id),
+                doing="stop it",
+            )
+        except SessionError as error:
+            await tell(f"The agent was not stopped ({error.code}): {error}")
+            return
+        frame = stop_control_frame(
+            agent_id=target.agent_id,
+            session_id=target.session_id,
+            room_id=target.room_id,
+            actor_id=actor_id,
+            message_ref=interaction.message_ref,
+            turn_id=interaction.value,
+            thread_id=target.thread_id,
+            surface=self._bridge_type,
+        )
+        if not self._connections.relay_session_command(target.agent_id, frame):
+            await tell(
+                "The agent was not stopped: its controller is not connected to Switch."
+            )
+            return
+        await tell(
+            "Switch has asked the agent to stop its current work. The activity "
+            "message will say when it has."
+        )
+
+    async def _handle_text_answer(self, msg: InboundMessage) -> None:
+        """An answer to an approval card, typed rather than pressed.
+
+        Runs alongside the relay rather than instead of it: an answer is also
+        something the person said in the channel, and the room sees it either
+        way.
+        """
+        if self._approval_answers is None:
+            return
+        answered = await self._approval_answers.for_text(msg)
+        if isinstance(answered, Refused):
+            await self._tell_refused(msg, answered, thread_ref=answered.card_ref)
+
+    async def _tell_refused(
+        self, actor: InboundActor, refused: Refused, thread_ref: str | None
+    ) -> None:
+        """Tell whoever answered that it did not land.
+
+        The refusal is already in the log by the time this runs; this is the
+        half of it the person can see. How privately depends on the platform,
+        and a platform that cannot say it at all logs and returns, so this is
+        best effort by design and never the thing that decides an answer.
+        """
+        await self._adapter.tell_actor(
+            actor.channel_id,
+            actor.sender_id,
+            actor.sender_name,
+            thread_ref,
+            refused.told(),
+        )
+
+    async def _identify_actor(self, actor: InboundActor) -> str | None:
+        """The Switch identity behind the platform account that acted.
+
+        None where the channel maps to no room, or the human actor cannot be brought
+        into it. Both are refusals: an answer carries who gave it, and there is
+        no default actor to fall back on.
+        """
+        room_ids = self._channel_to_room.get(actor.channel_id)
+        if room_ids is None:
+            logger.warning(
+                "Ignoring an answer in %s: the channel maps to no room",
+                actor.channel_id,
+            )
+            return None
+        room_id, transport_room_id = room_ids
+        human_actor = await self._ensure_human_in_room(
+            external_user_id=actor.sender_id,
+            external_username=actor.sender_name,
+            room_id=room_id,
+            transport_room_id=transport_room_id,
+        )
+        return human_actor.transport_user_id if human_actor is not None else None
+
+    async def _handle_user_joined_channel(self, join: InboundUserJoin) -> None:
+        """Called by the adapter when an external user joins a bridged
+        channel (e.g. someone adds louisa to a Mattermost channel via the
+        Mattermost UI). Auto-creates the Switch room if the channel isn't
+        mapped yet (same as the lazy inbound-message path), then ensures
+        the human actor exists and is joined to the room."""
+        if await self._is_registered_agent(join.external_username):
+            # The account that joined is actually a bridged Switch agent (its
+            # bot account), not an external user. Route it through the agent-join
+            # path so it maps to a single agent participant instead of spawning a
+            # duplicate "user" identity.
+            await self._handle_agent_joined_channel(
+                InboundAgentJoin(
+                    channel_id=join.channel_id,
+                    channel_type=join.channel_type,
+                    agent_name=join.external_username,
+                    channel_name=join.channel_name,
+                )
+            )
+            return
+        room_ids = self._channel_to_room.get(join.channel_id)
+        if room_ids is None:
+            lock = self._channel_locks.setdefault(join.channel_id, asyncio.Lock())
+            async with lock:
+                room_ids = self._channel_to_room.get(join.channel_id)
+                if room_ids is None:
+                    room_ids = await self._create_room_for_channel(
+                        channel_id=join.channel_id,
+                        channel_type=join.channel_type,
+                        sender_name=join.external_username,
+                        channel_name=join.channel_name,
+                    )
+            if room_ids is None:
+                return
+        room_id, transport_room_id = room_ids
+        await self._ensure_human_in_room(
+            external_user_id=join.external_user_id,
+            external_username=join.external_username,
+            room_id=room_id,
+            transport_room_id=transport_room_id,
+        )
+
+    # ── Human actor lifecycle ─────────────────────────────────────────────────────
+
+    async def _repair_placeholder_username(
+        self, external_user_id: str, resolved_username: str
+    ) -> None:
+        """Replace a stored name that is really a platform id, now we have one.
+
+        Switch files someone under the name it first saw, and a platform that
+        supplied none left its own id there — which then reads as that person's
+        name in the room title, on their client and in every agent
+        reply that addresses them. Repairing on the way past needs no migration
+        for the rows already written.
+
+        Runs on every inbound message on every bridge, so the common path — a
+        stored name that is fine — must not cost a query. Once someone's stored
+        name is known not to be a placeholder it cannot become one again (the
+        repair below is one-way), so that answer is remembered and the lookup
+        happens once per person rather than once per message.
+
+        Deliberately one-way: an id is replaced by a name, never the reverse,
+        and a name is never replaced by another name. Renaming someone people
+        have been addressing for weeks because a platform changed its mind about
+        their display name would be worse than the problem.
+        """
+        if not resolved_username or not external_user_id:
+            return
+        if external_user_id in self._names_known_good:
+            return
+        if self._adapter.is_placeholder_username(resolved_username):
+            return
+        async with self._session_factory() as session:
+            existing = await self._external_user_store.get_by_external_id(
+                session, self._bridge_id, external_user_id
+            )
+            if existing is None:
+                # Not filed yet; the caller creates them a moment later under
+                # the name we already have, so there is nothing to repair and
+                # nothing worth remembering.
+                return
+            if existing.external_username == resolved_username or not (
+                self._adapter.is_placeholder_username(existing.external_username)
+            ):
+                self._names_known_good.add(external_user_id)
+                return
+            logger.info(
+                "Renaming external user %s from its %s id to '%s'",
+                external_user_id,
+                self._bridge_type,
+                resolved_username,
+            )
+            await self._external_user_store.rename(
+                session, existing.id, resolved_username
+            )
+            await session.commit()
+            client_id = existing.client_id
+        # The client keeps its localpart, since that is an address and
+        # changing it would orphan the history, but its display name is what
+        # people read.
+        human_actor = self._client_lifecycle.get(client_id)
+        if human_actor is not None:
+            try:
+                await human_actor.set_display_name(resolved_username)
+            except Exception:
+                logger.warning(
+                    "Renamed external user %s but could not update the display "
+                    "name of its HumanActor",
+                    external_user_id,
+                    exc_info=True,
+                )
+
+    async def ensure_external_user(
+        self, *, external_user_id: str, external_username: str
+    ) -> ExternalUser:
+        """Get-or-create the `ExternalUser` record for a platform identity,
+        without waiting for that person to speak.
+
+        The inbound path creates these lazily on first message, which leaves
+        nobody to claim for a workspace that has only just been connected.
+        Claiming an identity (CHOO-2137) needs the record to exist up front, so
+        this provisions the same human actor the inbound path would have.
+        """
+        async with self._session_factory() as session:
+            existing = await self._external_user_store.get_by_external_id(
+                session, self._bridge_id, external_user_id
+            )
+        if existing is not None:
+            return existing
+
+        client_id = self._human_actors.get(external_user_id)
+        if client_id is None:
+            client_id = await self._create_human_actor(
+                external_user_id, external_username
+            )
+
+        async with self._session_factory() as session:
+            created = await self._external_user_store.get_by_client_id(
+                session, client_id
+            )
+        if created is None:
+            raise RuntimeError(
+                f"Human actor for external user {external_user_id} on bridge "
+                f"{self._bridge_id} was created without an ExternalUser record"
+            )
+        return created
+
+    async def _create_human_actor(
+        self, external_user_id: str, external_username: str
+    ) -> str:
+        """Mint the client identity that stands in for a person on the platform.
+
+        Bound to the **bridge's** tenant, not to whatever room the message
+        that triggered it arrived in. A human actor is per-bridge and outlives that
+        message: the same client is reused for every room this person speaks
+        in, so a client row stamped with the first room's tenant would be
+        wrong for the second — and the client task it starts must not carry
+        that tenant either, which is why `ClientLifecycleService` unbinds
+        before running one.
+        """
+        lock = self._human_actor_locks.setdefault(external_user_id, asyncio.Lock())
+        async with lock:
+            with tenant_scope(self._bridge_tenant_id):
+                return await self._create_human_actor_locked(
+                    external_user_id, external_username
+                )
+
+    async def _create_human_actor_locked(
+        self, external_user_id: str, external_username: str
+    ) -> str:
+        existing = self._human_actors.get(external_user_id)
+        if existing is not None:
+            return existing
+        # Another switch-core process may have minted this person already:
+        # each process learns its bridge's people when the bridge starts, and
+        # someone who first spoke since then is known only in the database.
+        adopted = await self._adopt_human_actor(external_user_id)
+        if adopted is not None:
+            return adopted
+
+        # Defence in depth against agent/user misdetection: a bridged agent
+        # must never get a human actor as if it were an external user. If the
+        # name collides with a registered Switch agent, refuse loudly rather
+        # than create a duplicate "user" identity for it.
+        async with self._session_factory() as session:
+            agent = await self._agent_store.get_by_name(session, external_username)
+        if agent is not None:
+            raise ValueError(
+                f"Refusing to create external-user human actor for '{external_username}'"
+                " on bridge "
+                f"{self._bridge_id}: name collides with a registered Switch agent"
+                " (likely a bridged agent bot misclassified as a user)"
+            )
+
+        sanitized = re.sub(r"[^a-z0-9_-]", "-", external_username.lower()).strip("-")
+        # Scope to the bridge: the same username on two bridges of the same
+        # type (e.g. two Slack workspaces) must map to distinct clients,
+        # since transport_user_id is globally unique but usernames are not.
+        localpart = f"switch-{self._bridge_type}-{self._bridge_id}-{sanitized}"
+        # Two people whose names sanitize alike (`ann.marie` and `ann-marie`)
+        # would share that localpart: the one who comes second gets it with
+        # their platform id's digest appended, the same in every process.
+        digest = hashlib.blake2b(external_user_id.encode(), digest_size=4).hexdigest()
+        candidates = (localpart, f"{localpart}-{digest}")
+
+        for localpart in candidates:
+            try:
+                client = await self._client_lifecycle.create_and_start(
+                    client_type="user",
+                    display_name=external_username,
+                    localpart=localpart,
+                )
+            except IntegrityError:
+                # Taken: by this person, minted by another process between the
+                # read above and here, or by someone else whose name
+                # sanitizes the same.
+                adopted = await self._adopt_human_actor_client(
+                    external_user_id,
+                    external_username,
+                    f"@{localpart}:{self._id_server_name}",
+                )
+                if adopted is not None:
+                    return adopted
+                continue
+            break
+        else:
+            raise RuntimeError(
+                f"No client localpart is free for external user "
+                f"{external_user_id} ({external_username!r}) on bridge "
+                f"{self._bridge_id}"
+            )
+
+        ext_user = ExternalUser(
+            bridge_id=self._bridge_id,
+            external_user_id=external_user_id,
+            external_username=external_username,
+            client_id=client.client_id,
+        )
+        async with self._session_factory() as session:
+            await self._external_user_store.create(session, ext_user)
+            await session.commit()
+
+        self._human_actors[external_user_id] = client.client_id
+        self._human_user_ids.add(client.transport_user_id)
+        self._adapter.prime_mention_targets({external_username: external_user_id})
+
+        logger.info(
+            "Created human actor %s for external user %s on bridge %s",
+            client.transport_user_id,
+            external_user_id,
+            self._bridge_id,
+        )
+        return client.client_id
+
+    async def _adopt_human_actor(self, external_user_id: str) -> str | None:
+        """The human actor another process minted for this person, started
+        here and remembered, or None when there is none yet."""
+        async with self._session_factory() as session:
+            known = await self._external_user_store.get_by_external_id(
+                session, self._bridge_id, external_user_id
+            )
+            record = (
+                None
+                if known is None
+                else await self._client_store.get(session, known.client_id)
+            )
+        if record is None or known is None:
+            return None
+        self._run_human_actor(external_user_id, known.external_username, record)
+        return record.id
+
+    async def _adopt_human_actor_client(
+        self, external_user_id: str, external_username: str, transport_user_id: str
+    ) -> str | None:
+        """The human actor whose client row was written first, when it is this
+        person's; None when it stands for someone else."""
+        deadline = time.monotonic() + _HUMAN_ACTOR_MINTING_SECONDS
+        while True:
+            async with self._session_factory() as session:
+                record = await self._client_store.get_by_transport_user_id(
+                    session, transport_user_id
+                )
+                person = (
+                    None
+                    if record is None
+                    else await self._external_user_store.get_by_client_id(
+                        session, record.id
+                    )
+                )
+            if record is None:
+                raise RuntimeError(
+                    f"Creating the human actor {transport_user_id} conflicted "
+                    "with another, which cannot be read back"
+                )
+            if person is not None:
+                break
+            # Its process writes whose it is right after the client row.
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"The human actor {transport_user_id} has no external user "
+                    f"after {_HUMAN_ACTOR_MINTING_SECONDS:.0f}s, so whose it is "
+                    "cannot be told"
+                )
+            await asyncio.sleep(0.1)
+        if (
+            person.bridge_id != self._bridge_id
+            or person.external_user_id != external_user_id
+        ):
+            return None
+        self._run_human_actor(external_user_id, external_username, record)
+        return record.id
+
+    def _run_human_actor(
+        self, external_user_id: str, external_username: str, record: Client
+    ) -> None:
+        client = self._client_lifecycle.get(record.id)
+        if client is None:
+            client = self._client_lifecycle.start_client(record)
+        self._human_actors[external_user_id] = record.id
+        self._human_user_ids.add(client.transport_user_id)
+        self._adapter.prime_mention_targets({external_username: external_user_id})
+        logger.info(
+            "Adopted human actor %s for external user %s on bridge %s, minted "
+            "by another process",
+            client.transport_user_id,
+            external_user_id,
+            self._bridge_id,
+        )
+
+    async def _channel_for_room(self, transport_room_id: str) -> str | None:
+        """The channel a room is bridged to, from memory or, on a miss, from
+        the room's row. A room bridged through another switch-core process
+        (created from the Console there, or adopted from a channel that
+        process heard of first) is mapped only there until this one reads it,
+        and this process may be the one relaying the room out."""
+        channel_id = self._find_channel(transport_room_id=transport_room_id)
+        if channel_id is not None:
+            return channel_id
+        async with self._session_factory() as session:
+            room = await self._room_store.get_by_transport_room_id(
+                session, transport_room_id
+            )
+        if (
+            room is None
+            or room.bridge_id != self._bridge_id
+            or not room.external_channel_id
+        ):
+            return None
+        self.add_room_mapping(
+            room.id, room.transport_room_id, room.external_channel_id, room.tenant_id
+        )
+        return room.external_channel_id
+
+    async def reload_channel_map(self) -> None:
+        """Map this bridge's rooms as their rows say now, after another
+        process bridged, unbridged or moved one. A mapping made here while
+        the rows were being read is newer than the read, and is kept."""
+        before = dict(self._room_to_channel)
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            rooms = await self._room_store.get_by_bridge(session, self._bridge_id)
+        stored = {
+            (room.id, room.transport_room_id): room
+            for room in rooms
+            if room.external_channel_id
+        }
+        for key, channel_id in before.items():
+            if key not in stored and self._room_to_channel.get(key) == channel_id:
+                logger.info(
+                    "Room %s is no longer bridged to channel %s; unmapping it",
+                    key[0],
+                    channel_id,
+                )
+                self.remove_room_mapping(*key)
+        for key, room in stored.items():
+            if self._room_to_channel.get(key) != room.external_channel_id:
+                assert room.external_channel_id is not None
+                self.add_room_mapping(
+                    room.id,
+                    room.transport_room_id,
+                    room.external_channel_id,
+                    room.tenant_id,
+                )
+
+    def _find_channel(
+        self, room_id: str | None = None, transport_room_id: str | None = None
+    ) -> str | None:
+        for (rid, mrid), channel_id in self._room_to_channel.items():
+            if room_id and rid == room_id:
+                return channel_id
+            if transport_room_id and mrid == transport_room_id:
+                return channel_id
+        return None
+
+    # ── Outbound (room → platform) ──────────────────────────────────────────
+
+    async def handle_outbound_message(
+        self, room: RoomRef, event: TransportMessage
+    ) -> None:
+        logger.debug(
+            "[BRIDGE-OUT] room message from=%s room=%s body=%s",
+            event.sender,
+            room.room_id,
+            event.body[:80] if event.body else "",
+        )
+        if event.sender == self._workspace_consumer_transport_user_id:
+            logger.debug("[BRIDGE-OUT] skipping bridge client message")
+            return
+        if await self._is_human_sender(event.sender):
+            logger.debug(
+                "[BRIDGE-OUT] skipping human actor message from %s", event.sender
+            )
+            return
+
+        channel_id = await self._channel_for_room(room.room_id)
+        if channel_id is None:
+            logger.debug("[BRIDGE-OUT] no channel mapping for room %s", room.room_id)
+            return
+
+        room_id, _ = self._channel_to_room[channel_id]
+        with tenant_scope(await self._room_tenant(room_id)):
+            with self._counted_outbound("message"):
+                await self._relay_outbound_message(channel_id, event)
+
+    async def handle_outbound_command(self, room: RoomRef, event: CommandEvent) -> None:
+        """Post a room command as the text that types it, so the reply threaded
+        under the command has a platform post to sit under.
+
+        A command typed on the platform names its human actor as `user_id`, so
+        `handle_outbound_message` drops it like any other message from there.
+        """
+        assert event.message_id is not None and event.thread_id is not None
+        threaded = event.thread_id != event.message_id
+        await self.handle_outbound_message(
+            room,
+            TransportMessage(
+                room_id=room.room_id,
+                event_id=event.message_id,
+                sender=event.user_id,
+                timestamp=0,
+                content=(
+                    {
+                        "m.relates_to": {
+                            "rel_type": "m.thread",
+                            "event_id": event.thread_id,
+                        }
+                    }
+                    if threaded
+                    else {}
+                ),
+                body=f"!{event.command} {event.args}".strip(),
+                sender_name=event.user_name,
+                thread_root_id=event.thread_id if threaded else None,
+            ),
+        )
+
+    async def _relay_outbound_message(
+        self, channel_id: str, event: TransportMessage
+    ) -> None:
+        event_content = event.content
+        admin_marker = event_content.get(ADMIN_MARKER)
+        platform_marker = event_content.get(PLATFORM_MARKER)
+        sender_name = event.sender_name
+        # An admin/system or platform message renders natively per bridge
+        # (admin_message) rather than on behalf of its room sender, so it
+        # needs no sender_name.
+        is_system = admin_marker is not None or platform_marker is not None
+        if sender_name is None and not is_system:
+            logger.error(
+                "No sender_name in event from %s — skipping outbound", event.sender
+            )
+            return
+
+        logger.debug(
+            "[BRIDGE-OUT] sending to channel=%s sender=%s admin=%s platform=%s",
+            channel_id,
+            sender_name,
+            admin_marker is not None,
+            platform_marker is not None,
+        )
+
+        thread_root_ref = await self._outbound_thread_root_ref(
+            event_content, channel_id
+        )
+
+        if not await self._claim_outbound(channel_id, event.event_id):
+            return
+        try:
+            message_ref = await self._post_outbound_message(
+                channel_id,
+                event,
+                sender_name,
+                thread_root_ref,
+                admin_marker=admin_marker if is_system else None,
+                is_system=is_system,
+            )
+        except (Exception, asyncio.CancelledError):
+            await asyncio.shield(self._release_outbound(event.event_id))
+            raise
+        await self._settle_outbound(event.event_id, message_ref)
+
+    async def _post_outbound_message(
+        self,
+        channel_id: str,
+        event: TransportMessage,
+        sender_name: str | None,
+        thread_root_ref: str | None,
+        *,
+        admin_marker: object,
+        is_system: bool,
+    ) -> str | None:
+        event_content = event.content
+        if is_system:
+            message_type = (
+                admin_marker.get("type") if isinstance(admin_marker, dict) else None
+            )
+            # Raw, not translated: `admin_message` renders its own body, the
+            # same way the notices posted directly through it do. Translating
+            # here as well ran the body through twice, and the second pass
+            # escapes the markup the first one produced — a command reply
+            # arrived showing its own `<b>` tags.
+            # A platform message sent for a person says so, so the room sees
+            # whose authority it carries. A thread reply sits under a root that
+            # already said it, and a body naming the person needs no second line.
+            body = event.body
+            person = platform_on_behalf_of(event_content)
+            if (
+                person is not None
+                and not _is_thread_reply(event_content)
+                and person.label not in body
+            ):
+                body = f"On behalf of {person.label}:\n\n{body}"
+            return await self._adapter.admin_message(
+                channel_id,
+                body,
+                thread_root_ref,
+                message_type=message_type,
+            )
+        assert sender_name is not None  # guarded by the caller
+        # Only the marker pages a channel. An `@channel` an agent wrote
+        # itself is defused by `translate_outbound` like any other text.
+        room_wide = is_room_wide_mention(event_content)
+        return await self._adapter.send_message(
+            channel_id,
+            sender_name,
+            (
+                self._adapter.render_room_wide_mention(event.body)
+                if room_wide
+                else self._adapter.translate_outbound(event.body)
+            ),
+            thread_root_id=thread_root_ref,
+            room_wide_mention=room_wide,
+        )
+
+    async def _outbound_thread_root_ref(
+        self, event_content: dict[str, object], channel_id: str
+    ) -> str | None:
+        """Bridge threads outbound: if this room message is a threaded reply,
+        resolve its thread root to the external post that anchors the thread."""
+        relates = event_content.get("m.relates_to") or {}
+        if not isinstance(relates, dict) or relates.get("rel_type") != "m.thread":
+            return None
+        root_event_id = relates.get("event_id")
+        if not root_event_id:
+            return None
+        thread_root_ref = await self._external_post_for_event(str(root_event_id))
+        if thread_root_ref is None:
+            logger.warning(
+                "[BRIDGE-OUT] no external post mapped for thread root %s; "
+                "posting top-level in channel %s",
+                root_event_id,
+                channel_id,
+            )
+        return thread_root_ref
+
+    async def handle_outbound_media(
+        self,
+        room: RoomRef,
+        event: TransportMedia,
+        client: WorkspaceConsumer,
+    ) -> None:
+        """Relay a room media event (an agent-sent image/file) out to the
+        external channel.
+
+        Mirrors handle_outbound_message: human actor media is skipped (it originated
+        on the platform), the caption convention is unpacked (a `filename` key
+        means the body is a caption), and the relayed post is recorded in the
+        message map so replies thread both ways. Any file type relays natively
+        via the adapter; a file whose bytes can't be fetched or that exceeds the
+        relay cap gets a disclosed text notice rather than a silent drop.
+
+        A message carrying several files arrives as several media events
+        sharing a group marker; they are buffered here and relayed as ONE
+        platform post. `client` is the bridge's own client, used to fetch the
+        media bytes.
+        """
+        logger.debug(
+            "[BRIDGE-OUT] room media from=%s room=%s body=%s",
+            event.sender,
+            room.room_id,
+            event.body[:80] if event.body else "",
+        )
+        if event.sender == self._workspace_consumer_transport_user_id:
+            return
+        if await self._is_human_sender(event.sender):
+            return
+
+        channel_id = await self._channel_for_room(room.room_id)
+        if channel_id is None:
+            logger.debug("[BRIDGE-OUT] no channel mapping for room %s", room.room_id)
+            return
+
+        room_id, _ = self._channel_to_room[channel_id]
+        with tenant_scope(await self._room_tenant(room_id)):
+            with self._counted_outbound("media"):
+                await self._relay_outbound_media(room, channel_id, event, client)
+
+    async def _is_human_sender(self, sender: str) -> bool:
+        """Whether a room message was written by a person on this bridge, so
+        relaying it out would echo them back to themselves.
+
+        Kept in memory both ways, and read from the database on a miss: a
+        person whose actor another process minted is known there first.
+        """
+        if sender in self._human_user_ids:
+            return True
+        if sender in self._not_human_user_ids:
+            return False
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            human = await self._external_user_store.is_bridge_user(
+                session, self._bridge_id, sender
+            )
+        (self._human_user_ids if human else self._not_human_user_ids).add(sender)
+        return human
+
+    async def _relay_outbound_media(
+        self,
+        room: RoomRef,
+        channel_id: str,
+        event: TransportMedia,
+        client: WorkspaceConsumer,
+    ) -> None:
+        event_content = event.content
+        sender_name = event.sender_name
+        if sender_name is None:
+            logger.error(
+                "No sender_name in media event from %s — skipping outbound",
+                event.sender,
+            )
+            return
+        sender_name = str(sender_name)
+
+        thread_root_ref = await self._outbound_thread_root_ref(
+            event_content, channel_id
+        )
+
+        # Caption convention (mirrors the inbound path): when a `filename` key
+        # is present the event body is a caption; otherwise the body IS the
+        # filename and there is no caption.
+        explicit_filename = event_content.get("filename")
+        filename = str(explicit_filename or event.body or "attachment")
+        caption = event.body if explicit_filename else None
+
+        info = event_content.get("info") or {}
+        mimetype = normalise_mime_type(
+            str(
+                (info.get("mimetype") if isinstance(info, dict) else None)
+                or "application/octet-stream"
+            )
+        )
+
+        data = await self._download_media(client, event.uri, filename)
+        if data is not None and len(data) <= self._max_attachment_bytes:
+            # Part of a multi-file message? Hold it until the whole group has
+            # arrived, then relay all of it as one platform post.
+            group = parse_attachment_group(event_content)
+            if group is not None:
+                group_id, index, total = group
+                pending = self._outbound_groups.setdefault(
+                    group_id,
+                    _PendingOutboundGroup(
+                        total=total, room_id=room.room_id, from_seq=event.seq
+                    ),
+                )
+                pending.from_seq = min(pending.from_seq, event.seq)
+                pending.parts[index] = OutboundAttachment(
+                    filename=filename, mimetype=mimetype, data=data
+                )
+                pending.event_ids[index] = event.event_id
+                if index == 0:
+                    pending.caption = caption
+                if len(pending.parts) < total:
+                    self._schedule_outbound_group_flush(
+                        group_id, channel_id, sender_name, thread_root_ref, client
+                    )
+                    return
+                self._cancel_outbound_group_flush(group_id)
+                self._outbound_groups.pop(group_id, None)
+                await self._relay_outbound_group(
+                    pending, channel_id, sender_name, thread_root_ref
+                )
+                return
+
+        if not await self._claim_outbound(channel_id, event.event_id):
+            return
+        message_ref: str | None
+        try:
+            if data is None or len(data) > self._max_attachment_bytes:
+                if data is not None:
+                    logger.warning(
+                        "[BRIDGE-OUT] attachment %s is %d bytes, over the "
+                        "%d-byte relay cap",
+                        filename,
+                        len(data),
+                        self._max_attachment_bytes,
+                    )
+                note = f"_sent an attachment that couldn't be relayed: {filename}_"
+                body = f"{caption}\n{note}" if caption else note
+                message_ref = await self._adapter.send_message(
+                    channel_id,
+                    sender_name,
+                    self._adapter.translate_outbound(body),
+                    thread_root_id=thread_root_ref,
+                )
+            else:
+                message_ref = await self._adapter.send_attachment(
+                    channel_id,
+                    sender_name,
+                    filename,
+                    mimetype,
+                    data,
+                    caption=caption,
+                    thread_root_id=thread_root_ref,
+                )
+        except (Exception, asyncio.CancelledError):
+            await asyncio.shield(self._release_outbound(event.event_id))
+            raise
+        await self._settle_outbound(event.event_id, message_ref)
+
+    def held_from(self, room_id: str) -> int | None:
+        """The first file of a multi-file message in this room still waiting
+        for the rest: not posted yet, so the bridge's progress in the room
+        stops before it."""
+        held = [
+            pending.from_seq
+            for pending in [
+                *self._outbound_groups.values(),
+                *self._flushing_outbound_groups,
+            ]
+            if pending.room_id == room_id
+        ]
+        return min(held) if held else None
+
+    def _schedule_outbound_group_flush(
+        self,
+        group_id: str,
+        channel_id: str,
+        sender_name: str,
+        thread_root_ref: str | None,
+        client: WorkspaceConsumer,
+    ) -> None:
+        """Arm the safety net for an incomplete outbound attachment group.
+
+        A group normally completes immediately — the sender posts its events
+        back-to-back. This timer guarantees that a batch that never completes
+        still reaches the platform, flagged, instead of being held forever.
+
+        Armed once per group, NOT re-armed per part, so the deadline bounds the
+        whole group rather than the gap between parts.
+        """
+        if group_id in self._outbound_group_timers:
+            return
+        self._outbound_group_timers[group_id] = asyncio.get_running_loop().call_later(
+            OUTBOUND_GROUP_TIMEOUT_SECONDS,
+            lambda: asyncio.create_task(
+                self._flush_incomplete_outbound_group(
+                    group_id, channel_id, sender_name, thread_root_ref, client
+                )
+            ),
+        )
+
+    def _cancel_outbound_group_flush(self, group_id: str) -> None:
+        timer = self._outbound_group_timers.pop(group_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    async def _flush_incomplete_outbound_group(
+        self,
+        group_id: str,
+        channel_id: str,
+        sender_name: str,
+        thread_root_ref: str | None,
+        client: WorkspaceConsumer,
+    ) -> None:
+        self._outbound_group_timers.pop(group_id, None)
+        pending = self._outbound_groups.get(group_id)
+        if pending is None or not client.running:
+            # A bridge that stopped leaves the group to whoever holds it next:
+            # its progress stops before the group's first file.
+            return
+        # A file of the group arriving while this posts would otherwise be
+        # added to a post already on its way without it, and never sent.
+        del self._outbound_groups[group_id]
+        self._flushing_outbound_groups.append(pending)
+        try:
+            await self._flush_outbound_group(
+                group_id, pending, channel_id, sender_name, thread_root_ref
+            )
+        finally:
+            self._flushing_outbound_groups = [
+                flushing
+                for flushing in self._flushing_outbound_groups
+                if flushing is not pending
+            ]
+            if client.transport is not None:
+                client.transport.held_back_released(pending.room_id)
+
+    async def _flush_outbound_group(
+        self,
+        group_id: str,
+        pending: _PendingOutboundGroup,
+        channel_id: str,
+        sender_name: str,
+        thread_root_ref: str | None,
+    ) -> None:
+        received = len(pending.parts)
+        logger.error(
+            "[BRIDGE-OUT] attachment group %s incomplete: %d of %d parts arrived "
+            "within %ss; relaying what arrived",
+            group_id,
+            received,
+            pending.total,
+            OUTBOUND_GROUP_TIMEOUT_SECONDS,
+        )
+        notice = (
+            f"_incomplete attachment group: relaying {received} of "
+            f"{pending.total} files_"
+        )
+        pending.caption = f"{pending.caption}\n{notice}" if pending.caption else notice
+        await self._relay_outbound_group(
+            pending, channel_id, sender_name, thread_root_ref
+        )
+
+    async def _relay_outbound_group(
+        self,
+        pending: _PendingOutboundGroup,
+        channel_id: str,
+        sender_name: str,
+        thread_root_ref: str | None,
+    ) -> None:
+        # Claimed, and recorded, by the earliest file that arrived: the post
+        # stands for the whole group, and that file is the first of it a reply
+        # can thread under.
+        claim_event_id = pending.event_ids[min(pending.event_ids)]
+        if not await self._claim_outbound(channel_id, claim_event_id):
+            return
+        try:
+            message_ref = await self._adapter.send_attachments(
+                channel_id,
+                sender_name,
+                [pending.parts[i] for i in sorted(pending.parts)],
+                caption=pending.caption,
+                thread_root_id=thread_root_ref,
+            )
+        except (Exception, asyncio.CancelledError):
+            await asyncio.shield(self._release_outbound(claim_event_id))
+            raise
+        await self._settle_outbound(claim_event_id, message_ref)
+
+    async def _download_media(
+        self, client: WorkspaceConsumer, media_uri: str | None, filename: str
+    ) -> bytes | None:
+        """Fetch a media URI's bytes via the workspace consumer, or None on failure
+        (logged — the caller posts a disclosed fallback, never a silent drop)."""
+        if not media_uri:
+            logger.error("[BRIDGE-OUT] media event for %s has no media URI", filename)
+            return None
+        if client.transport is None:
+            logger.error(
+                "[BRIDGE-OUT] workspace consumer not connected; cannot fetch %s",
+                media_uri,
+            )
+            return None
+        try:
+            resp = await client.transport.download_media(media_uri)
+        except TransportError as exc:
+            logger.error("[BRIDGE-OUT] failed to download media %s: %s", media_uri, exc)
+            return None
+        return resp.body
+
+    async def handle_outbound_typing(
+        self, room_id: str, agent_name: str, is_typing: bool
+    ) -> None:
+        channel_id = self._find_channel(room_id=room_id)
+        if channel_id is None:
+            logger.error("No channel found for room %s", room_id)
+            return
+
+        await self._adapter.send_typing(channel_id, agent_name, is_typing)
+
+    # ── Protection sync ──────────────────────────────────────────────────────
+
+    # TODO: use this when protection setup is done
+    async def handle_protection_verdict(
+        self, event_id: str, new_content: str | None
+    ) -> None:
+        async with self._session_factory() as session:
+            mapping = await self._bridge_message_map_store.get_by_transport_event_id(
+                session, self._bridge_id, event_id
+            )
+        if mapping is None or mapping.external_post_id is None:
+            return
+
+        channel_id = mapping.external_channel_id
+        message_ref = mapping.external_post_id
+        if new_content is None:
+            await self._adapter.delete_message(channel_id, message_ref)
+            # The post is gone; drop the mapping so it can't resolve later.
+            async with self._session_factory() as session:
+                await self._bridge_message_map_store.delete_by_transport_event_id(
+                    session, self._bridge_id, event_id
+                )
+                await session.commit()
+        else:
+            translated = self._adapter.translate_outbound(new_content)
+            await self._adapter.update_message(channel_id, message_ref, translated)
+
+    # ── Message-map helpers ───────────────────────────────────────────────────
+
+    def _prerecord_message_map(
+        self, transport_event_id: str, external_post_id: str
+    ) -> None:
+        """Anchor a room-event → external-post mapping in memory, synchronously,
+        so it resolves before the durable _record_message_map write commits.
+
+        _record_message_map awaits a DB round-trip that yields the event loop; a
+        fast command reply (e.g. !help) can be relayed during that yield and miss
+        the not-yet-committed row, dropping the result at the channel root rather
+        than in the command's thread. Callers set this immediately after
+        room_send returns, with NO await in between, and pop it once the row is
+        committed. Same discipline as begin_provisioning for the room-mapping
+        race."""
+        self._pending_message_maps[transport_event_id] = external_post_id
+
+    async def _claim_outbound(self, channel_id: str, transport_event_id: str) -> bool:
+        """Claim a room message for posting to the platform, before posting
+        it. False when it is claimed already: posted, or being posted, by
+        whoever held the bridge before. Claiming first is what keeps a
+        hand-over between processes from posting a message twice.
+
+        A post that fails, or is cancelled because the bridge stopped before
+        it finished, lets its claim go, so whoever holds the bridge next posts
+        it; one the platform took just before the cancel then shows twice. A
+        process that dies between the claim and the post leaves the claim,
+        which the next holder claims again once it is
+        `_UNPOSTED_CLAIM_LAPSES_AFTER` old and posts the message, twice if the
+        platform had taken it before the death."""
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            claimed = await self._bridge_message_map_store.claim(
+                session,
+                bridge_id=self._bridge_id,
+                external_channel_id=channel_id,
+                transport_event_id=transport_event_id,
+                unposted_after=_UNPOSTED_CLAIM_LAPSES_AFTER,
+            )
+            await session.commit()
+        if not claimed:
+            logger.info(
+                "[BRIDGE-OUT] %s was already posted to channel %s; not posting it "
+                "again",
+                transport_event_id,
+                channel_id,
+            )
+        return claimed
+
+    async def _settle_outbound(
+        self, transport_event_id: str, external_post_id: str | None
+    ) -> None:
+        """Record what a claimed message became on the platform, or let the
+        claim go when the platform took nothing."""
+        if external_post_id is None:
+            await self._release_outbound(transport_event_id)
+            return
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            await self._bridge_message_map_store.fill(
+                session,
+                bridge_id=self._bridge_id,
+                transport_event_id=transport_event_id,
+                external_post_id=external_post_id,
+            )
+            await session.commit()
+
+    async def _release_outbound(self, transport_event_id: str) -> None:
+        """Let a claim go after the platform refused the post, or the post
+        was cancelled before it finished."""
+        async with tenant_session(
+            self._session_factory, self._bridge_tenant_id
+        ) as session:
+            await self._bridge_message_map_store.release_claim(
+                session,
+                bridge_id=self._bridge_id,
+                transport_event_id=transport_event_id,
+            )
+            await session.commit()
+
+    async def _record_message_map(
+        self,
+        *,
+        external_channel_id: str,
+        transport_event_id: str,
+        external_post_id: str,
+    ) -> None:
+        """Persist a room-event ↔ external-post correlation (idempotent)."""
+        async with self._session_factory() as session:
+            existing = await self._bridge_message_map_store.get_by_transport_event_id(
+                session, self._bridge_id, transport_event_id
+            )
+            if existing is not None:
+                return
+            await self._bridge_message_map_store.create(
+                session,
+                BridgeMessageMap(
+                    bridge_id=self._bridge_id,
+                    external_channel_id=external_channel_id,
+                    transport_event_id=transport_event_id,
+                    external_post_id=external_post_id,
+                ),
+            )
+            await session.commit()
+
+    async def _event_for_external_post(self, external_post_id: str) -> str | None:
+        async with self._session_factory() as session:
+            mapping = await self._bridge_message_map_store.get_by_external_post_id(
+                session, self._bridge_id, external_post_id
+            )
+        return mapping.transport_event_id if mapping is not None else None
+
+    async def _external_post_for_event(self, transport_event_id: str) -> str | None:
+        pending = self._pending_message_maps.get(transport_event_id)
+        if pending is not None:
+            return pending
+        async with self._session_factory() as session:
+            mapping = await self._bridge_message_map_store.get_by_transport_event_id(
+                session, self._bridge_id, transport_event_id
+            )
+        # A claim not filled yet maps to nothing on the platform.
+        return mapping.external_post_id if mapping is not None else None
+
+    # ── Room mapping management ──────────────────────────────────────────────
+
+    def begin_provisioning(self, external_channel_id: str) -> None:
+        """Mark a channel as being provisioned by Switch itself, so inbound
+        join/message handlers do not auto-create a duplicate room for it in the
+        window between the channel existing (bot auto-joins → inbound join
+        fires) and the room↔channel mapping being committed. The caller must
+        record this before awaiting anything after the channel is created, and
+        clear it with end_provisioning once the mapping is established."""
+        self._provisioning_channels.add(external_channel_id)
+
+    def end_provisioning(self, external_channel_id: str) -> None:
+        """Clear the provisioning marker set by begin_provisioning. Idempotent."""
+        self._provisioning_channels.discard(external_channel_id)
+
+    def add_room_mapping(
+        self,
+        room_id: str,
+        transport_room_id: str,
+        external_channel_id: str,
+        tenant_id: str,
+    ) -> None:
+        """Register a room↔channel mapping, and the room's tenant with it.
+
+        The tenant is a required argument rather than something looked up
+        later because every caller already has the room row in hand. Taking it
+        here is what lets `_traced` bind a tenant for a room created *after*
+        this bridge started without a database read on the inbound path — and,
+        more to the point, without a read that would run under whatever tenant
+        happened to be bound at the time.
+        """
+        key = (room_id, transport_room_id)
+        self._channel_to_room[external_channel_id] = key
+        self._room_to_channel[key] = external_channel_id
+        self._room_tenants[room_id] = tenant_id
+
+    def remove_room_mapping(self, room_id: str, transport_room_id: str) -> None:
+        key = (room_id, transport_room_id)
+        channel_id = self._room_to_channel.pop(key, None)
+        if channel_id is not None:
+            self._channel_to_room.pop(channel_id, None)
+        self._room_tenants.pop(room_id, None)

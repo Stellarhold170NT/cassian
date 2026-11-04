@@ -1,0 +1,30 @@
+# Sample CSI VolumeSnapshots for a Switch install. See BACKUP.md.
+#
+# Requires: a CSI driver with snapshot support + the external-snapshotter
+# controller (present on most managed clusters), and a VolumeSnapshotClass.
+#
+# Replace:
+#   RELEASE          -> your Helm release name (kubectl get pvc to confirm)
+#   csi-snapclass    -> your VolumeSnapshotClass (kubectl get volumesnapshotclass)
+#
+#   kubectl apply -f this-file
+#
+# These are one-off snapshots. For scheduled snapshots use snapscheduler or Velero.
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: postgresql-snapshot
+spec:
+  volumeSnapshotClassName: csi-snapclass
+  source:
+    persistentVolumeClaimName: RELEASE-postgresql-data
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: mattermost-snapshot
+spec:
+  volumeSnapshotClassName: csi-snapclass
+  source:
+    persistentVolumeClaimName: RELEASE-mattermost-data

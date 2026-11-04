@@ -1,0 +1,180 @@
+import { useMutation, useQuery, type QueryClient } from '@tanstack/react-query';
+import { Check, CheckCircle2, CircleAlert, Copy, Loader2, RefreshCw } from 'lucide-react';
+import { rpc } from '@renderer/lib/ipc';
+import { Button } from '@renderer/lib/ui/button';
+import { getProvider, type AgentProviderId } from '@shared/core/providers/agent-provider-registry';
+
+function providerReadinessQueryKey(
+  providerId: AgentProviderId,
+  sshHost: string | null,
+  dir: string
+) {
+  return ['provider-readiness', providerId, sshHost, dir] as const;
+}
+
+/**
+ * Ask every provider's sign-in on one SSH host again: its setup changed, so an
+ * answer read before — "CLI not installed", "Switch is not set up there" —
+ * would otherwise stand for as long as it is cached.
+ */
+export function invalidateHostProviderReadiness(queryClient: QueryClient, sshHost: string) {
+  return queryClient.invalidateQueries({
+    predicate: ({ queryKey }) => queryKey[0] === 'provider-readiness' && queryKey[2] === sshHost,
+  });
+}
+
+/**
+ * Whether a provider's CLI is installed and signed in on a machine. One check
+ * per provider, machine and directory, shared by every component that asks:
+ * the Add Agent tiles, an agent's settings and the sidebar all read the same
+ * cached answer.
+ */
+export function useProviderReadiness(
+  providerId: AgentProviderId,
+  sshHost: string | null,
+  dir: string,
+  enabled: boolean
+) {
+  return useQuery({
+    queryKey: providerReadinessQueryKey(providerId, sshHost, dir),
+    queryFn: () => rpc.agents.providerReadiness({ providerId, sshHost, dir }),
+    // Signing in is not something that changes minute to minute, and this is
+    // rendered once per provider tile and once per agent row — so a short
+    // window turned opening a page into a burst of probes, each of which
+    // starts a provider process on the execution machine.
+    staleTime: 5 * 60_000,
+    retry: false,
+    enabled,
+  });
+}
+
+/** What is wrong with a provider on a machine, in a few words, or null when nothing is known to be. */
+export function providerProblem(
+  data: { installed: boolean | null; status: string; loginHelps?: boolean } | undefined
+): string | null {
+  if (!data) return null;
+  if (data.installed === false) return 'CLI not installed';
+  if (data.status === 'unauthenticated' && data.loginHelps === false) return 'Can’t be used yet';
+  if (data.status === 'unauthenticated') return 'Not signed in';
+  if (data.status === 'unconfigured') return 'No backend configured';
+  return null;
+}
+
+export function ProviderConnectionStatus({
+  providerId,
+  sshHost,
+  dir,
+  compact = false,
+}: {
+  providerId: AgentProviderId;
+  sshHost: string | null;
+  dir: string;
+  compact?: boolean;
+}) {
+  const provider = getProvider(providerId);
+  const query = useProviderReadiness(providerId, sshHost, dir, true);
+  const copy = useMutation({
+    mutationFn: (command: string) => navigator.clipboard.writeText(command),
+  });
+  const data = query.data;
+  const checking = query.isFetching;
+  const missing = data?.installed === false;
+  const ready = data?.installed === true && data.status === 'authenticated';
+  const headline = checking
+    ? 'Checking installation and sign-in…'
+    : data?.installed == null
+      ? 'Could not check CLI'
+      : missing
+        ? 'CLI not installed'
+        : data?.status === 'unauthenticated'
+          ? data.loginHelps === false
+            ? 'Can’t be used yet'
+            : 'Not signed in'
+          : data?.status === 'unconfigured'
+            ? 'No backend configured'
+            : ready
+              ? providerId === 'opencode'
+                ? 'Backend connected'
+                : 'Signed in'
+              : 'Sign-in not verified';
+  const reason =
+    checking || ready
+      ? null
+      : query.error
+        ? 'Could not reach this host. Check the connection and try again.'
+        : (data?.message ?? null);
+  // Only a CLI that answered "signed out" (or "no backend") is fixed by its
+  // login command, and not when the check says signing in would not help. An
+  // unknown status means the check itself could not run, and the reason says
+  // what to do instead.
+  const loginMayHelp =
+    (data?.status === 'unauthenticated' || data?.status === 'unconfigured') &&
+    data.loginHelps !== false;
+  const Icon = checking ? Loader2 : ready ? CheckCircle2 : CircleAlert;
+  const tone = checking || ready ? 'text-foreground-muted' : 'text-foreground-warning';
+  if (compact)
+    return (
+      <span
+        className={`inline-flex items-center gap-1.5 text-xs ${tone}`}
+        title={reason ?? undefined}
+      >
+        <Icon className={`size-3.5 ${checking ? 'animate-spin' : ''}`} />
+        {headline}
+        {reason && <span className="sr-only">: {reason}</span>}
+      </span>
+    );
+  return (
+    <div className="rounded-lg border border-border bg-background-1 p-3 text-sm" role="status">
+      <div className="flex items-center gap-2">
+        <Icon className={`size-4 shrink-0 ${tone} ${checking ? 'animate-spin' : ''}`} />
+        <span className="font-medium">
+          {provider?.name ?? providerId} · {headline}
+        </span>
+        <Button
+          className="ml-auto shrink-0"
+          size="sm"
+          variant="ghost"
+          disabled={checking}
+          onClick={() => void query.refetch()}
+          aria-label="Recheck installation and sign-in"
+        >
+          <RefreshCw className={`size-3.5 ${checking ? 'animate-spin' : ''}`} />
+          Recheck
+        </Button>
+      </div>
+      <p className="mt-1 text-xs text-foreground-muted">
+        {sshHost ? `On ${sshHost}` : 'On this computer'}
+        {data?.installed === true ? ' · CLI installed' : ''}
+      </p>
+      {reason && <p className="mt-2 text-foreground-muted">{reason}</p>}
+      {!checking && data?.installed && loginMayHelp && provider && (
+        <div className="mt-2 space-y-1">
+          <p>Run in a terminal {sshHost ? `on ${sshHost}` : 'on this computer'}, then Recheck:</p>
+          <div className="flex items-center gap-2 rounded bg-background px-2 py-1">
+            <code className="min-w-0 flex-1 text-xs break-all select-all">
+              {provider.loginCommand}
+            </code>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => copy.mutate(provider.loginCommand)}
+              aria-label="Copy sign-in command"
+            >
+              {copy.isSuccess ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+              {copy.isSuccess ? 'Copied' : 'Copy'}
+            </Button>
+          </div>
+          {copy.error && (
+            <p role="alert">Could not copy. Select the command above to copy it manually.</p>
+          )}
+        </div>
+      )}
+      {!checking && missing && (
+        <p className="mt-2 text-foreground-muted">
+          Install this CLI {sshHost ? 'from this host’s setup page' : 'in Settings → Agents'}, then
+          recheck.
+        </p>
+      )}
+    </div>
+  );
+}

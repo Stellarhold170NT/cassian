@@ -1,0 +1,749 @@
+# Project Overview
+
+**This repository is public.** Everything written here is world-readable and
+permanent, git history included. See "This repository is public" in the root
+`CLAUDE.md` for what that rules out — credentials, internal hostnames and
+infrastructure names, personal addresses. It applies to test fixtures too.
+
+Switch Console is a cross-platform, local-first Electron app for orchestrating multiple AI
+coding agents in parallel. Each agent runs in its own session in its location's directory
+(there are no Git worktrees). An agent runs either locally or — when configured remote — on an
+SSH host — through a persistent SDK host. The supported providers are Claude Code,
+Codex, OpenCode, Antigravity ACP and Cursor. Local and SSH sessions use the same
+adapters, durable commands and transcript recovery. See [SDK sessions](docs/sdk-sessions.md).
+
+## The name: display vs identity (CHOO-2008)
+
+Switch Console is a fork; upstream attribution is recorded in `NOTICE`. The app was
+previously called **switchdash**, and before that `emdash`.
+
+The rename covered the display name, the source tree and the release artifacts. What
+did **not** move is anything already written to a user's disk or already spoken to
+something deployed — those names are frozen, and the split is load-bearing.
+
+Renamed: `PRODUCT_NAME`, the workspace packages (`@switch-console/*`), the app
+directory (`apps/switch-console-desktop/`), the binary and package names
+(`APP_NAME_LOWER`), the release artifacts (`ARTIFACT_PREFIX`) and tags
+(`switch-console-v*`), the Windows signing profile, and every name that lives
+only inside this repo — log filenames, the renderer-log IPC channel, temp-file
+prefixes, `TERM_PROGRAM`, the oxlint plugin namespace, the icon asset folder,
+the Nix package, the updater cache directories and the BYOI tooling names.
+
+Still `switchdash`, deliberately — **do not "fix" these**:
+
+- the user-data directory (`USER_DATA_DIR_NAME`) and the SQLite file `switchdash.db` —
+  it holds the database, and the compose project names derive from it, so renaming
+  starts an existing install empty and orphans its Postgres volume
+- the macOS app id (`com.switchdash.*`) — it carries registration and update
+  continuity for copies installed before the rename, and nobody reads it
+- the name the app announces to the OS (`OS_APP_NAME`, passed to `app.setName`) —
+  `safeStorage` encrypts against a key the OS files under it, bound the first time
+  the app touches the keychain and never re-read, so a renamed build gets an empty
+  key and cannot read the saved sign-ins or the local server's credentials sitting
+  in the shared database. Measured on macOS: the bundle names are not consulted,
+  only this call. Nothing a user reads comes from it — display strings take
+  `PRODUCT_NAME`
+- the `switchdash://` deeplink scheme — links already posted into Slack and Mattermost
+  are permanent, and deployed Mattermost stacks whitelist the scheme in their config
+- the per-project config file (`.switchdash.json`) and per-repo state dir
+  (`.switchdash/`)
+- `SWITCHDASH_*` environment variables and the `X-Switchdash-*` hook headers — baked
+  into hook commands already written into users' own agent config files, and into
+  sidecars already deployed on remote hosts
+
+One cost was accepted rather than avoided: because `APP_NAME_LOWER` moved, `apt` and
+`dnf` treat `switch-console` as a new package rather than an upgrade of `switchdash`,
+so a Linux user upgrading across the rename has to remove the old package by hand.
+
+The **update feed** points at GitHub Releases on the public
+`sandbox-quantum/switch` repo (see `electron-builder.config.ts` `publish`): the feed is
+read unauthenticated, so the updater needs no token. The SQLite database file is `switchdash.db`;
+installs upgrading from a pre-rebrand build are migrated forward from their legacy database
+on first launch — see `LEGACY_DB_FILENAMES` in `src/main/db/default-path.ts` and the
+copy-migration in `database-file.ts` (those legacy filenames are the only place the
+pre-rebrand name is retained).
+
+## Repository Structure
+
+This is a pnpm workspace monorepo. The Electron app lives in `apps/switch-console-desktop/`
+(package `@switch-console/desktop`). Unless prefixed otherwise, `src/...`, `drizzle/`,
+`scripts/`, `build/`, and config-file paths in this document and in `agents/` docs are
+relative to `apps/switch-console-desktop/`.
+
+Repo root:
+
+- `.claude/` - Local Claude agent settings for this checkout.
+- `agents/` - Agent-facing architecture, workflow, convention, integration, and risk docs.
+- `apps/switch-console-desktop/` - The Electron desktop app (everything below).
+- `packages/` - Shared workspace packages.
+  - `packages/core/` - Transport-agnostic core runtime primitives.
+  - `packages/shared/` - Shared workspace primitives, including the `Result<T, E>` type
+    (`@switch-console/shared`).
+  - `packages/plugins/` - Plugin interfaces and helpers, and the agent provider plugins
+    under `src/agents/impl/<id>/`.
+  - `packages/switch-agent-runtime/` - The published agent runtime; sessions run a pinned
+    version of it (see "Versioned Artifacts").
+- Root config files - `pnpm-workspace.yaml`, root `package.json` with aggregate scripts,
+  `.nvmrc`, `.oxfmtrc.json`, `.oxlintrc.json`.
+
+Inside `apps/switch-console-desktop/`:
+
+- `build/` - Electron packaging assets; avoid edits unless working on packaging or signing.
+- `drizzle/` - Generated Drizzle SQL migrations and metadata.
+- `scripts/` - Build and verification support scripts (sidecar bundle, postinstall,
+  deeplink reset, compose sync). Releasing is a GitHub Actions workflow at the repo
+  root, not a script here.
+- `src/main/` - Electron main process, RPC controllers, services, database, SDK host.
+- `src/preload/` - Typed Electron preload bridge exposed to the renderer.
+- `src/renderer/` - React app organized around `app/`, `features/`, `lib/`, and tests.
+- `src/shared/` - Shared IPC primitives, provider metadata, events, MCP, skills, and types.
+- `src/types/` - Ambient and cross-cutting TypeScript declarations.
+- `tooling/` - App-level dev and test infrastructure that is not bundled into production.
+- App config files - Electron Vite, Vitest, TypeScript, Drizzle, Nix, and packaging config.
+
+## Build & Development Commands
+
+The repo root has aggregate scripts (`dev`, `build`, `test`, `lint`, `format`,
+`format:check`, `typecheck`) that fan out through the pnpm workspace. App-specific
+commands run from `apps/switch-console-desktop/`.
+
+Install dependencies (repo root):
+
+```bash
+pnpm install
+```
+
+Start the full workspace dev setup from the repo root. This builds `packages/**`
+once, then runs package watch builds and the Electron app in parallel:
+
+```bash
+pnpm run dev
+```
+
+Start only the Electron app from `apps/switch-console-desktop/`:
+
+```bash
+cd apps/switch-console-desktop
+pnpm run dev
+pnpm run d
+```
+
+Switch Cloud, the hosted deployment the first-run page and the Add server dialog
+offer, has no URL in source. Point a run at one with `SWITCH_CLOUD_URL`, or bake
+one into a build with `MAIN_VITE_SWITCH_CLOUD_URL` (inlined into the main
+process by electron-vite). Either must be a bare https origin; with neither set
+the Cloud choice reads "Coming soon".
+
+```bash
+SWITCH_CLOUD_URL=https://cloud.example.com pnpm run dev
+```
+
+Run main-process or renderer-only dev watches:
+
+```bash
+pnpm run dev:main
+pnpm run dev:renderer
+```
+
+Run with debug logging:
+
+```bash
+pnpm run dev:debug
+```
+
+Use an isolated development database for schema or migration work by pointing
+`SWITCHDASH_DB_FILE` at a scratch path. From the repo root this starts the full workspace
+dev setup:
+
+```bash
+SWITCHDASH_DB_FILE=/tmp/switchdash-scratch.db pnpm run dev
+```
+
+From `apps/switch-console-desktop/`, this starts only the Electron app:
+
+```bash
+cd apps/switch-console-desktop
+SWITCHDASH_DB_FILE=/tmp/switchdash-scratch.db pnpm run dev
+```
+
+Reset the dev databases from `apps/switch-console-desktop/`:
+
+```bash
+pnpm run db:reset
+```
+
+Build the app:
+
+```bash
+pnpm run build
+pnpm run build:main
+pnpm run build:renderer
+```
+
+Package desktop artifacts locally:
+
+```bash
+pnpm run package
+pnpm run package:mac           # arm64
+pnpm run package:mac:x64
+pnpm run package:linux         # x64
+pnpm run package:linux:arm64
+pnpm run package:win
+```
+
+Two things these scripts do NOT do for you:
+
+- **Build the workspace packages.** They package the app only, so on a fresh
+  clone the renderer build fails with `Failed to resolve entry for package
+  "@switch-console/shared"` — its `exports` point at a `dist/` that no one has
+  written yet. Run `pnpm run build` from the repo root (or
+  `pnpm -r --filter './packages/**' run build`) first.
+- **Rebuild the native modules.** `npmRebuild` is off, so whatever
+  `pnpm --filter @switch-console/desktop run rebuild` last produced is what
+  gets copied into the package.
+
+The macOS and Linux scripts name an arch for that second reason: the natives are
+built for the host, so packaging the other arch yields a package that installs,
+launches, and dies on the first wrong-arch `.node`. Build each arch on that arch
+— which is also why the release workflow runs macOS twice, on an Apple silicon
+runner and an Intel one, rather than passing both flags to one job.
+
+The two macOS builds share one auto-update channel file. electron-builder writes
+`latest-mac.yml` for every macOS arch (the per-arch suffix it gives Linux is
+Linux-only), so neither release job publishes its own — `merge-mac-manifest`
+combines them into one manifest listing both, which is what electron-updater
+reads and how it routes each Mac to its own build. Anything that changes macOS
+artifact names has to keep `arm64` in the Apple silicon file names: that
+substring is the whole of the updater's routing rule.
+
+Run formatting, linting, type checks, and tests:
+
+```bash
+pnpm run format
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+```
+
+Run focused database validation:
+
+```bash
+pnpm run db:setup
+pnpm run db:fixtures
+pnpm run test:migrations
+```
+
+Rebuild native Electron dependencies after native dependency changes:
+
+```bash
+pnpm run rebuild
+```
+
+Clean and reset dependencies:
+
+```bash
+pnpm run clean
+pnpm run reset
+```
+
+## Code Style & Conventions
+
+- Use Node `24.14.0` from `.nvmrc` and `pnpm@10.28.2`.
+- Use `pnpm` for root project work; do not introduce npm or yarn lockfile churn.
+- Format with `oxfmt`; config is `.oxfmtrc.json`.
+- Keep formatted lines near the configured `printWidth` of 100 characters.
+- Use 2 spaces, semicolons, single quotes in TS, double quotes in JSX, LF endings,
+  trailing commas where valid in ES5, and sorted imports.
+- Lint with `oxlint`; config is `.oxlintrc.json` with correctness errors,
+  TypeScript, React hooks, and local repo rules enabled.
+- TypeScript strict mode is enabled in `apps/switch-console-desktop/tsconfig.json`, the single
+  tsconfig for all app targets.
+- Avoid `any`; if a registry or boundary needs it, keep the escape local and documented.
+- Use top-level `import` statements; do not use `require()`.
+- Never re-export as a shortcut; import from the original source.
+- Components use `PascalCase`; hooks use `useX` camelCase or an existing local pattern.
+- Tests use `*.test.ts` or `*.test.tsx`.
+- Main-process RPC handlers live in `src/main/core/*/controller.ts` and delegate to
+  imported operation or service functions.
+- Renderer RPC calls go through `rpc` from `src/renderer/lib/ipc.ts`.
+- Feature UI lives under `src/renderer/features/<feature>/`; shared renderer
+  primitives, stores, hooks, modal infrastructure, hotkeys, and UI live under
+  `src/renderer/lib/`.
+- New modals must be registered in `src/renderer/app/modal-registry.ts`.
+- New views must be registered in `src/renderer/app/view-registry.ts`.
+- New commands should use `src/renderer/lib/commands/registry.ts` and view-level
+  `commandProvider` hooks where possible.
+- Commit messages should follow Conventional Commits:
+
+```text
+<type>(<scope>): <short imperative summary>
+
+Examples:
+fix(opencode): change initialPromptFlag from -p to --prompt for TUI
+feat(docs): add changelog tab with GitHub releases integration
+```
+
+## Architecture Notes
+
+```mermaid
+flowchart LR
+  User[User] --> Renderer[React renderer]
+  Renderer --> RPC[Typed RPC client and event emitter]
+  RPC --> Preload[Electron preload bridge]
+  Preload --> Main[Electron main process]
+  Main --> Controllers[src/main/core controllers]
+  Controllers --> Services[Domain services and providers]
+  Services --> DB[(SQLite via Drizzle)]
+  Services --> SDK[Persistent SDK host]
+  Services --> MCP[MCP and skills services]
+  SDK --> Agents[Native provider adapters]
+  Main --> Events[Typed events]
+  Events --> Renderer
+```
+
+The app boots from `src/main/index.ts`, loads environment and database state,
+registers RPC controllers through `src/main/rpc.ts`, creates the Electron window,
+and exposes a typed preload API from `src/preload/index.ts`. The renderer is a
+React app that calls typed RPC methods, subscribes to typed events, and coordinates
+views, modals, command providers, project state, and session workflows.
+Shared IPC primitives, provider metadata, events, MCP types, skills types, and
+domain types live under `src/shared/`.
+
+Main-process work is split into domain modules under `src/main/core/`: agent hooks,
+agent runtime, agents (Switch agents), app, dependencies, embedded controller, execution context, fs,
+locations (an agent's working dir on a host — formerly the project/workspace split),
+managed Switch server, prompt library, providers (the CLI-provider registry), SDK host,
+remote hosts, resource monitor, search, secrets, sessions, settings, SDK host, SSH,
+switch rooms, switch servers, switch setup, command shells, lifecycle scripts, updates, and
+view state. `agents` and `providers` are different things — see
+`agents/architecture/main-process.md`. Stateful main-process concerns use singleton
+services; expected failures should use the `Result<T, E>` pattern from the
+`@switch-console/shared` workspace package.
+
+### Logging
+
+`createLogger()` in `src/shared/logger.ts` backs all three processes. The console and
+the file sink are levelled independently: the console follows `LOG_LEVEL` (default
+`warn`), the file follows `LOG_FILE_LEVEL` (default `info`), so a shipped build records
+the run that led to a failure without a noisy terminal.
+
+Entries carry structured context. Do not add a parameter to a function only so a log
+line can mention it — the identity is ambient:
+
+- **Main:** an `AsyncLocalStorage` scope (`src/main/lib/log-context.ts`) is opened at the
+  RPC chokepoint, so anything beneath a call inherits its `sessionId`. Use
+  `runWithLogContext()` when adding a new entry point, and `bindLogContext()` for
+  callbacks that outlive the operation that created them (streams, intervals) — ALS
+  follows promises and timers but such emitters otherwise keep a stale scope forever.
+- **Renderer:** no ALS in the browser; attach ids with `log.child({ … })`.
+- **Enrichment:** `registerLogContextResolver()` derives the remaining fields from the
+  ids present (session → room, id → name). Resolvers must stay synchronous and
+  best-effort; never query the database from the logging path, which runs during
+  shutdown and inside error handlers.
+
+Names come from a cache **pushed to** by the row mappers (`mapSessionRowToSession`,
+`mapAgentRowToAgent`) — never fetched on demand.
+
+At the boundaries that fail (sidecar launch, migrations, updater, SDK host, RPC), log an
+`event` plus an enumerated `stage`/`errorCode` rather than prose, so failures can be
+grepped and counted.
+
+## Testing Strategy
+
+- Local merge gate:
+
+```bash
+pnpm run format
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+```
+
+- Unit tests run with Vitest in the `node` project for `src/**/*.test.ts`.
+- Main database integration tests run in the `main-db` Vitest project.
+- Migration tests run in the `migrations` project via `pnpm run test:migrations`.
+- Fixture generation runs in the `fixtures` project via `pnpm run db:fixtures`.
+- Renderer browser tests run in the `browser` project using Playwright-backed
+  `@vitest/browser-playwright`. **Agents: skip these — do not run or try to fix
+  them.** They need a real Chromium and its system libraries (e.g. `libnspr4`),
+  which dev VMs generally lack, so they fail for environment reasons unrelated
+  to your change. CI is the gate for them. Run the node projects instead:
+
+```bash
+pnpm vitest run --project node --project main-db
+```
+
+  If `pnpm run test` reports failures only from the `browser` project (a
+  Playwright launch error rather than an assertion), treat the run as green and
+  say so — do not install browsers or chase the failure.
+- Main-process tests are colocated in `src/main/core/**/*.test.ts`.
+- Renderer unit tests live under `src/renderer/tests/`.
+- Renderer browser tests live under `src/renderer/tests/browser/`.
+- Integration-style tests create temporary projects in `os.tmpdir()`.
+- Run the consistency checks locally before merging:
+
+```bash
+pnpm run format:check
+pnpm run typecheck
+pnpm run lint
+```
+
+- Run the tests locally before merging as well.
+
+## Security & Compliance
+
+- The project is licensed under Apache-2.0; see `LICENSE` at the repo root.
+- Do not commit secrets, tokens, private keys, app databases, logs, build artifacts,
+  or generated dependency folders.
+- Application secrets are stored through encrypted app secret services and Electron
+  safe storage.
+- The app sends a small, fixed set of product events to the company's public OTLP relay,
+  which forwards them to Amplitude and Datadog, and nothing else. The relay holds both
+  vendor keys, so **no credential ships in the app** — do not reintroduce one, and do not
+  call a vendor directly. It also means the vendors see the relay's network address rather
+  than the user's. Do not turn that into a promise about *them*: it is a property of the
+  relay's configuration, which lives in another repository and whose own documentation
+  describes the change that would undo it. The consent copy therefore promises only what
+  this app does — it sends no address and no location — which stays true either way.
+  Logs are local-only and no code path transmits them off the machine. Do not add one.
+  `getDiagnosticLogAttachment()` builds a redacted export and is the only function
+  intended to ever feed such a path; anything that ships log content must go through it
+  rather than reading the log itself, and no log content may enter a telemetry payload.
+- **Telemetry consent is a gate, not a preference.** Anything that would send usage data
+  must `await isTelemetryAllowed()` (`src/main/core/telemetry/consent.ts`) at the point of
+  emission and send nothing when it returns false. Do not read `telemetry.enabled` from
+  settings directly — it does not distinguish "said yes" from "not asked yet" — and do not
+  cache the answer across a send, since the user can revoke it at any time. Consent off
+  means **no request is made at all**, not a request whose result is discarded.
+- **The answer reaches the managed server too, and never by omission.** "Share usage
+  data" is one decision covering this app and a Switch server it runs, so `startStack`
+  reads it and writes `TELEMETRY_ENABLED` into the stack's `.env` on every start —
+  `false` as explicitly as `true`, because the compose file forwards the key only when
+  the `.env` names it, and a stack started under a yes would otherwise keep reporting.
+  On a shared SSH host a "yes" is written only when the stack already shares or no
+  other Console has been seen on it lately (`shareUsageData` in `pipeline.ts`), so one
+  user's yes never turns sharing on over the others; a "no" is always written. The
+  scope note in `telemetry-copy.ts` and `docs/TELEMETRY.md` §4.1 state this to the
+  user, and change with it. Adding a variable to that contract needs three edits: `deploy/local/standalone-docker-compose.yml`
+  plus `pnpm run sync:compose`, `env-file.ts`, and `native/core-settings.ts` — a native
+  local server (no Docker) gets the same settings as its process environment, and the
+  copy it was started with is what is read back. The server reads the gate once at
+  boot, so a running stack can be out of step; that is surfaced on the server's page with
+  a restart offered, never applied by restarting the user's server for them. Whether it
+  is out of step is read off the running container, not inferred from what we last wrote —
+  and a host that cannot be read is reported as unknown, never as agreeing.
+- **The toggle defaults to on.** Usage data is opt-out: a first-run notice says what is
+  shared and carries the off switch, and the same toggle lives in Settings. That default is
+  a product decision, and so is what identifies an install (today, only the random
+  per-install id). Changing either is a product and privacy call, not a code change.
+- **What a telemetry payload may contain.** Add an event only by adding it to the closed
+  catalogue in `src/main/core/telemetry/events.ts`: its property types are literal unions,
+  numbers and booleans, and `TELEMETRY_EVENT_PROPERTIES` names the same fields as data, which
+  the emitter uses to drop anything else before it builds a payload. A count goes as a number
+  and a yes/no as a boolean rather than as text, so both stay usable at the far end; anything
+  else — an object, an array, `null`, a non-finite number — is refused rather than encoded. The types alone are not
+  enough — excess-property checking does not apply through a spread — so the runtime
+  filter is what makes "nothing free-text can reach a payload" true rather than intended.
+  Permitted: which of the catalogued things happened, agent type, local-vs-remote,
+  success-vs-failure, how long an operation took, app version, operating system, the
+  random install id, which kind of launch it was (first, after an update, or neither),
+  and whether a signed-in account is on a company email domain — the yes/no only, read
+  from the domain, never the address. A duration is a number rather than a value from a fixed set,
+  so it is held to `TelemetryDurationMs`: measured on a monotonic clock, whole
+  milliseconds, and never a span that could encode something else. That is a branded
+  type, not an alias for `number`, and `startTimer()` is the only thing that mints one —
+  so a call site cannot reach for `Date.now() - startedAt`, which is not monotonic and
+  across a clock step yields a negative number nothing at the far end can tell from data.
+  Never: prompts, code, file paths, working directories, error messages or stack traces
+  (use an enumerated code), machine or user names, IP or MAC addresses, email or sign-in,
+  and no agent, room, project, location or server names or ids. Widening this is a consent
+  decision — the summary the user consents to lives in
+  `src/renderer/features/telemetry/telemetry-copy.ts`, the field-by-field disclosure it
+  links to is `docs/TELEMETRY.md`, and both must be kept in step with it.
+- **The interface may report only through the one gate.** Almost everything is
+  reported from the main process, where a call site is type-checked against the
+  catalogue. The exceptions are moments that exist only in the UI — a screen
+  opened, a command run, a checklist abandoned — and they go through
+  `rpc.telemetry.track` into `src/main/core/telemetry/renderer-events.ts`, which
+  checks the event is one of the few permitted and every value against the set
+  the catalogue allows. That check is not ceremony: a type does not survive a
+  process boundary, so it is the only thing standing between a received value
+  and a payload. Do not add a second path, and if a moment can be observed from
+  the main process, observe it there.
+- **Report a moment, not a state — and if you must report a state, claim it after
+  the gate.** A condition that is true from the instant it becomes true is true
+  again on every later launch, so reporting it directly counts it forever;
+  `ONCE_PER_INSTALL` in `renderer-events.ts` exists for that case and keeps the
+  record beside the emitter rather than in the user's settings, which would
+  report a setting nobody changed. The record is spent once and never given
+  back, so it must not be claimed until a send is actually possible: the app
+  renders behind the first-run consent prompt, so anything claiming before the
+  consent check spends its one chance while the answer is still unset and
+  retires the event for the life of the install.
+- **Prefer a value the caller declares to one you read back.** Several
+  dimensions describe an intent that only the caller has — which button, which
+  source, whether a room was chosen — and the state that would answer is often
+  consumed by the very operation being reported. Pass it through the params;
+  narrow it at the emitter, because it crossed a process boundary.
+- **A fallback must not assert something.** `unknown` is the right default for a
+  dimension nobody supplied. Falling back to a real variant — `user` for "who
+  started this" — reports a claim the code has no evidence for, and it lands in
+  the bucket a human would read as deliberate.
+- **Telemetry never affects the user.** It is fire-and-forget with a short timeout and no
+  retry: a send that fails is logged with an `errorCode` and dropped. It must never block,
+  delay or fail an operation, and must never surface in the UI. It is off in a dev build,
+  which is logged once so a build that is not reporting says why.
+- **The compile-time guards are load-bearing; keep them in the `[X] extends
+  [never]` form.** An indexed access by a union distributes and then collapses,
+  so `Map[Union]` yields `true | never` — which is `true`, and passes while
+  every member but one is wrong. Two assertions in this area were written that
+  way and asserted nothing. Wrapping both sides in a tuple stops the
+  distribution. Note also that `satisfies { [K in Name]: readonly (keyof T[K])[] }`
+  constrains what an array *may* contain, never what it *must* — that is why
+  `_everyPropertyIsAllowListed` is a separate check.
+- **The sidecar sends nothing to the relay.** It runs headless on a user's VM with no
+  consent prompt and no access to this setting, so sessions it starts are not counted in
+  this app's telemetry. Do not "fix" that by having it report; the gate is not reachable
+  from there. What a session host does tell is the Switch server it already works for:
+  that a new session started and how (`host/session-start.ts`), as ordinary traffic to
+  that server. Whether that leaves the server as telemetry is the server's own setting.
+- **Redaction is split by destination, and both halves must be preserved:**
+  - **Secrets** (tokens, keys, JWTs, PEM blocks, URL credentials) are redacted on the
+    write path by `redactSecrets()` and must never reach disk.
+  - **Personal data** (home directories, IP and MAC addresses, emails) is deliberately
+    *retained* in the local log file — it is what makes a user's own log debuggable —
+    and is redacted by `redactDiagnosticLog()` in `getDiagnosticLogAttachment()`, the
+    single point at which content is prepared to leave the machine. Do not "fix" the
+    local file by scrubbing it on write; that reinstates the problem this split exists
+    to solve.
+  - Anything contributed via `registerDiagnosticSection()` passes through the same
+    export scrub. Never read the raw log file from outside `file-logger.ts`.
+- **An agent's Switch API token lives in exactly one file:**
+  `<working dir>/.switch/agents/<slug>.json`, beside a generated `.gitignore`
+  containing `*`. For the agents **Switch Console** manages it also writes
+  `.claude/settings.local.json` carrying the endpoint and agent id only — Claude
+  Code's own file, read by every session in the directory, which does not need
+  the credential. Do not add a token back to it: two copies is how one goes stale
+  and authenticates as the wrong agent.
+  - **Where Switch Console writes the settings file, Claude Code makes it live.**
+    Its `env` block becomes real process environment for everything a session
+    spawns, so keep the agent id in it in step with `.switch/agents/`; changing
+    one means changing the other.
+  - Two consumers read this layout: Switch Console and the sidecar. A session
+    host reads it through `readSharedCredentials` in
+    `packages/agent-providers/src/host/shared-config.ts` and refuses a file
+    naming a different agent. Changing the shape means changing both.
+  - The token being in a working tree at all is a known exposure — a
+    `.gitignore` stops `git add` and not an archive, a sync or `git add -f`.
+    Moving it out is tracked separately; it is deliberately not solved by
+    writing it to a second location as well.
+- **The embedded agent controller's credential** (`embedded-controller/`) lives only in
+  the encrypted app secrets store. It reaches the controller child on stdin
+  (`--credential-stdin`), never on argv, in the environment or in a file, so the
+  watchers and sessions the controller starts cannot inherit it. Keep it that way.
+- SDK host environment passthrough must use the allowlist in `packages/agent-providers/src/host/agent-env.ts`.
+- Treat shell escaping and provider process spawning as security-sensitive.
+- Do not bypass path-safety, shell escaping, or validation helpers.
+- Use `pnpm-lock.yaml` for dependency integrity and review dependency changes.
+
+## Shared SDK Host
+
+`packages/agent-providers/src/host/` owns persistent execution on both local and
+SSH machines. `src/main/core/sdk-host/` deploys and connects to it. Changes to
+launch configuration, skills, MCP, environment and recovery must work on the
+execution machine. Never replace unknown command outcomes with retries.
+
+## Versioned Artifacts — Bump Them
+
+The agent runtime package carries its own version, separate from the app's.
+**If you make a non-trivial change to it, bump its version in the same commit.**
+Not at release time, not "later" — in the commit that changes it, or it will be
+forgotten and someone will debug a build they think is newer than it is.
+
+| Artifact | Version lives in | Bump when |
+|---|---|---|
+| Agent runtime package | `packages/switch-agent-runtime/package.json` | any change to the protocol client or the hosted tool surface. Its version is the `client_version` Switch records for the connection, and `just artifacts-check` fails if it disagrees with `artifacts.yaml` |
+
+"Non-trivial" means anything a user could observe: behaviour, protocol, wiring,
+dependencies. A comment or a rename that changes nothing does not need one.
+
+SDK host deployment uses the bundle content hash. Preserve wire compatibility
+and durable command receipts across redeployment.
+
+## Agent Guardrails
+
+- Load only the relevant `agents/` docs for the area being changed.
+- Do not hand-edit numbered Drizzle migrations or `drizzle/meta/`.
+- Use `pnpm run db:generate` for new migrations, then update fixtures and migration tests.
+- Avoid editing `dist/`, `release/`, `out/`, `build/`, and generated package artifacts
+  unless the task is explicitly about packaging, signing, or release behavior.
+- Do not dispatch release workflows, publish packages, or upload artifacts unless the
+  user explicitly asks for release work.
+- Treat `src/main/core/sdk-host/`, `src/main/db/`, and updater code as high risk and read
+  the matching `agents/risky-areas/` page first.
+- Do not weaken shell quoting, spawn behavior, env allowlists, or secret redaction casually.
+- Prefer existing service, provider, RPC, modal, view, and store patterns over new abstractions.
+- New RPC methods belong in the appropriate `src/main/core/*/controller.ts` and are
+  registered through `src/main/rpc.ts`.
+- Keep renderer-main calls on typed RPC and typed events. The preload bridge in
+  `src/preload/index.ts` should stay small; add direct `window.electronAPI` surface
+  only when a browser/Electron primitive cannot fit the RPC/event path.
+- Access session and location MobX stores through selectors and session view hooks:
+  `getSessionStore`, `asProvisioned`, `sessionViewKind`, `getSessionManagerStore`,
+  `getLocationStore`, `asMounted`, `useSessionViewKind`, `useSessionRuntime`,
+  `useSessionLocationId`, `useSessionViewModel`, and `useSessionAgent`.
+- Never use `asProvisioned(...)!` or `asMounted(...)!`; use explicit null checks.
+- State guards must check `kind !== 'ready'` rather than enumerating non-ready states.
+- Access session managers through `getSessionManagerStore(locationId)`, not `location.sessionManager`.
+- Access mounted locations through `asMounted(getLocationStore(id))`, not inline guards.
+- Session selectors live in `src/renderer/features/sessions/stores/session-selectors.ts`.
+- Location selectors live in `src/renderer/features/locations/stores/location-selectors.ts`.
+- For provider changes, follow [Add an agent provider](docs/add-an-agent-provider.md): the
+  plugin, the runtime registration (with its env passthrough), and tests for non-standard
+  behavior. Nothing else should need to name the provider.
+- For MCP changes, keep canonical data in shared types and adapt provider formats at edges.
+- Run the local merge gate before merging:
+
+```bash
+pnpm run format
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+```
+
+## Extensibility Hooks
+
+- An agent provider registers in two places, each with one line: its plugin in
+  `packages/plugins/src/agents/plugin-registry.ts` (display metadata, detection, install,
+  icon) and its runtime in `packages/agent-providers/src/providers/registry.ts` (adapter,
+  sign-in check, login command). An ACP CLI's runtime is made from its hooks on the generic
+  ACP adapter. `src/shared/core/providers/agent-provider-registry.ts` is the catalogue the
+  app builds from both at startup; nothing in the app lists provider ids. See
+  [Add an agent provider](docs/add-an-agent-provider.md).
+- **The Switch skill every session receives** lives in
+  `packages/plugins/src/switch-skill/SKILL.md`, the one copy Console pushes to
+  every host (system context for Claude Code, Cursor and Antigravity; a
+  `SKILL.md` for Codex and OpenCode). A change to how agents interact with Switch
+  — MCP tools, in-room commands, room workflow — updates it.
+- Provider detection lives in `src/main/core/dependencies/` (`dependency-managers.ts`,
+  `registry.ts`), with remote detection in `remote-dependency-manager.ts`.
+- SDK host deployment and env passthrough live under `src/main/core/sdk-host/`.
+- Per-provider directory-trust helpers live under `src/main/core/agent-hooks/`.
+- Modal definitions are centralized in `src/renderer/app/modal-registry.ts`.
+- View definitions and navigation guards are centralized in `src/renderer/app/view-registry.ts`.
+- MCP types live under `src/shared/core/mcp/`.
+- Skills types and validation live under `src/shared/core/skills/`.
+- Per-location runtime settings can be supplied through `.switchdash.json`:
+  `preservePatterns`, `scripts.setup`, `scripts.run`, `scripts.teardown`, and
+  `shellSetup`.
+- Location settings such as `locationProvider` are DB-backed, not
+  `.switchdash.json`.
+- Optional environment variables:
+  `SWITCHDASH_DB_FILE`, `SWITCHDASH_DISABLE_NATIVE_DB`,
+  `SWITCHDASH_REGISTER_DEEPLINK`,
+  `SWITCHDASH_FAKE_UPDATE`, `SWITCHDASH_TELEMETRY_DEV`, and
+  `SWITCHDASH_TELEMETRY_ENDPOINT`.
+- Telemetry in dev: a dev build sends nothing, so the emitter cannot be exercised by
+  `pnpm run dev` alone. `SWITCHDASH_TELEMETRY_DEV=1` opts a dev run in, and
+  `SWITCHDASH_TELEMETRY_ENDPOINT` redirects it at a local listener so what is actually
+  sent can be read off the wire rather than off the code. Both are dev-only and cannot
+  activate in a packaged build. There is no key to configure: events go to the public
+  OTLP relay, which holds the vendor credentials server-side, so every build can report
+  and none carries a secret. Example:
+  `SWITCHDASH_TELEMETRY_DEV=1 SWITCHDASH_TELEMETRY_ENDPOINT=http://127.0.0.1:9009 pnpm run dev`.
+- The Codex Windows install list leads with the ChatGPT `install.ps1`, and npm's
+  option is stripped of the `recommended` flag `npmDependency` adds for every
+  platform — both `pickInstallOption` and the settings UI take the *first*
+  recommended option, so leaving it on npm steers Windows users there whatever
+  the order. The script ships no uninstaller, so the descriptor removes exactly
+  the two directories it creates (`%LOCALAPPDATA%\Programs\OpenAI\Codex` and
+  `%USERPROFILE%\.codex\packages\standalone`) and leaves the rest of
+  `~/.codex` — config, auth, sessions — alone. It is written without `$` or `%`
+  because the install runner's shell may be either PowerShell or cmd.exe, and
+  each would expand one of them before `powershell -c` ran.
+- An auto-approving Codex session launches with `-c approval_policy="never"` and
+  nothing else. The sandbox is deliberately **not** overridden: "Bypass
+  permissions" promises unattended approvals, not unattended filesystem and
+  network access, so the user's own `sandbox_mode` from `~/.codex/config.toml`
+  stands. See `packages/plugins/src/agents/impl/codex/index.ts`.
+- App updates in dev: the update service is inert outside packaged builds, so the
+  "update available" UI cannot be exercised by `pnpm run dev` alone. Set
+  `SWITCHDASH_FAKE_UPDATE` to replay the lifecycle against a simulated release —
+  `available`, `download-error`, `check-error`, `auth-required`, or `up-to-date`.
+  An unrecognised value fails at startup rather than silently doing nothing.
+  `SWITCHDASH_FAKE_UPDATE_VERSION` overrides the offered version (default: the
+  current minor, bumped) and `SWITCHDASH_FAKE_UPDATE_MS` the simulated download
+  duration. Nothing is downloaded or installed, and the harness cannot activate in
+  a packaged build. Example:
+  `SWITCHDASH_FAKE_UPDATE=available pnpm run dev`.
+- The managed local Switch server in dev: a dev build launched from a Switch
+  checkout shows a **"Build switch-core from this checkout"** toggle on the local
+  server's page. With it on, every start layers a generated build override on the
+  bundled compose file and runs `up -d --build`, so `switch`, `gateway` and
+  `setup` are built from the working tree and tagged `dev-checkout` instead of
+  pulling the pinned GHCR images. The choice persists in
+  `local-switch-server/checkout-build.json` under user-data and applies from the
+  next start. The compose file stays the bundled pinned one — re-sync it
+  (`pnpm run sync:compose`) if the checkout's own standalone compose has moved
+  on. Because the tag is not a semver, the downgrade guard cannot run against a
+  checkout build; it is skipped with a warning rather than silently.
+  See `src/main/core/managed-switch-server/checkout-build.ts`.
+- Choosing the managed servers' switch-core in dev: a dev build runs the canary
+  pin (`COMPATIBLE_SWITCH_VERSION`). `SWITCH_CONSOLE_SERVER_VERSION` overrides it
+  for the run, read once by the main process at launch:
+  - a release version (`0.30.0`, `0.31.0-rc.7`) — every managed server, local
+    (native or Docker) and SSH-hosted, runs that release: native install, image
+    tags and `.env` `SWITCH_VERSION`, the downgrade guard, drift and upgrade
+    prompts all use it, and the setup page shows it. The checkout toggle is held
+    off. The bundled compose file stays the pinned one, and a version older than
+    what a stack already ran is refused by the downgrade guard as usual.
+  - `checkout` — the local server builds (Docker) or installs (native)
+    switch-core from the checkout the app was started in on every start,
+    whatever the persisted toggle says; the server page shows the toggle held on
+    by the variable. Remote managed servers keep the pin, since a remote host
+    builds nothing from this machine. The downgrade guard is skipped with a
+    warning, as for the toggle.
+  A value that is neither, or `checkout` with no checkout above the app's
+  working directory, stops the launch with an error naming the variable. Set it
+  in the launching environment (`.env.local` works too):
+  `SWITCH_CONSOLE_SERVER_VERSION=checkout pnpm run dev`. Stable and canary builds
+  ignore it. See `src/main/core/managed-switch-server/server-version.ts`.
+- Deeplinks in dev: `pnpm run dev` does **not** claim the `switchdash://` OS URL
+  scheme by default — doing so hijacks the handler from the installed app and the
+  registration outlives the dev process (on macOS it sticks in Launch Services),
+  so later deeplinks open the bare dev Electron's welcome window instead of the
+  installed app. To test deeplinks against the dev build, run with
+  `SWITCHDASH_REGISTER_DEEPLINK=1 pnpm run dev`; afterwards run
+  `pnpm run deeplink:reset` (macOS) to hand the scheme back to the installed app.
+- Path aliases are defined in `tsconfig.json` and mirrored in `electron.vite.config.ts`:
+  `@/*`, `@renderer/*`, `@main/*`, `@shared/*`, and `@root/*`.
+- Versioned JSON column schemas are defined in `src/shared/` using
+  `defineVersionedSchema()` from `src/shared/lib/versioned-schema/versioned-schema.ts` and wired to
+  Drizzle via `versionedJsonColumn()` from `src/main/db/versioned-column.ts`.
+  See `agents/conventions/versioned-schemas.md` for the full guide.
+
+## Further Reading
+
+- [Agent docs map](agents/README.md)
+- [Quickstart](agents/quickstart.md)
+- [Architecture overview](agents/architecture/overview.md)
+- [Main process architecture](agents/architecture/main-process.md)
+- [Renderer architecture](agents/architecture/renderer.md)
+- [Shared modules](agents/architecture/shared.md)
+- [Remote execution: hosts, reachability, sidecar](agents/architecture/remote-execution.md)
+- [Switch rooms and sessions](agents/architecture/switch-rooms.md)
+- [Data model (Switch Console vs. its upstream origin)](agents/architecture/data-model.md)
+- [Testing workflow](agents/workflows/testing.md)
+- [Provider integration](agents/integrations/providers.md)
+- [MCP integration](agents/integrations/mcp.md)
+- [IPC conventions](agents/conventions/ipc.md)
+- [Main-process patterns](agents/conventions/main-patterns.md)
+- [Renderer patterns](agents/conventions/renderer-patterns.md)
+- [TypeScript and React conventions](agents/conventions/typescript.md)
+- [Config file rules](agents/conventions/config-files.md)
+- [Versioned schema conventions](agents/conventions/versioned-schemas.md)
+- [Database risk notes](agents/risky-areas/database.md)
+- [SDK session risk notes](agents/risky-areas/sdk-sessions.md)
+- [Updater risk notes](agents/risky-areas/updater.md)
+- [Contributing guide](../CONTRIBUTING.md) (repo root)
+- [Project README](README.md)

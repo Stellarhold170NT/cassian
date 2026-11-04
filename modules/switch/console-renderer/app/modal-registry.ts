@@ -1,0 +1,155 @@
+import {
+  ConnectorAppMoveDialog,
+  ConnectorAppRemoveDialog,
+  ConnectorAppSecretDialog,
+  ConnectorAppSetupDialog,
+} from '@renderer/features/admin/connector-app-dialogs';
+import { RenameAgentModal } from '@renderer/features/agent-identity/rename-agent-modal';
+import { RenameChatModal } from '@renderer/features/chats/components/chat-modals';
+import { CommandPaletteModal } from '@renderer/features/command-palette/command-palette-modal';
+import { ConnectServiceModal } from '@renderer/features/connectors/connect-service-modal';
+import { DisconnectServiceDialog } from '@renderer/features/connectors/disconnect-dialog';
+import { AddAgentModal } from '@renderer/features/locations/components/add-agent-modal/add-agent-modal';
+import { DeleteAgentModal } from '@renderer/features/locations/components/delete-agent-modal';
+import { ResetAgentModal } from '@renderer/features/locations/components/reset-agent-modal';
+import { AddHostModal } from '@renderer/features/remote-hosts/add-host-modal';
+import { RemoveAgentConfigModal } from '@renderer/features/remote-hosts/remove-agent-config-modal';
+import { CreateSessionModal } from '@renderer/features/sessions/create-session-modal/create-session-modal';
+import { DeleteSessionModal } from '@renderer/features/sessions/delete-session-modal';
+import { RenameSessionModal } from '@renderer/features/sessions/rename-session-modal';
+import { BuddySetupModal } from '@renderer/features/switch-buddy/buddy-setup-modal';
+import { AddAgentsToRoomModal } from '@renderer/features/switch-rooms/AddAgentsToRoomModal';
+import { AddAgentToRoomsModal } from '@renderer/features/switch-rooms/AddAgentToRoomsModal';
+import { DeleteRoomModal } from '@renderer/features/switch-rooms/DeleteRoomModal';
+import { AddServerModal } from '@renderer/features/switch-servers/AddServerModal';
+import { AssignServerModal } from '@renderer/features/switch-servers/assign-server-modal';
+import { BundledChatSignInModal } from '@renderer/features/switch-servers/BundledChatSignIn';
+import { ClaimIdentityModal } from '@renderer/features/switch-servers/ClaimIdentityModal';
+import { ConnectChatModal } from '@renderer/features/switch-servers/ConnectChatModal';
+import { ConnectMessagingAppModal } from '@renderer/features/switch-servers/ConnectMessagingAppModal';
+import { CreateRoomModal } from '@renderer/features/switch-servers/CreateRoomModal';
+import { DeleteAccountModal } from '@renderer/features/switch-servers/delete-account-modal';
+import { DeleteServerModal } from '@renderer/features/switch-servers/DeleteServerModal';
+import { DisconnectMessagingAppModal } from '@renderer/features/switch-servers/DisconnectMessagingAppModal';
+import { RenameServerModal } from '@renderer/features/switch-servers/RenameServerModal';
+import { ReplaceTokenModal } from '@renderer/features/switch-servers/ReplaceTokenModal';
+import { RequireLinkConfirmationModal } from '@renderer/features/switch-servers/RequireLinkConfirmationModal';
+import { TeamsPlacementModal } from '@renderer/features/switch-servers/TeamsPlacementModal';
+import { SaveTemplateModal } from '@renderer/features/templates/save-template-modal';
+import { CreateWorkspaceModal } from '@renderer/features/workspaces/create-workspace-modal';
+import { InvitePeopleModal } from '@renderer/features/workspaces/invite-people-modal';
+import { ConfirmActionDialog } from '@renderer/lib/components/confirm-action-dialog';
+import { ExternalLinkChoiceDialog } from '@renderer/lib/components/external-link-choice-dialog';
+import { UnsavedChangesDialog } from '@renderer/lib/components/unsaved-changes-dialog';
+import { type ModalComponent } from '@renderer/lib/modal/modal-provider';
+
+export type ModalSize = 'xs' | 'sm' | 'md' | 'lg';
+export type ModalPosition = 'center' | 'top';
+
+export type ModalRegistryEntry<TProps = unknown, TResult = unknown> = {
+  component: ModalComponent<TProps, TResult>;
+  size?: ModalSize;
+  position?: ModalPosition;
+  /**
+   * Whether a click on the backdrop dismisses the modal. Defaults to `true`.
+   * Set `false` for data-entry modals so a stray outside click does not
+   * discard in-progress input; the Escape key and close/Cancel buttons still
+   * dismiss.
+   */
+  dismissOnOutsideClick?: boolean;
+};
+
+export function createModal<TProps, TResult>(
+  component: ModalComponent<TProps, TResult>,
+  config: Omit<ModalRegistryEntry, 'component'> = {}
+): ModalRegistryEntry<TProps, TResult> {
+  return { component, ...config };
+}
+
+export const modalRegistry = {
+  commandPaletteModal: createModal(CommandPaletteModal, { size: 'md' }),
+  sessionModal: createModal(CreateSessionModal, { dismissOnOutsideClick: false }),
+  addAgentModal: createModal(AddAgentModal, { size: 'lg', dismissOnOutsideClick: false }),
+  saveTemplateModal: createModal(SaveTemplateModal, { size: 'sm', dismissOnOutsideClick: false }),
+  confirmActionModal: createModal(ConfirmActionDialog, { size: 'xs' }),
+  deleteAgentModal: createModal(DeleteAgentModal, { size: 'sm' }),
+  renameAgentModal: createModal(RenameAgentModal, { size: 'sm', dismissOnOutsideClick: false }),
+  removeAgentConfigModal: createModal(RemoveAgentConfigModal, { size: 'sm' }),
+  resetAgentModal: createModal(ResetAgentModal, { size: 'sm' }),
+  confirmExternalLinkModal: createModal(ExternalLinkChoiceDialog, { size: 'sm' }),
+  unsavedChangesModal: createModal(UnsavedChangesDialog, { size: 'xs' }),
+  renameSessionModal: createModal(RenameSessionModal, {
+    size: 'xs',
+    dismissOnOutsideClick: false,
+  }),
+  deleteSessionModal: createModal(DeleteSessionModal, { size: 'sm' }),
+  addServerModal: createModal(AddServerModal, { size: 'md', dismissOnOutsideClick: false }),
+  buddySetupModal: createModal(BuddySetupModal, { size: 'lg', dismissOnOutsideClick: false }),
+  createWorkspaceModal: createModal(CreateWorkspaceModal, {
+    size: 'md',
+    dismissOnOutsideClick: false,
+  }),
+  invitePeopleModal: createModal(InvitePeopleModal, {
+    size: 'lg',
+    dismissOnOutsideClick: false,
+  }),
+  addHostModal: createModal(AddHostModal, { size: 'md', dismissOnOutsideClick: false }),
+  assignServerModal: createModal(AssignServerModal, { size: 'sm', dismissOnOutsideClick: false }),
+  renameServerModal: createModal(RenameServerModal, {
+    size: 'xs',
+    dismissOnOutsideClick: false,
+  }),
+  deleteServerModal: createModal(DeleteServerModal, { size: 'sm' }),
+  deleteAccountModal: createModal(DeleteAccountModal, { size: 'sm', dismissOnOutsideClick: false }),
+  createRoomModal: createModal(CreateRoomModal, { size: 'lg', dismissOnOutsideClick: false }),
+  connectMessagingAppModal: createModal(ConnectMessagingAppModal, {
+    size: 'md',
+    dismissOnOutsideClick: false,
+  }),
+  connectChatModal: createModal(ConnectChatModal, { size: 'md' }),
+  connectServiceModal: createModal(ConnectServiceModal, { size: 'md' }),
+  disconnectServiceModal: createModal(DisconnectServiceDialog, { size: 'sm' }),
+  connectorAppSetupModal: createModal(ConnectorAppSetupDialog, {
+    size: 'md',
+    dismissOnOutsideClick: false,
+  }),
+  connectorAppSecretModal: createModal(ConnectorAppSecretDialog, {
+    size: 'sm',
+    dismissOnOutsideClick: false,
+  }),
+  connectorAppRemoveModal: createModal(ConnectorAppRemoveDialog, { size: 'sm' }),
+  connectorAppMoveModal: createModal(ConnectorAppMoveDialog, { size: 'sm' }),
+  claimIdentityModal: createModal(ClaimIdentityModal, {
+    size: 'md',
+    dismissOnOutsideClick: false,
+  }),
+  requireLinkConfirmationModal: createModal(RequireLinkConfirmationModal, {
+    size: 'md',
+    dismissOnOutsideClick: false,
+  }),
+  bundledChatSignInModal: createModal(BundledChatSignInModal, { size: 'sm' }),
+  disconnectMessagingAppModal: createModal(DisconnectMessagingAppModal, {
+    size: 'sm',
+    dismissOnOutsideClick: false,
+  }),
+  replaceTokenModal: createModal(ReplaceTokenModal, {
+    size: 'sm',
+    dismissOnOutsideClick: false,
+  }),
+  teamsPlacementModal: createModal(TeamsPlacementModal, { size: 'md' }),
+  addAgentsToRoomModal: createModal(AddAgentsToRoomModal, {
+    // The room-side twin of `addAgentToRoomModal`, and sized to match: the two
+    // do the same job from opposite ends and should not feel like two dialogs.
+    size: 'lg',
+    dismissOnOutsideClick: false,
+  }),
+  addAgentToRoomModal: createModal(AddAgentToRoomsModal, {
+    // Wide enough for a searchable list and a grid of what you have picked —
+    // this dialog browses a whole server's rooms, not just confirms one.
+    size: 'lg',
+    dismissOnOutsideClick: false,
+  }),
+  deleteRoomModal: createModal(DeleteRoomModal, { size: 'sm', dismissOnOutsideClick: false }),
+  renameChatModal: createModal(RenameChatModal, { size: 'xs', dismissOnOutsideClick: false }),
+  // oxlint-disable-next-line typescript/no-explicit-any
+} satisfies Record<string, ModalRegistryEntry<any, any>>;

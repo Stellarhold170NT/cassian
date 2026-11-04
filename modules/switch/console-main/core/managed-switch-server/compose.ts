@@ -1,0 +1,294 @@
+import { log } from '@main/lib/logger';
+import {
+  BUILD_OVERRIDE_FILE_NAME,
+  COMPOSE_FILE_NAME,
+  CORE_SERVICE,
+  ENV_FILE_NAME,
+  LOCAL_SERVER_PROFILES,
+} from './constants';
+import { commandFailure } from './error-text';
+import type { ServerHost } from './host/types';
+
+/** Pulls can take minutes on a cold machine; give compose a generous ceiling. */
+const COMPOSE_TIMEOUT_MS = 20 * 60 * 1000;
+
+function profileArgs(): string[] {
+  return LOCAL_SERVER_PROFILES.flatMap((p) => ['--profile', p]);
+}
+
+/** Base args that scope every invocation to the managed project + env file.
+ * Relative file names resolve against the host working dir (the ctx root). */
+function baseArgs(host: ServerHost, globalFlags: string[], extraFiles: string[] = []): string[] {
+  return [
+    'compose',
+    ...globalFlags,
+    '-f',
+    COMPOSE_FILE_NAME,
+    ...extraFiles.flatMap((file) => ['-f', file]),
+    '--env-file',
+    ENV_FILE_NAME,
+    '--project-name',
+    host.composeProjectName,
+    ...profileArgs(),
+  ];
+}
+
+export async function runDocker(
+  host: ServerHost,
+  args: string[],
+  timeout: number
+): Promise<string> {
+  const full = [host.dockerBin, ...args];
+  try {
+    const { stdout } = await host.ctx.exec(host.dockerBin, args, {
+      timeout,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    return stdout;
+  } catch (error) {
+    throw new Error(`${full.join(' ')} failed: ${commandFailure(error)}`);
+  }
+}
+
+/**
+ * Bring the stack up in the background (`up -d`), streaming each line of output
+ * to `onLog` so the UI can show a live tail during the (slow) image pull.
+ * Assumes the compose file and `.env` are written and GHCR login has run.
+ *
+ * `fromCheckout` layers the dev-only build override on top of the compose file
+ * and adds `--build`, so the stack's images come from the developer's working
+ * tree instead of the registry (see checkout-build.ts). The override must
+ * already be written to the host working dir.
+ */
+export function composeUp(
+  host: ServerHost,
+  onLog: (line: string) => void,
+  fromCheckout: boolean
+): Promise<void> {
+  log.info(
+    `local-switch-server: docker compose up (${host.label})${fromCheckout ? ' from local checkout' : ''}`
+  );
+  // Compose already falls back to plain, line-per-event output when it is not
+  // attached to a TTY, which is how we always run it — so this pins the
+  // behaviour we depend on rather than changing it. `--progress` belongs to
+  // `compose`, not to `up`; after the subcommand it exits with "unknown flag".
+  const overrides = fromCheckout ? [BUILD_OVERRIDE_FILE_NAME] : [];
+  return host.streamCommand(
+    host.dockerBin,
+    [
+      ...baseArgs(host, ['--progress', 'plain'], overrides),
+      'up',
+      '-d',
+      ...(fromCheckout ? ['--build'] : []),
+    ],
+    onLog,
+    { timeoutMs: COMPOSE_TIMEOUT_MS }
+  );
+}
+
+/**
+ * Run one command in a throwaway container of `image`, on the stack's network.
+ *
+ * Deliberately `docker run` and not `compose run`: the caller needs a specific
+ * image, and the compose file on disk is whatever version the stack was last
+ * started with. A `compose run` would take the service definition — and the
+ * image — from that file, which for the case this exists to serve does not
+ * contain the service at all.
+ *
+ * The stack's `.env` supplies the credentials. What it cannot supply is where
+ * the other containers are: those come from each service's own definition in
+ * the compose file, so the few that matter are passed explicitly here. They are
+ * compose service names, stable across the versions this runs against, and
+ * they override anything the `.env` says — a `.env` written for the host names
+ * `localhost`, which is not where Postgres is from inside the network.
+ *
+ * Rejects on a non-zero exit.
+ */
+export function dockerRunOneOff(
+  host: ServerHost,
+  spec: { image: string; command: string[]; env: Record<string, string> },
+  onLog: (line: string) => void
+): Promise<void> {
+  log.info(`local-switch-server: docker run ${spec.image} (${host.label})`);
+  const env = Object.entries(spec.env).flatMap(([key, value]) => ['-e', `${key}=${value}`]);
+  return host.streamCommand(
+    host.dockerBin,
+    [
+      'run',
+      '--rm',
+      '--network',
+      `${host.composeProjectName}_default`,
+      '--env-file',
+      ENV_FILE_NAME,
+      ...env,
+      spec.image,
+      ...spec.command,
+    ],
+    onLog,
+    { timeoutMs: COMPOSE_TIMEOUT_MS }
+  );
+}
+
+/** Stop and remove the stack's containers. `removeVolumes` also destroys the
+ * data volumes (the reset path) — irreversible. */
+export async function composeDown(host: ServerHost, removeVolumes: boolean): Promise<void> {
+  log.info(`local-switch-server: docker compose down${removeVolumes ? ' -v' : ''} (${host.label})`);
+  await runDocker(
+    host,
+    [...baseArgs(host, []), 'down', ...(removeVolumes ? ['-v'] : [])],
+    5 * 60 * 1000
+  );
+}
+
+/** Stop the stack's containers without removing them or anything else. */
+export async function composeStop(host: ServerHost): Promise<void> {
+  log.info(`local-switch-server: docker compose stop (${host.label})`);
+  await runDocker(host, [...baseArgs(host, []), 'stop'], 5 * 60 * 1000);
+}
+
+/**
+ * Bring up one service of the stack as it is currently configured on the host
+ * — the compose file and `.env` already there, not this build's — without its
+ * dependents, and wait for it to report healthy.
+ */
+export async function composeUpService(host: ServerHost, service: string): Promise<void> {
+  log.info(`local-switch-server: docker compose up ${service} (${host.label})`);
+  await runDocker(
+    host,
+    [...baseArgs(host, []), 'up', '-d', '--no-deps', '--wait', service],
+    5 * 60 * 1000
+  );
+}
+
+/** Id of the container running `service`. Throws when there is none. */
+export async function serviceContainerId(host: ServerHost, service: string): Promise<string> {
+  const stdout = await runDocker(host, [...baseArgs(host, []), 'ps', '-q', service], 60_000);
+  const id = stdout.trim();
+  if (!/^[a-f0-9]+$/.test(id)) {
+    throw new Error(`Could not identify the ${service} container on ${host.label}.`);
+  }
+  return id;
+}
+
+/**
+ * When the core container last started, as Docker reports it (ISO-8601), or
+ * null when it is not running. Throws when Docker could not be asked.
+ */
+export async function coreStartedAt(host: ServerHost): Promise<string | null> {
+  if (!(await isStackRunning(host))) return null;
+  const id = await serviceContainerId(host, CORE_SERVICE);
+  const stdout = await runDocker(host, ['inspect', '--format', '{{.State.StartedAt}}', id], 30_000);
+  const startedAt = stdout.trim();
+  if (Number.isNaN(Date.parse(startedAt))) {
+    throw new Error(
+      `Docker reported an unreadable start time for the core container: ${startedAt}`
+    );
+  }
+  return new Date(startedAt).toISOString();
+}
+
+/** Service names currently in the `running` state for the managed project. */
+export async function runningServices(host: ServerHost): Promise<string[]> {
+  try {
+    const stdout = await runDocker(
+      host,
+      [...baseArgs(host, []), 'ps', '--status', 'running', '--services'],
+      60_000
+    );
+    return stdout
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } catch (error) {
+    log.warn('local-switch-server: `compose ps` failed; treating stack as down', { error });
+    return [];
+  }
+}
+
+/** Whether the core service is up — our proxy for "the stack is up". */
+export async function isStackRunning(host: ServerHost): Promise<boolean> {
+  return (await runningServices(host)).includes(CORE_SERVICE);
+}
+
+/**
+ * Image reference of each running container, keyed by compose service name —
+ * the ground truth for what the stack is actually running, as opposed to what
+ * the `.env` last asked for.
+ *
+ * Unlike {@link runningServices} this does NOT swallow failures: a caller
+ * deciding whether an upgrade or downgrade is in play must be able to tell
+ * "nothing is running" from "could not ask".
+ */
+export async function runningImages(host: ServerHost): Promise<Map<string, string>> {
+  const stdout = await runDocker(
+    host,
+    [...baseArgs(host, []), 'ps', '--status', 'running', '--format', 'json'],
+    60_000
+  );
+  const images = new Map<string, string>();
+  for (const entry of parseComposePs(stdout)) {
+    if (entry.Service && entry.Image) images.set(entry.Service, entry.Image);
+  }
+  return images;
+}
+
+/**
+ * Environment of the running container for `service`, keyed by variable name.
+ *
+ * This is what the process is ACTUALLY running with, which the `.env` on disk
+ * is not: that file is rewritten at the top of every start, so between a
+ * rewrite and a `compose up` that failed it describes an intention rather than
+ * a fact. For a setting the user has consented to, the difference is the whole
+ * point of asking.
+ *
+ * Null when the service has no running container. Failures are not swallowed,
+ * for the reason {@link runningImages} does not swallow them: "not running" and
+ * "could not ask" are different answers.
+ */
+export async function runningServiceEnv(
+  host: ServerHost,
+  service: string
+): Promise<Map<string, string> | null> {
+  const listed = await runDocker(
+    host,
+    [...baseArgs(host, []), 'ps', '--status', 'running', '--format', 'json'],
+    60_000
+  );
+  const id = parseComposePs(listed).find((entry) => entry.Service === service)?.ID;
+  if (!id) return null;
+
+  const inspected = await runDocker(
+    host,
+    ['inspect', '--format', '{{json .Config.Env}}', id],
+    60_000
+  );
+  const parsed: unknown = JSON.parse(inspected.trim());
+  if (!Array.isArray(parsed)) {
+    throw new Error(`docker inspect ${service}: .Config.Env was not a list`);
+  }
+  const env = new Map<string, string>();
+  for (const entry of parsed) {
+    if (typeof entry !== 'string') continue;
+    const split = entry.indexOf('=');
+    if (split > 0) env.set(entry.slice(0, split), entry.slice(split + 1));
+  }
+  return env;
+}
+
+type ComposePsEntry = { Service?: string; Image?: string; ID?: string };
+
+/** Compose emits `ps --format json` as a JSON array on some versions and as
+ * one JSON object per line on others; accept both. */
+function parseComposePs(stdout: string): ComposePsEntry[] {
+  const trimmed = stdout.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    const parsed: unknown = JSON.parse(trimmed);
+    return Array.isArray(parsed) ? (parsed as ComposePsEntry[]) : [];
+  }
+  return trimmed
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line) as ComposePsEntry);
+}

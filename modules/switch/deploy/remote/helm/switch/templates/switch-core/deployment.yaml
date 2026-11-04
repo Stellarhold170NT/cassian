@@ -1,0 +1,229 @@
+{{- include "switch.validateDbTls" . }}
+{{- include "switch.validateLogging" . }}
+{{- include "switch.validateObservability" . }}
+{{- include "switch.validateControllerRelease" . }}
+{{- $roll := .Values.switchCore.rollingUpdate }}
+{{- if not (has (toString $roll.maxSurge) (list "0" "1")) }}
+{{- fail (printf "switchCore.rollingUpdate.maxSurge must be 0 or 1, got %v: switch-core checks its database connection budget for at most one pod beyond replicaCount during a roll, so a larger surge could open more connections than Postgres allows." $roll.maxSurge) }}
+{{- end }}
+{{- if and (eq (toString $roll.maxSurge) "0") (eq (toString $roll.maxUnavailable) "0") }}
+{{- fail "switchCore.rollingUpdate.maxSurge and maxUnavailable are both 0, so a roll could never replace a pod. Set maxSurge to 1 (the default) or maxUnavailable above 0." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "switch.fullname" . }}-switch-core
+  labels:
+    {{- include "switch.labels" . | nindent 4 }}
+    {{- include "switch.selectorLabels" (dict "Release" .Release "component" "switch-core") | nindent 4 }}
+spec:
+  replicas: {{ .Values.switchCore.replicaCount }}
+  # Each bridge and reader is held by one pod at a time through a
+  # lease in Postgres, so two pods side by side during a roll do not both run
+  # it: the old pod hands its work over on SIGTERM, and the new one takes it
+  # over. One replica still uses Recreate, because switch-core sizes its
+  # connection budget and its shutdown drain for a single replica being
+  # replaced rather than rolled (CORE_REPLICAS=1).
+  strategy:
+    {{- if gt (int .Values.switchCore.replicaCount) 1 }}
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.switchCore.rollingUpdate.maxSurge }}
+      maxUnavailable: {{ .Values.switchCore.rollingUpdate.maxUnavailable }}
+    {{- else }}
+    type: Recreate
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "switch.selectorLabels" (dict "Release" .Release "component" "switch-core") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "switch.labels" . | nindent 8 }}
+        {{- include "switch.selectorLabels" (dict "Release" .Release "component" "switch-core") | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "switch.coreServiceAccountName" . }}
+      {{- if .Values.global.imagePullSecrets }}
+      {{- include "switch.imagePullSecrets" . | nindent 6 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.switchCore.terminationGracePeriodSeconds }}
+      {{- $spread := .Values.switchCore.topologySpread }}
+      {{- if and (gt (int .Values.switchCore.replicaCount) 1) $spread.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: {{ $spread.maxSkew }}
+          topologyKey: {{ $spread.topologyKey }}
+          whenUnsatisfiable: {{ $spread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "switch.selectorLabels" (dict "Release" .Release "component" "switch-core") | nindent 14 }}
+      {{- end }}
+      {{- with .Values.switchCore.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.switchCore.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        {{- include "switch.waitFor" (dict "name" "postgres" "host" (include "switch.postgresHost" .) "port" (include "switch.postgresPort" .)) | nindent 8 }}
+        # Migrates and re-issues grants as the schema owner, so the serving
+        # container below never holds the owner's password. Covers a fresh
+        # install, where the pre-upgrade Job does not run; on an upgrade it
+        # finds nothing pending.
+        - name: migrate
+          image: {{ include "switch.image" (dict "global" .Values.global "image" .Values.switchCore.image) }}
+          imagePullPolicy: {{ include "switch.imagePullPolicy" (dict "policy" .Values.switchCore.imagePullPolicy "image" .Values.switchCore.image) }}
+          command: ["switch-migrate"]
+          env:
+            {{- include "switch.coreEnv" (merge (dict "omitTeamsApp" true) .) | nindent 12 }}
+          resources:
+            {{- toYaml .Values.switchCore.resources | nindent 12 }}
+          {{- if include "switch.dbCaBundleConfigMap" . }}
+          volumeMounts:
+            {{- include "switch.dbCaBundleVolumeMount" . | nindent 12 }}
+          {{- end }}
+      containers:
+        - name: switch-core
+          image: {{ include "switch.image" (dict "global" .Values.global "image" .Values.switchCore.image) }}
+          imagePullPolicy: {{ include "switch.imagePullPolicy" (dict "policy" .Values.switchCore.imagePullPolicy "image" .Values.switchCore.image) }}
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+            {{- if .Values.switchCore.teamsBridge.enabled }}
+            - containerPort: {{ .Values.switchCore.teamsBridge.port }}
+              name: teams
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.switchCore.collaborationCallback.enabled }}
+            - containerPort: {{ .Values.switchCore.collaborationCallback.port }}
+              name: callbacks
+              protocol: TCP
+            {{- end }}
+          env:
+            {{- if .Values.switchCore.hostedControllerSecret }}
+            - name: HOSTED_CONTROLLER_CONFIG_PATH
+              value: /etc/switch-hosted/controller.json
+            - name: HOSTED_LAUNCH_CAPACITY
+              value: {{ .Values.switchCore.hostedLaunchCapacity | quote }}
+            - name: HOSTED_DISK_RETENTION_DAYS
+              value: {{ .Values.switchCore.hostedDiskRetentionDays | quote }}
+            - name: HOSTED_IDLE_STOP_MINUTES
+              value: {{ .Values.switchCore.hostedIdleStopMinutes | quote }}
+            {{- end }}
+            {{- if and .Values.switchCore.githubConnectionsSecret .Values.switchCore.githubAppPrivateKeyPath }}
+            - name: GITHUB_APP_CONFIG_PATH
+              value: /etc/switch-github/github.json
+            - name: GITHUB_APP_PRIVATE_KEY_PATH
+              value: {{ .Values.switchCore.githubAppPrivateKeyPath | quote }}
+            {{- else if .Values.switchCore.githubConnectionsSecret }}
+            - name: HOSTED_GITHUB_CONFIG_PATH
+              value: /etc/switch-github/github.json
+            {{- end }}
+            {{- if .Values.switchCore.airtableClientSecret }}
+            - name: AIRTABLE_CLIENT_CONFIG_PATH
+              value: /etc/switch-airtable/client.json
+            {{- end }}
+            {{- if .Values.switchCore.googleWorkspaceClientSecret }}
+            - name: GOOGLE_WORKSPACE_CLIENT_CONFIG_PATH
+              value: /etc/switch-google-workspace/client.json
+            {{- end }}
+            {{- include "switch.coreEnv" (merge (dict "omitOwnerCredentials" true) .) | nindent 12 }}
+          # Readiness checks the database; liveness deliberately does not.
+          # With one replica a failing readiness probe empties the Service
+          # rather than shifting traffic, which is right while the database is
+          # unreachable and would be catastrophic as a restart trigger. With
+          # several, traffic shifts to the pods still ready, and a pod also
+          # leaves readiness as it starts shutting down. `/health` stays the
+          # cheap always-ok reply that liveness and the other workloads' boot
+          # waits use.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            # Six failures at ten seconds: long enough to ride out a database
+            # failover, short enough that a real outage stops being served.
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.switchCore.resources | nindent 12 }}
+          {{- if or (include "switch.dbCaBundleConfigMap" .) .Values.switchCore.githubConnectionsSecret .Values.switchCore.googleWorkspaceClientSecret .Values.switchCore.airtableClientSecret .Values.switchCore.hostedControllerSecret (include "switch.teamsAppFederated" .) }}
+          volumeMounts:
+            {{- if .Values.switchCore.hostedControllerSecret }}
+            - name: hosted-controller
+              mountPath: /etc/switch-hosted
+              readOnly: true
+            {{- end }}
+            {{- if .Values.switchCore.githubConnectionsSecret }}
+            - name: github-connections
+              mountPath: /etc/switch-github
+              readOnly: true
+            {{- end }}
+            {{- if .Values.switchCore.airtableClientSecret }}
+            - name: airtable-client
+              mountPath: /etc/switch-airtable
+              readOnly: true
+            {{- end }}
+            {{- if .Values.switchCore.googleWorkspaceClientSecret }}
+            - name: google-workspace-client
+              mountPath: /etc/switch-google-workspace
+              readOnly: true
+            {{- end }}
+            {{- if include "switch.dbCaBundleConfigMap" . }}
+            {{- include "switch.dbCaBundleVolumeMount" . | nindent 12 }}
+            {{- end }}
+            {{- if include "switch.teamsAppFederated" . }}
+            - name: teams-app-token
+              mountPath: {{ include "switch.teamsAppTokenDir" . }}
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or (include "switch.dbCaBundleConfigMap" .) .Values.switchCore.githubConnectionsSecret .Values.switchCore.googleWorkspaceClientSecret .Values.switchCore.airtableClientSecret .Values.switchCore.hostedControllerSecret (include "switch.teamsAppFederated" .) }}
+      volumes:
+        {{- if .Values.switchCore.hostedControllerSecret }}
+        - name: hosted-controller
+          secret:
+            secretName: {{ .Values.switchCore.hostedControllerSecret | quote }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.switchCore.githubConnectionsSecret }}
+        - name: github-connections
+          secret:
+            secretName: {{ .Values.switchCore.githubConnectionsSecret | quote }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.switchCore.airtableClientSecret }}
+        - name: airtable-client
+          secret:
+            secretName: {{ .Values.switchCore.airtableClientSecret | quote }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if .Values.switchCore.googleWorkspaceClientSecret }}
+        - name: google-workspace-client
+          secret:
+            secretName: {{ .Values.switchCore.googleWorkspaceClientSecret | quote }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if include "switch.dbCaBundleConfigMap" . }}
+        {{- include "switch.dbCaBundleVolume" . | nindent 8 }}
+        {{- end }}
+        {{- if include "switch.teamsAppFederated" . }}
+        # The token the distributed Teams app presents to Microsoft in place of
+        # a secret. Its audience is the one Microsoft Entra expects of a
+        # federated credential; the kubelet rotates it.
+        - name: teams-app-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: api://AzureADTokenExchange
+                  expirationSeconds: 3600
+        {{- end }}
+      {{- end }}

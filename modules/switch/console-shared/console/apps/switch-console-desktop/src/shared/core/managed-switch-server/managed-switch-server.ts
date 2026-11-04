@@ -1,0 +1,508 @@
+/**
+ * Shared types for local-server mode: Switch Console runs a full Switch server on
+ * the user's machine at COMPATIBLE_SWITCH_VERSION — natively (PostgreSQL and
+ * switch-core as plain processes), or, for a server set up before that, via
+ * `docker compose` and the standalone compose artifact bundled into the app.
+ * The main process owns the lifecycle; the renderer drives it through these
+ * types and subscribes to the status event.
+ */
+
+/**
+ * How the local server runs. `native` — PostgreSQL and switch-core as plain
+ * processes on this machine, no Docker — is what a new install gets. `docker`
+ * is a server set up before that, which stays on its compose stack (and its
+ * data volume) until it is reset.
+ */
+export type LocalServerRuntime = 'native' | 'docker';
+
+/** Lifecycle phase of the managed local stack. */
+export type LocalServerPhase = 'stopped' | 'starting' | 'running' | 'stopping' | 'error';
+
+/** Whether Docker is usable on this machine. `daemon-down` means the binary is
+ * installed but the daemon is not reachable (Docker Desktop not running). */
+export type DockerAvailability =
+  | { available: true; version: string }
+  | { available: false; reason: 'not-installed' | 'daemon-down'; detail: string };
+
+/**
+ * How the switch-core version a stack is actually deployed at relates to the
+ * version this build of Switch Console pins.
+ *
+ * - `upgrade` — the stack is behind; restarting re-pulls and migrates forward.
+ * - `downgrade` — the stack is AHEAD. Unsafe: its database has already migrated
+ *   to a newer schema and switch-core cannot roll one back, so the stack must
+ *   not be restarted against the older pin.
+ * - `unknown` — one of the two is not a comparable semver. Neither direction can
+ *   be proven, so it is surfaced rather than assumed safe.
+ * - `unreadable` — the deployed version could not be read at all. Distinct from
+ *   "matches" on purpose (CHOO-1865): a probe that failed and a stack that is
+ *   in step used to be the same empty result, so a host we could not read
+ *   rendered as healthy. Unknown must never look like fine.
+ */
+export type SwitchVersionDriftDirection = 'upgrade' | 'downgrade' | 'unknown' | 'unreadable';
+
+/**
+ * A mismatch between the deployed switch-core version and this build's pin.
+ *
+ * A union rather than one shape with nullable fields, so the invariant is the
+ * compiler's to keep: there is a deployed version in every case except the one
+ * where reading it is what failed.
+ */
+export type SwitchVersionDrift =
+  | {
+      /** The version the stack is actually deployed at. */
+      deployed: string;
+      /** The version this build of Switch Console pins. */
+      expected: string;
+      direction: 'upgrade' | 'downgrade' | 'unknown';
+    }
+  | {
+      /** Null because the deployed version is exactly what could not be read. */
+      deployed: null;
+      expected: string;
+      direction: 'unreadable';
+      /** What failed, so the user is told more than "something did". */
+      reason: string;
+    };
+
+/**
+ * Why a downgrade is refused, in one message — shared by the main process (as
+ * the status `error` when a start is blocked) and the renderer (as the drift
+ * banner) so both say the same thing.
+ *
+ * Kept to two sentences, but both ways out stay in: a user who is not told
+ * that updating Switch Console fixes this will reach for Reset and lose their data.
+ */
+export function switchVersionDowngradeMessage(deployed: string, expected: string): string {
+  return (
+    `Runs switch-core ${deployed}; this app pins ${expected}. Its database has already migrated ` +
+    `forward and switch-core can't roll back — update Switch Console to a build with switch-core ` +
+    `${deployed} or newer, or reset the stack (deletes its data).`
+  );
+}
+
+/**
+ * Why an upgrade stopped short of removing the message server, in one message.
+ *
+ * Says the two things a user needs: nothing has changed, and trying again is
+ * the fix. Deliberately does not offer a way past it — the history is only on
+ * the message server, and the version being upgraded to is the one that
+ * removes it.
+ */
+export function matrixMigrationFailedMessage(deployed: string, expected: string): string {
+  return (
+    `Your room history has to be copied out of the message server before updating to ` +
+    `switch-core ${expected}, and the copy did not finish. Nothing has changed — the stack is ` +
+    `still on ${deployed}. Try starting it again; the copy carries on from where it stopped.`
+  );
+}
+
+/**
+ * Image tag a checkout build is tagged with. Deliberately not a semver and
+ * deliberately not the pin: it must never be mistaken for a released version,
+ * and it must not overwrite the pinned image in the local image store. Shared
+ * because the renderer recognises it too — a stack on this tag is a checkout
+ * build rather than a stack that has drifted.
+ */
+export const CHECKOUT_IMAGE_TAG = 'dev-checkout';
+
+/**
+ * The dev-only "build switch-core from this checkout" option: where the
+ * checkout is, and whether the next start will build from it instead of pulling
+ * the pinned released images. Only ever offered to a dev build running out of a
+ * Switch source tree.
+ */
+export type CheckoutBuild = {
+  /** Absolute path of the checkout the images would be built from. */
+  root: string;
+  /** Whether the option is on. Applies from the next start onwards. */
+  enabled: boolean;
+  /** The environment setting that decides `enabled` for this run instead of
+   * the toggle (e.g. `SWITCH_CONSOLE_SERVER_VERSION=checkout`), or null when
+   * the toggle decides. */
+  forcedBy: string | null;
+};
+
+/**
+ * Whether the running managed stack is sharing usage data — read off the host,
+ * not assumed from what the Console last wrote (CHOO-2890).
+ *
+ * The Console's "Share usage data" toggle governs the server it manages as well
+ * as itself, but the server reads that choice once, when it starts. So a
+ * running stack can be out of step with the current answer, and the only
+ * honest way to know is to look. `known: false` carries what stopped us: an
+ * unread host must not render as one that agrees.
+ */
+export type DeployedTelemetry =
+  | {
+      known: true;
+      enabled: boolean;
+      /** Whether it sends to the relay this build reports to. A stack set up by
+       * an older build may name none and run on its own version's default. */
+      endpointCurrent: boolean;
+    }
+  | { known: false; reason: string };
+
+/**
+ * A managed stack that is behind this build's pin and is being moved onto it.
+ *
+ * Console upgrades such a stack on its own, and sessions for agents on the
+ * server wait while it does, so the state is visible to both the renderer and
+ * the session gate:
+ *
+ * - `updating` — the database is being backed up or the stack restarted at the
+ *   pin. Sessions wait for it to finish.
+ * - `failed` — the backup or the restart failed. Sessions are refused with
+ *   `error` until a retry succeeds.
+ * - `pending` — the stack is stopped. It is upgraded when it is next started,
+ *   never started at the old version.
+ * - `held` — the stack is running on a shared host and others have used it
+ *   recently. The update restarts it for all of them, so it waits for someone
+ *   here to run it.
+ */
+export type ManagedServerUpgrade =
+  | { state: 'updating'; from: string; to: string }
+  | { state: 'failed'; from: string; to: string; error: string }
+  | { state: 'pending'; from: string; to: string }
+  | { state: 'held'; from: string; to: string };
+
+/** Why a session cannot start on a managed server whose upgrade has not
+ * finished. Shared so the thrown error and the UI say the same thing. */
+export function managedServerUpgradeBlockedReason(
+  serverName: string,
+  upgrade: Exclude<ManagedServerUpgrade, { state: 'updating' }>
+): string {
+  if (upgrade.state === 'pending') {
+    return `${serverName} is stopped on switch-core ${upgrade.from} and needs switch-core ${upgrade.to}. Start it from the server's page to update it; sessions on it start once the update finishes.`;
+  }
+  if (upgrade.state === 'held') {
+    return `${serverName} runs switch-core ${upgrade.from} and this Console needs switch-core ${upgrade.to}. Others use it too, so it is not updated without asking: update it from the server's page. Sessions on it start once the update finishes.`;
+  }
+  return `Updating ${serverName} from switch-core ${upgrade.from} to ${upgrade.to} failed: ${upgrade.error} Retry the update from the server's page; sessions on it stay paused until it succeeds.`;
+}
+
+/** Snapshot of the managed local server, emitted on every transition. */
+export type LocalServerStatus = {
+  phase: LocalServerPhase;
+  /** How this server runs, once read at boot; null until then. */
+  runtime: LocalServerRuntime | null;
+  /** Whether Mattermost is turned on for a native server (it needs Docker);
+   * null when the user never chose, which means on wherever Docker is
+   * available. A Docker server always runs it, so this is null there. */
+  mattermost: boolean | null;
+  /** How the Mattermost beside a native server is doing since the last start:
+   * it comes up after the server does. `off` when the running server is going
+   * without it: turned off, or left out at start because Docker was not there.
+   * Null when the server is not running, or when nothing has been seen of it
+   * since Console launched. */
+  mattermostState: 'off' | 'starting' | 'running' | 'failed' | null;
+  /** Something the last start could not do that did not stop it (Mattermost
+   * skipped or failed, say), for the server page to say; else null. */
+  notice: string | null;
+  /** Whether the stack's state has been read since launch. Until it has, a
+   * `stopped` phase is only the starting value, not something observed. */
+  checked: boolean;
+  /** Set while the stack is behind this build's pin and not yet upgraded. */
+  upgrade: ManagedServerUpgrade | null;
+  /** The registered server's id once the stack is up, else null. */
+  serverId: string | null;
+  /** The released switch-core version this build runs: its pin, or in a dev
+   * build the one SWITCH_CONSOLE_SERVER_VERSION names. A checkout build
+   * replaces it on the local server — see {@link checkoutBuild}. */
+  version: string;
+  /** The version the stack on the host is actually deployed at, once observed.
+   * Null when nothing is deployed yet or it could not be read. */
+  deployedVersion: string | null;
+  /** Set when {@link deployedVersion} differs from {@link version}, else null. */
+  drift: SwitchVersionDrift | null;
+  /** Dev builds launched from a Switch checkout only: the checkout the stack's
+   * images can be (or are being) built from, and whether that is turned on.
+   * Null in a released build, and in a dev build that is not running from a
+   * checkout — there is nothing to offer then. */
+  checkoutBuild: CheckoutBuild | null;
+  /** What the running stack is doing about usage data, or null when no stack is
+   * up — a stopped server reports nothing, so there is nothing to be out of
+   * step with. */
+  deployedTelemetry: DeployedTelemetry | null;
+  /** Human-readable current step (e.g. "Pulling images…"), or null. */
+  message: string | null;
+  /** Populated only when `phase === 'error'`. */
+  error: string | null;
+  /** What failed when `phase === 'error'` and it was not a start: a stop or a
+   * reset that broke partway, or (`run`) a server that was running and then
+   * stopped or stopped answering on its own. Null for a failed start, and
+   * whenever the phase is anything else. */
+  failedTo: 'stop' | 'reset' | 'run' | null;
+};
+
+/**
+ * Raised when a call is made to a Switch Console-managed server whose stack is not
+ * running. The gateway only exists while the stack is up, so reaching for it
+ * from a stopped one can only produce a transport error naming a local port
+ * that was never the problem — this reports the lifecycle state instead.
+ *
+ * It lives with the model, next to the phase it carries, so anything holding an
+ * error — including the RPC logging chokepoint — can recognise it without
+ * importing the supervisors or Docker.
+ */
+export class ManagedServerStoppedError extends Error {
+  readonly serverId: string;
+  readonly phase: LocalServerPhase;
+
+  constructor(server: { id: string; name: string }, phase: LocalServerPhase) {
+    super(managedServerStoppedReason(server.name, phase));
+    this.name = 'ManagedServerStoppedError';
+    this.serverId = server.id;
+    this.phase = phase;
+  }
+}
+
+/** Human-readable one-liner for a stopped managed stack, used in errors and the UI. */
+export function managedServerStoppedReason(serverName: string, phase: LocalServerPhase): string {
+  if (phase === 'error') {
+    return `${serverName} isn't running: it failed to start or stop, or stopped unexpectedly. See the server's page.`;
+  }
+  return `${serverName}'s Switch stack is not running. Start it from the server's page, then retry.`;
+}
+
+/** Outcome of a start request. `docker-unavailable` and `version-downgrade` are
+ * separated from generic errors so the UI can point the user at installing /
+ * starting Docker, or explain why an older build refuses to take over a stack
+ * that has already migrated forward. */
+export type StartLocalServerResult =
+  | {
+      kind: 'started';
+      serverId: string;
+      /** The consent this start applied to the stack, so the supervisor can
+       * record what the server is now doing without probing for what it just
+       * wrote. */
+      telemetryEnabled: boolean;
+      /** Something the start could not do that does not undo it, for the
+       * server page to say; null when there is nothing to say. */
+      warning: string | null;
+    }
+  | { kind: 'docker-unavailable'; reason: 'not-installed' | 'daemon-down'; detail: string }
+  | { kind: 'version-downgrade'; deployed: string; expected: string }
+  // The upgrade would have removed the message server before this stack's
+  // history was copied out of it, and the copy failed. The stack is untouched
+  // and still on `deployed`; retrying is safe and resumes where it stopped.
+  | { kind: 'matrix-migration-failed'; deployed: string; expected: string; detail: string }
+  | { kind: 'error'; message: string };
+
+/** Outcome of starting a remote stack: a start's, or `cancelled` when the user
+ * stopped waiting for another Console's hold on the stack, before anything
+ * was changed. */
+export type StartRemoteServerResult = StartLocalServerResult | { kind: 'cancelled' };
+
+/**
+ * Outcome of joining a remote stack another Console started. Everything short
+ * of `connected` leaves the host exactly as it was.
+ */
+export type ConnectRemoteServerResult =
+  | {
+      kind: 'connected';
+      serverId: string;
+      /** The switch-core version the stack's settings name, when they do. */
+      deployedVersion: string | null;
+    }
+  /** The stack is set up but stopped: Start it, which keeps its data. */
+  | { kind: 'not-running' }
+  /** Nothing is set up on the host: Start sets one up. */
+  | { kind: 'absent' }
+  /** Another account's stack whose settings were never shared. `message` says
+   * so and what fixes it. */
+  | { kind: 'unshared'; ownerDir: string | null; message: string }
+  | { kind: 'docker-unavailable'; reason: 'not-installed' | 'daemon-down'; detail: string }
+  /** The user stopped waiting for another Console's hold on the stack. */
+  | { kind: 'cancelled' }
+  | { kind: 'error'; message: string };
+
+/** Something that happened to the stack on this computer, as Console recorded it. */
+export type LocalActivityAction =
+  | 'started'
+  | 'stopped'
+  | 'start-failed'
+  | 'updated'
+  | 'reset'
+  /** The running server stopped, or stopped answering, without being asked. */
+  | 'crashed';
+
+/** One entry of the local stack's history. Only this Console acts on it, so
+ * there is no "who". */
+export type LocalActivityEntry = {
+  /** ISO timestamp. */
+  at: string;
+  action: LocalActivityAction;
+  /** The version an update moved to, or why a start failed or the server
+   * stopped; else null. */
+  detail: string | null;
+};
+
+/** Something a Console did to a shared remote stack, as recorded on its host. */
+export type StackActivityAction = 'started' | 'connected' | 'stopped' | 'reset' | 'disconnected';
+
+/**
+ * A Console that uses a shared remote stack, as it last recorded itself on the
+ * stack's host. Everyone sharing the stack signs in as the one admin account,
+ * so this, not the server, is where they are told apart.
+ */
+export type StackConsole = {
+  /** The Console's random id: the same one it sends the server. */
+  consoleId: string;
+  /** `user@host` of the desktop the Console runs on. */
+  name: string;
+  /** The account on the stack's host that Console reaches it as. */
+  hostAccount: string;
+  appVersion: string;
+  /** ISO timestamp of the last time it started, joined or picked up the stack. */
+  lastSeenAt: string;
+};
+
+export type StackActivityEntry = {
+  /** ISO timestamp. */
+  at: string;
+  action: StackActivityAction;
+  consoleId: string;
+  name: string;
+  hostAccount: string;
+};
+
+/** The Consoles recorded on a shared stack's host, and what they last did to it. */
+export type StackRegister = {
+  /** This Console's own id, so it can tell itself apart in the lists. */
+  self: string;
+  /** Most recently seen first. */
+  consoles: StackConsole[];
+  /** Most recent first, and only the latest few. */
+  activity: StackActivityEntry[];
+};
+
+/** How long a Console counts as still using a shared server after it was last
+ * seen: long enough to span a holiday, short enough that someone who tried it
+ * once in the spring is not warned about in the autumn. */
+export const RECENTLY_SEEN_DAYS = 14;
+
+/** The other Consoles seen on the server recently, most recent first — the
+ * people a stop, restart, reset or update from here will affect. */
+export function othersRecentlySeen(register: StackRegister | null, now: Date): StackConsole[] {
+  if (!register) return [];
+  const cutoff = now.getTime() - RECENTLY_SEEN_DAYS * 24 * 60 * 60 * 1000;
+  return register.consoles.filter((c) => {
+    if (c.consoleId === register.self) return false;
+    const seen = Date.parse(c.lastSeenAt);
+    return Number.isFinite(seen) && seen >= cutoff;
+  });
+}
+
+/** What a Console holding a shared server's lock is doing to it. */
+export type ServerLockAction =
+  | 'starting'
+  | 'updating'
+  | 'connecting'
+  | 'checking'
+  | 'stopping'
+  | 'resetting';
+
+/**
+ * A Console's hold on a shared server's lock: whoever changes a server others
+ * use holds it, so two Consoles cannot start, update, stop or reset it over
+ * each other. Both durations are by the host's clock.
+ */
+export type ServerLockHolder = {
+  name: string;
+  hostAccount: string;
+  action: ServerLockAction;
+  heldForSeconds: number;
+  /** When the lock lapses unless its holder renews it — which a Console that
+   * has gone away no longer does. */
+  expiresInSeconds: number;
+};
+
+const LOCK_ACTION_PHRASE: Record<ServerLockAction, string> = {
+  starting: 'starting',
+  updating: 'updating',
+  connecting: 'connecting to',
+  checking: 'checking',
+  stopping: 'stopping',
+  resetting: 'resetting',
+};
+
+function lockHolderName(holder: ServerLockHolder): string {
+  return `${holder.name} (as ${holder.hostAccount})`;
+}
+
+function minutes(seconds: number): string {
+  const whole = Math.max(1, Math.ceil(seconds / 60));
+  return whole === 1 ? 'a minute' : `${whole} minutes`;
+}
+
+/** What a Console waiting for the lock says while it waits. */
+export function waitingForLockMessage(holder: ServerLockHolder): string {
+  return `Waiting for ${lockHolderName(holder)} to finish ${LOCK_ACTION_PHRASE[holder.action]} the server…`;
+}
+
+/** What a check of the server says when the user stopped waiting to make it. */
+export function stoppedWaitingForLockMessage(holder: ServerLockHolder | null): string {
+  const what = holder
+    ? `${lockHolderName(holder)} to finish ${LOCK_ACTION_PHRASE[holder.action]} the server`
+    : 'the server';
+  return `Stopped waiting for ${what}, so this Console has not checked it since.`;
+}
+
+/** What the Add Server step says of a server someone is changing right now. */
+export function lockHolderSentence(holder: ServerLockHolder): string {
+  return (
+    `${lockHolderName(holder)} is ${LOCK_ACTION_PHRASE[holder.action]} this server right now. ` +
+    `Starting or connecting here waits until they are done.`
+  );
+}
+
+/** Why a stop or reset was refused: someone else is changing the server. */
+export function serverBusyMessage(hostLabel: string, holder: ServerLockHolder): string {
+  return (
+    `${lockHolderName(holder)} is ${LOCK_ACTION_PHRASE[holder.action]} the server on ` +
+    `${hostLabel} right now, so nothing was changed. Try again once they are done. If that ` +
+    `Console has gone away, its hold on the server clears by itself within ` +
+    `${minutes(holder.expiresInSeconds)}.`
+  );
+}
+
+/**
+ * A stop or reset of a shared server turned away because another Console is
+ * changing it right now. Nothing was touched. Lives with the model, like
+ * {@link ManagedServerStoppedError}, so the RPC boundary and the renderer can
+ * recognise a refusal that is a state to show rather than a fault.
+ */
+export class ServerBusyError extends Error {
+  constructor(
+    readonly holder: ServerLockHolder,
+    hostLabel: string
+  ) {
+    super(serverBusyMessage(hostLabel, holder));
+    this.name = 'ServerBusyError';
+  }
+}
+
+/**
+ * What a remote host has of a stack, for the renderer to decide what to offer
+ * — Connect, Start, or neither. The main process's reading of the host with
+ * every secret left out. `busy` is the Console changing the stack right now,
+ * if any, which whatever is offered will wait for.
+ */
+export type RemoteStackProbe =
+  | { kind: 'absent'; busy: ServerLockHolder | null }
+  /** A stack whose settings this account can read. `shared` is false for one
+   * this account started before settings were shared; connecting shares it.
+   * `drift` compares the version its settings name with this build's pin. */
+  | {
+      kind: 'present';
+      running: boolean;
+      deployedVersion: string | null;
+      shared: boolean;
+      drift: SwitchVersionDrift | null;
+      busy: ServerLockHolder | null;
+    }
+  | { kind: 'unshared'; running: boolean; ownerDir: string | null; message: string }
+  | { kind: 'incomplete'; running: boolean; missing: string[] }
+  | { kind: 'unreadable'; reason: string }
+  | { kind: 'docker-unavailable'; reason: 'not-installed' | 'daemon-down'; detail: string };

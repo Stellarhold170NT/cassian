@@ -1,0 +1,356 @@
+"""HTTP front door for the agent operations (CHOO-1857 / CHOO-490).
+
+`POST /agents/{agent_id}/ops/{operation}` with the operation's arguments as the
+JSON body. Operation names are exactly the MCP tool names — one vocabulary, so
+a local runtime translating between the two is `POST /ops/${toolName}` and
+nothing more.
+
+Both front doors are built from the **same** registry: this one dispatches into
+it, and the MCP server registers its tools from it. Parity is therefore
+structural — an operation is reachable through both doors the moment it exists,
+and neither can quietly fall behind the other.
+
+What is deliberately NOT here: media upload/download (multipart and binary, so
+HTTP semantics matter), the event stream, connection lifecycle, mediation, and
+registration. Those are not agent tools.
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import time
+from typing import Annotated, Any
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.bridges.agent.auth import ControllerPrincipal, get_agent_from_scope
+from switch_core.bridges.agent.dependencies import get_protocol, get_session_factory
+from switch_core.bridges.agent.operations import all_operations, get_operation
+from switch_core.bridges.agent.operations.callctx import (
+    CallContext,
+    CallerSession,
+    call_context,
+)
+from switch_core.bridges.agent.protocol.agent_connections import (
+    MAX_ID_LENGTH,
+    UnknownConnectionError,
+)
+from switch_core.bridges.agent.protocol.agent_core import AgentCore
+from switch_core.budgets import BudgetExceeded
+from switch_core.db.models import Agent
+from switch_core.observability.catalogue import (
+    BRIDGE_CALL_DURATION,
+    BRIDGE_ERRORS,
+    BRIDGE_EVENTS_IN,
+)
+from switch_core.observability.metrics import metrics
+from switch_core.trust.client import GuardrailBlockedError
+
+logger = logging.getLogger(__name__)
+
+
+class UnknownOperationError(Exception):
+    def __init__(self, name: str, known: list[str]) -> None:
+        super().__init__(
+            f"unknown operation {name!r}; expected one of: {', '.join(sorted(known))}"
+        )
+        self.name = name
+
+
+class BadArgumentsError(Exception):
+    """The body did not match the operation's parameters."""
+
+
+def refusal_status(exc: Exception) -> int | None:
+    """The status an operation's refusal is answered with, over HTTP or on a
+    controller's socket; None for an exception that is a failure instead."""
+    if isinstance(exc, UnknownOperationError):
+        return 404
+    if isinstance(exc, BadArgumentsError):
+        return 400
+    if isinstance(exc, BudgetExceeded):
+        return 429
+    if isinstance(exc, GuardrailBlockedError):
+        return 422
+    if isinstance(exc, PermissionError):
+        return 403
+    if isinstance(exc, ValueError):
+        # Operations raise ValueError for "you asked for something that is not
+        # there or not allowed yet" - surfaced rather than swallowed.
+        return 400
+    return None
+
+
+def list_operations() -> dict[str, dict[str, Any]]:
+    """Every operation, with its parameters.
+
+    Read straight off the registry both doors are built from, so this is the
+    authoritative list — for clients and for the protocol documentation.
+    """
+    return {
+        op.name: {
+            "description": op.description,
+            "input_schema": op.input_schema,
+        }
+        for op in all_operations().values()
+    }
+
+
+async def call_operation(
+    *,
+    operation: str,
+    arguments: dict[str, Any],
+    agent_id: str,
+    connection_id: str | None,
+    session: CallerSession | None,
+) -> Any:
+    """Run one operation on behalf of an agent.
+
+    `connection_id` becomes the caller's session key, so an operation that
+    depends on the caller's room binding — `connect_to_room`, `post_message`,
+    `assume_role` — resolves it from the connection rather than from an MCP
+    transport session. That is what makes the two doors interchangeable.
+
+    `session` is set when the caller named an SDK session, and is what those
+    same operations prefer: it says which room *this* caller is in, where the
+    connection can only say which rooms it covers between them.
+    """
+    op = get_operation(operation)
+    if op is None:
+        raise UnknownOperationError(operation, list(all_operations()))
+
+    fn = op.fn
+    signature = inspect.signature(fn)
+    accepted = set(signature.parameters)
+
+    unexpected = set(arguments) - accepted
+    if unexpected:
+        raise BadArgumentsError(
+            f"{operation} does not accept: {', '.join(sorted(unexpected))}"
+        )
+
+    call_args: dict[str, Any] = dict(arguments)
+
+    missing = [
+        name
+        for name, param in signature.parameters.items()
+        if name not in call_args and param.default is inspect.Parameter.empty
+    ]
+    if missing:
+        raise BadArgumentsError(f"{operation} requires: {', '.join(missing)}")
+
+    # The agent bridge's side of `switch.bridge.*`: every operation an agent
+    # calls is an event in, timed as a call, and counted as an error when it
+    # raises. `event` is the operation's name, bounded by the registry.
+    metrics().increment(
+        BRIDGE_EVENTS_IN, {"bridge": "agent", "platform": "switch", "event": operation}
+    )
+    started = time.perf_counter()
+    with call_context(
+        CallContext(agent_id=agent_id, session_key=connection_id, session=session)
+    ):
+        try:
+            result = fn(**call_args)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception:
+            metrics().increment(
+                BRIDGE_ERRORS,
+                {"bridge": "agent", "platform": "switch", "direction": "inbound"},
+            )
+            raise
+    metrics().observe(
+        BRIDGE_CALL_DURATION,
+        {"bridge": "agent", "platform": "switch", "kind": operation},
+        (time.perf_counter() - started) * 1000.0,
+    )
+    return result
+
+
+# ── HTTP router ──────────────────────────────────────────────────────────────
+
+
+SESSION_SELECTOR_HEADERS = (
+    "X-Switch-Session-Id",
+    "X-Switch-Session-Host-Id",
+    "X-Switch-Session-Epoch",
+)
+
+
+async def resolve_caller(
+    *,
+    agent_id: str,
+    protocol: AgentCore,
+    factory: async_sessionmaker[AsyncSession],
+    connection_id: str | None,
+    session_id: str | None,
+    host_id: str | None,
+    epoch: str | None,
+) -> tuple[str | None, CallerSession | None]:
+    """Who is calling and what they are bound to, from the selector they sent.
+
+    A connection selector names the connection. A session selector adds which
+    of the agent's sessions on it is calling, and so which room that session
+    connected to — the fact a connection shared by several sessions cannot
+    supply. The connection is never taken on trust: one belonging to another
+    agent, or one that has died, is refused.
+    """
+    bound = connection_id
+    if session_id is not None and connection_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "a session selector names the connection it calls over; "
+                "send X-Switch-Connection-Id with X-Switch-Session-Id"
+            ),
+        )
+    if session_id is not None and len(session_id) > MAX_ID_LENGTH:
+        # The session is recorded with the room it connects to, and its id
+        # travels in the signals that tell other processes it lost the room.
+        raise HTTPException(
+            status_code=400,
+            detail=f"X-Switch-Session-Id must be at most {MAX_ID_LENGTH} characters",
+        )
+    if bound is None:
+        return None, None
+
+    # The connection may be held by another process, and its row written a
+    # moment before this request; and the rooms it claimed, or the calling
+    # session's room, may have moved through another process whose answer the
+    # caller already has. So the rows are read again before the caller is
+    # resolved, rather than this process's copy trusted: a copy only a moment
+    # old would refuse the caller, or post into the room it left.
+    await protocol.connections.refresh(agent_id)
+
+    caller: CallerSession | None = None
+    if session_id is not None:
+        # Host and epoch are the host's own business now: Switch keeps no
+        # record of a session to check them against, only which room it
+        # connected to.
+        caller = CallerSession(
+            id=session_id,
+            host_id=host_id or "",
+            epoch=epoch or "",
+            room_id=protocol.connections.session_room(agent_id, session_id),
+            placed_by_controller=False,
+        )
+
+    # Derived, never taken on trust: a connection belonging to another agent,
+    # or to one that has already died, is refused rather than silently treated
+    # as no connection at all.
+    try:
+        protocol.connections.require(agent_id, bound)
+    except UnknownConnectionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return bound, caller
+
+
+async def resolve_controller_caller(
+    *, agent_id: str, protocol: AgentCore, room_id: str | None
+) -> tuple[str, CallerSession]:
+    """The caller, for a controller acting as one of its agents.
+
+    The controller keeps its agents' sessions to itself, so it names the room
+    the calling session works in with `X-Switch-Room-Id`, and that room stands
+    where a session selector's would. Membership is checked here; without the
+    header an operation that needs a room fails as for any caller in none.
+
+    The caller is the agent's holder id (`ControllerPresence.holder_id`), as
+    both session key and session: it is what a role lease is held under and
+    what reads the agent's unread counts, for every session the controller
+    runs. Connection and session selector headers mean nothing to Switch here
+    — they name the controller's local relay — and are not read.
+    """
+    holder = protocol.connections.controllers.holder_of(agent_id)
+    if holder is None:
+        raise HTTPException(
+            status_code=403,
+            detail=f"agent {agent_id} is no longer run by this controller",
+        )
+    if room_id is not None:
+        try:
+            await protocol.require_room_member(agent_id, room_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return holder, CallerSession(
+        id=holder, host_id="", epoch="", room_id=room_id, placed_by_controller=True
+    )
+
+
+router = APIRouter(prefix="/agents", tags=["operations"])
+
+
+@router.get("/{agent_id}/ops")
+async def get_operations(
+    agent_id: str,
+    agent: Annotated[Agent, Depends(get_agent_from_scope)],
+) -> dict[str, Any]:
+    """List every operation and its parameters, straight from the registry."""
+    return {"operations": list_operations()}
+
+
+@router.post("/{agent_id}/ops/{operation}")
+async def post_operation(
+    request: Request,
+    agent_id: str,
+    operation: str,
+    agent: Annotated[Agent, Depends(get_agent_from_scope)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    factory: Annotated[async_sessionmaker[AsyncSession], Depends(get_session_factory)],
+    body: dict[str, Any] | None = None,
+    connection_id: Annotated[str | None, Header(alias="x-switch-connection-id")] = None,
+    session_id: Annotated[str | None, Header(alias="x-switch-session-id")] = None,
+    host_id: Annotated[str | None, Header(alias="x-switch-session-host-id")] = None,
+    epoch: Annotated[str | None, Header(alias="x-switch-session-epoch")] = None,
+    room_id: Annotated[str | None, Header(alias="x-switch-room-id")] = None,
+) -> dict[str, Any]:
+    """Run one operation. The body is the operation's arguments.
+
+    The caller says what it is bound to, and that is what an operation
+    depending on the caller's room binding resolves it from. Either
+    `X-Switch-Connection-Id`, naming an open connection, or the session
+    selector — `X-Switch-Session-Id` with `X-Switch-Session-Host-Id` and
+    `X-Switch-Session-Epoch` — naming the session that bound one. Both are
+    read from headers rather than the body, and both are checked against the
+    calling agent. Only the session selector resolves a room for a caller
+    sharing its connection with other sessions.
+
+    A controller acting as the agent sends `X-Switch-Room-Id` instead
+    (`resolve_controller_caller`).
+    """
+    caller: CallerSession | None
+    session_key: str | None
+    if isinstance(request.scope.get("controller"), ControllerPrincipal):
+        session_key, caller = await resolve_controller_caller(
+            agent_id=agent.id, protocol=protocol, room_id=room_id
+        )
+    else:
+        session_key, caller = await resolve_caller(
+            agent_id=agent.id,
+            protocol=protocol,
+            factory=factory,
+            connection_id=connection_id,
+            session_id=session_id,
+            host_id=host_id,
+            epoch=epoch,
+        )
+
+    try:
+        result = await call_operation(
+            operation=operation,
+            arguments=body or {},
+            agent_id=agent.id,
+            connection_id=session_key,
+            session=caller,
+        )
+    except Exception as exc:
+        status = refusal_status(exc)
+        if status is None:
+            raise
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    return {"result": result}

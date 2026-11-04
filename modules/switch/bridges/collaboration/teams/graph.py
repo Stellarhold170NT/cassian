@@ -1,0 +1,444 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import quote, urlsplit
+
+import httpx
+
+from switch_core.bridges.collaboration.models import BridgeOperationError
+from switch_core.bridges.collaboration.teams.auth import GRAPH_SCOPE
+from switch_core.bridges.collaboration.teams.identity import TeamsTokens
+
+logger = logging.getLogger(__name__)
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+_GRAPH_HOST = urlsplit(GRAPH_BASE).hostname
+# How old our token must be before an authorization refusal is worth re-minting
+# it for. A token issued seconds ago cannot have missed a grant.
+_TOKEN_RETRY_AGE = 30.0
+# How often a throttled call is asked again, and the longest wait between
+# attempts this will sit through rather than fail the call.
+_THROTTLE_RETRIES = 2
+_THROTTLE_MAX_WAIT_SECONDS = 30.0
+
+
+class GraphError(BridgeOperationError):
+    """A Microsoft Graph REST call returned a non-success status.
+
+    `status` is kept because some refusals mean something specific to the
+    caller — a 404 on a subscription is a subscription that no longer exists,
+    which is answered by making a new one rather than by retrying.
+    """
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _graph_error(operation: str, resp: httpx.Response) -> GraphError:
+    """A ``GraphError`` for a failed call, leading with Graph's own explanation.
+
+    Graph answers a refusal with ``{"error": {"code", "message"}}``, and that
+    message is the only part anyone can act on — it names the permission that
+    was not consented, the host it could not resolve, the value it would not
+    take. Passing the raw body on instead buries it in JSON, and the raw body is
+    what reaches the operator once this becomes an API response.
+
+    A body that is not that shape is passed through verbatim: better an
+    unfriendly error that is true than a tidy one that guesses.
+    """
+    detail = resp.text
+    try:
+        error = resp.json()["error"]
+        message = str(error["message"])
+        code = str(error.get("code") or "").strip()
+        detail = f"{code}: {message}" if code else message
+    except (ValueError, KeyError, TypeError):
+        pass
+    return GraphError(
+        f"{operation} failed ({resp.status_code}): {detail}", status=resp.status_code
+    )
+
+
+def _retry_after(resp: httpx.Response, *, default: float) -> float:
+    """The wait Graph asked for, in seconds; `default` when it named none."""
+    try:
+        return max(0.0, float(resp.headers["Retry-After"]))
+    except (KeyError, ValueError):
+        return default
+
+
+def _segment(value: str) -> str:
+    """One identifier as a single URL path segment.
+
+    A team id can arrive from a request, and an unescaped `?`, `#` or `/` in
+    it would move the rest of the URL somewhere else. `:` and `@` are left as
+    they are: they are legal in a path segment, and every channel id has both.
+    """
+    return quote(value, safe=":@")
+
+
+@dataclass(frozen=True)
+class AppInstallation:
+    installation_id: str
+    #: The app's id in the organisation's own catalogue, as the installation
+    #: reports it.
+    catalog_app_id: str | None
+
+
+class GraphClient:
+    """Async client for the Microsoft Graph endpoints the Teams bridge needs:
+    change-notification subscriptions, channel and membership provisioning, and
+    directory lookups. Every call carries an app-only Graph token."""
+
+    def __init__(self, *, tokens: TeamsTokens, http: httpx.AsyncClient) -> None:
+        self._tokens = tokens
+        self._http = http
+
+    async def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        token = await self._tokens.graph_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        if extra:
+            headers.update(extra)
+        return headers
+
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Make a Graph call, retrying once if the token predates a new grant.
+
+        Graph roles are carried in the token, not looked up per call, so a
+        permission consented after ours was issued does nothing until the token
+        is replaced — the refusal names a permission the operator can see is
+        granted, and says it for as long as the token lives. When Graph refuses
+        on authorization we therefore drop the token and ask once more with a
+        newly minted one.
+
+        Exactly once, and only if the token was old enough to have missed the
+        grant, so a genuine denial costs one extra round trip rather than
+        looping.
+        """
+        resp = await self._request(method, url, extra_headers, kwargs)
+        if resp.status_code not in (401, 403):
+            return resp
+        if not self._tokens.invalidate(GRAPH_SCOPE, min_age_seconds=_TOKEN_RETRY_AGE):
+            return resp
+        logger.info(
+            "Graph refused %s %s with %d; retrying once with a freshly issued "
+            "token, in case a permission was granted since the last one",
+            method,
+            url,
+            resp.status_code,
+        )
+        return await self._request(method, url, extra_headers, kwargs)
+
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        extra_headers: dict[str, str] | None,
+        kwargs: dict[str, Any],
+    ) -> httpx.Response:
+        """One Graph call, waited out and asked again while Graph is throttling.
+
+        Graph throttles per app and per organisation, and says how long to
+        wait in `Retry-After`; asking again sooner only extends it. The
+        distributed app shares one budget across everything it does in an
+        organisation, so a burst — listing every team's apps, say — is the
+        likely way to meet it. A wait longer than this will sit through, or
+        throttling that outlasts the retries, is answered with Graph's own
+        response, which the caller raises as an error naming it.
+        """
+        attempt = 0
+        while True:
+            resp = await self._http.request(
+                method, url, headers=await self._headers(extra_headers), **kwargs
+            )
+            if resp.status_code != 429 or attempt == _THROTTLE_RETRIES:
+                return resp
+            wait = _retry_after(resp, default=float(2**attempt))
+            if wait > _THROTTLE_MAX_WAIT_SECONDS:
+                return resp
+            logger.warning(
+                "Graph is throttling %s %s; asking again in %.0fs", method, url, wait
+            )
+            await asyncio.sleep(wait)
+            attempt += 1
+
+    async def create_subscription(
+        self,
+        *,
+        resource: str,
+        notification_url: str,
+        lifecycle_notification_url: str,
+        client_state: str,
+        expiration_iso: str,
+        encryption_certificate: str,
+        encryption_certificate_id: str,
+    ) -> dict[str, Any]:
+        """Create a change-notification subscription with resource data.
+
+        Channel-message subscriptions must include an encryption certificate
+        (Graph encrypts the message body) and, because their lifetime exceeds an
+        hour's worth of renewals, a lifecycle notification URL.
+        """
+        body = {
+            "changeType": "created,updated",
+            "notificationUrl": notification_url,
+            "lifecycleNotificationUrl": lifecycle_notification_url,
+            "resource": resource,
+            "includeResourceData": True,
+            "encryptionCertificate": encryption_certificate,
+            "encryptionCertificateId": encryption_certificate_id,
+            "clientState": client_state,
+            "expirationDateTime": expiration_iso,
+        }
+        resp = await self._send("POST", f"{GRAPH_BASE}/subscriptions", json=body)
+        if resp.status_code >= 300:
+            raise _graph_error(f"create subscription for {resource}", resp)
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def renew_subscription(
+        self, *, subscription_id: str, expiration_iso: str
+    ) -> None:
+        resp = await self._send(
+            "PATCH",
+            f"{GRAPH_BASE}/subscriptions/{_segment(subscription_id)}",
+            json={"expirationDateTime": expiration_iso},
+        )
+        if resp.status_code >= 300:
+            raise _graph_error(f"renew subscription {subscription_id}", resp)
+
+    async def delete_subscription(self, *, subscription_id: str) -> None:
+        resp = await self._send(
+            "DELETE", f"{GRAPH_BASE}/subscriptions/{_segment(subscription_id)}"
+        )
+        if resp.status_code >= 300 and resp.status_code != 404:
+            raise _graph_error(f"delete subscription {subscription_id}", resp)
+
+    async def list_subscriptions(self) -> list[dict[str, Any]]:
+        """Every subscription this app holds in the directory, across Graph's pages."""
+        return await self._all_pages(
+            f"{GRAPH_BASE}/subscriptions", params=None, what="list subscriptions"
+        )
+
+    async def _all_pages(
+        self, url: str, *, params: dict[str, str] | None, what: str
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        next_url: str | None = url
+        while next_url is not None:
+            resp = await self._send("GET", next_url, params=params)
+            if resp.status_code >= 300:
+                raise _graph_error(what, resp)
+            page = resp.json()
+            items.extend(page.get("value", []) or [])
+            # The next link already carries the query.
+            next_url = page.get("@odata.nextLink")
+            params = None
+            if next_url is not None and urlsplit(next_url).hostname != _GRAPH_HOST:
+                raise BridgeOperationError(
+                    f"Graph's next page for {what} is not on {_GRAPH_HOST}, so "
+                    "Switch did not send its token there"
+                )
+        return items
+
+    # ── Provisioning ─────────────────────────────────────────────────────────
+
+    async def create_channel(
+        self,
+        *,
+        team_id: str,
+        display_name: str,
+        description: str,
+        membership_type: str,
+    ) -> dict[str, Any]:
+        """Create a channel in a team. ``membership_type`` is ``standard`` or
+        ``private``. Returns the created channel (with its ``id``)."""
+        body = {
+            "displayName": display_name,
+            "description": description,
+            "membershipType": membership_type,
+        }
+        resp = await self._send(
+            "POST", f"{GRAPH_BASE}/teams/{_segment(team_id)}/channels", json=body
+        )
+        if resp.status_code >= 300:
+            raise _graph_error(
+                f"create channel '{display_name}' in team {team_id}", resp
+            )
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def get_channel(self, *, team_id: str, channel_id: str) -> dict[str, Any]:
+        """One channel's properties.
+
+        `$select` is not an optimisation here so much as a correctness one:
+        Graph documents populating `email` and `summary` as expensive, and
+        `layoutType` — which tells a posts channel from a chat one — is only
+        returned by this per-channel read. Listing a team's channels reports it
+        as null for every channel, so there is no bulk route to it.
+        """
+        resp = await self._send(
+            "GET",
+            f"{GRAPH_BASE}/teams/{_segment(team_id)}/channels/{_segment(channel_id)}",
+            params={"$select": "id,displayName,description,membershipType,layoutType"},
+        )
+        if resp.status_code >= 300:
+            raise _graph_error(f"get channel {channel_id}", resp)
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def search_users(self, *, query: str, top: int = 25) -> list[dict[str, Any]]:
+        """Search the directory for people whose name, handle or mail matches.
+
+        Uses `$search` over the `users` collection, which needs the
+        ConsistencyLevel header. Returns the raw Graph user objects.
+        """
+        escaped = query.replace('"', '\\"')
+        resp = await self._send(
+            "GET",
+            f"{GRAPH_BASE}/users",
+            extra_headers={"ConsistencyLevel": "eventual"},
+            params={
+                # userPrincipalName is searched as well as name and mail
+                # because it is the handle Switch stores and later searches
+                # back for when a claim is confirmed. Without it, a tenant
+                # whose mail differs from its UPN — or has none — 404s on
+                # someone the user just picked out of this very list.
+                "$search": (
+                    f'"displayName:{escaped}" OR "mail:{escaped}" '
+                    f'OR "userPrincipalName:{escaped}"'
+                ),
+                "$select": "id,displayName,userPrincipalName,mail",
+                "$top": str(top),
+            },
+        )
+        if resp.status_code >= 300:
+            raise _graph_error(f"user search for {query!r}", resp)
+        payload: dict[str, Any] = resp.json()
+        users: list[dict[str, Any]] = payload.get("value", []) or []
+        return users
+
+    async def get_user(self, *, user_id: str) -> dict[str, Any]:
+        """One directory user by AAD object id.
+
+        Teams leaves the sender's name off some activities — 1:1 chats in
+        particular — and an id is not a name, however much the shape of the
+        code lets it stand in for one.
+        """
+        resp = await self._send(
+            "GET",
+            f"{GRAPH_BASE}/users/{_segment(user_id)}",
+            params={"$select": "id,displayName,userPrincipalName,mail"},
+        )
+        if resp.status_code >= 300:
+            raise _graph_error(f"get user {user_id}", resp)
+        result: dict[str, Any] = resp.json()
+        return result
+
+    async def add_channel_member(
+        self, *, team_id: str, channel_id: str, user_aad_id: str
+    ) -> None:
+        """Add an AAD user to a private channel's membership."""
+        body = {
+            "@odata.type": "#microsoft.graph.aadUserConversationMember",
+            "roles": [],
+            "user@odata.bind": (f"{GRAPH_BASE}/users('{user_aad_id}')"),
+        }
+        resp = await self._send(
+            "POST",
+            f"{GRAPH_BASE}/teams/{_segment(team_id)}/channels/{_segment(channel_id)}/members",
+            json=body,
+        )
+        if resp.status_code >= 300 and resp.status_code != 409:
+            raise _graph_error(
+                f"add member {user_aad_id} to channel {channel_id}", resp
+            )
+
+    async def add_team_member(self, *, team_id: str, user_aad_id: str) -> None:
+        """Add an AAD user to a team (so they can see its standard channels)."""
+        body = {
+            "@odata.type": "#microsoft.graph.aadUserConversationMember",
+            "roles": [],
+            "user@odata.bind": (f"{GRAPH_BASE}/users('{user_aad_id}')"),
+        }
+        resp = await self._send(
+            "POST", f"{GRAPH_BASE}/teams/{_segment(team_id)}/members", json=body
+        )
+        if resp.status_code >= 300 and resp.status_code != 409:
+            raise _graph_error(f"add member {user_aad_id} to team {team_id}", resp)
+
+    # ── The app's own installation in a team ─────────────────────────────────
+
+    async def list_teams(self) -> list[dict[str, Any]]:
+        """Every team in the organisation, by id and name, across Graph's pages."""
+        return await self._all_pages(
+            f"{GRAPH_BASE}/teams",
+            params={"$select": "id,displayName"},
+            what="list the organisation's teams",
+        )
+
+    async def install_app(self, *, team_id: str, catalog_app_id: str) -> None:
+        """Add the app, by its id in the organisation's catalogue, to a team."""
+        resp = await self._send(
+            "POST",
+            f"{GRAPH_BASE}/teams/{_segment(team_id)}/installedApps",
+            json={
+                "teamsApp@odata.bind": (
+                    f"{GRAPH_BASE}/appCatalogs/teamsApps/{_segment(catalog_app_id)}"
+                )
+            },
+        )
+        # 409: it is there already, which is what was asked for.
+        if resp.status_code >= 300 and resp.status_code != 409:
+            raise _graph_error(f"add the app to team {team_id}", resp)
+
+    async def find_app_installations(
+        self, *, team_id: str, external_id: str
+    ) -> list[AppInstallation]:
+        """This app's installations in a team, if it is installed.
+
+        Matched on the app's manifest id (`externalId`), which is the same in
+        every organisation's catalogue, rather than the id the catalogue
+        assigned, which differs per organisation — and which each installation
+        also reports, so finding one is how that id is learned without a
+        catalogue permission.
+        """
+        resp = await self._send(
+            "GET",
+            f"{GRAPH_BASE}/teams/{_segment(team_id)}/installedApps",
+            params={
+                "$expand": "teamsApp",
+                "$filter": f"teamsApp/externalId eq '{external_id}'",
+            },
+        )
+        if resp.status_code >= 300:
+            raise _graph_error(f"list app installations in team {team_id}", resp)
+        installations: list[dict[str, Any]] = resp.json().get("value", []) or []
+        return [
+            AppInstallation(
+                installation_id=str(item["id"]),
+                catalog_app_id=str((item.get("teamsApp") or {}).get("id") or "")
+                or None,
+            )
+            for item in installations
+            if item.get("id")
+        ]
+
+    async def uninstall_app(self, *, team_id: str, installation_id: str) -> None:
+        resp = await self._send(
+            "DELETE",
+            f"{GRAPH_BASE}/teams/{_segment(team_id)}/installedApps/{_segment(installation_id)}",
+        )
+        if resp.status_code >= 300 and resp.status_code != 404:
+            raise _graph_error(f"remove the app from team {team_id}", resp)

@@ -1,0 +1,57 @@
+import { getDiagnosticLogAttachment } from '@main/lib/file-logger';
+import { createRPCController } from '@shared/lib/ipc/rpc';
+import type { OpenInAppId } from '@shared/openInApps';
+import { appService } from './service';
+
+export const appController = createRPCController({
+  openExternal: async (url: string) => {
+    try {
+      await appService.openExternal(url);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  },
+  quit: () => {
+    try {
+      appService.quit();
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  },
+  openIn: async (args: {
+    app: OpenInAppId;
+    path: string;
+    isRemote?: boolean;
+    sshConnectionId?: string | null;
+  }) => {
+    try {
+      await appService.openIn(args);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  },
+  checkInstalledApps: () => appService.checkInstalledApps(),
+  listInstalledFonts: async (args?: { refresh?: boolean }) => {
+    const { fonts, cached, error } = await appService.listInstalledFonts(args?.refresh);
+    return { success: !error, fonts, cached, ...(error ? { error } : {}) };
+  },
+  openSelectDirectoryDialog: (args: { title: string; message: string; defaultPath?: string }) =>
+    appService.openSelectDirectoryDialog(args),
+  saveTextFile: (args: { title: string; defaultPath?: string; content: string }) =>
+    appService.saveTextFile(args),
+  openSelectAudioFileDialog: (args: { title: string; message: string }) =>
+    appService.openSelectAudioFileDialog(args),
+  readAudioFileDataUrl: async (filePath: string) => {
+    try {
+      return { success: true, dataUrl: await appService.readAudioFileDataUrl(filePath) };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  },
+  getAppVersion: () => appService.getCachedAppVersion(),
+  getPlatform: () => process.platform,
+  getDiagnosticLogAttachment,
+});

@@ -1,0 +1,1131 @@
+{{/*
+Full name, truncated for K8s name limits.
+*/}}
+{{- define "switch.fullname" -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels.
+*/}}
+{{- define "switch.labels" -}}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end }}
+
+{{/*
+Selector labels for a named component.
+Usage: {{ include "switch.selectorLabels" (dict "Release" .Release "component" "switch-core") }}
+*/}}
+{{- define "switch.selectorLabels" -}}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/*
+Secret name. Defaults to the chart-managed Secret; set secrets.existingSecret to
+have every consumer read from a pre-existing Secret instead (e.g. one synced by
+the External Secrets Operator / sealed-secrets). When set, the chart renders no
+Secret of its own.
+*/}}
+{{- define "switch.secretName" -}}
+{{- if .secretNameOverride -}}
+{{- .secretNameOverride -}}
+{{- else if .Values.secrets.existingSecret -}}
+{{- .Values.secrets.existingSecret -}}
+{{- else -}}
+{{- include "switch.fullname" . }}-secrets
+{{- end -}}
+{{- end }}
+
+{{/*
+The Secret's data block, so the pre-upgrade copy the migration reads is
+rendered from this one source and cannot drift from the release's own.
+*/}}
+{{- define "switch.secretData" -}}
+{{- if not .Values.postgresql.existingSecret }}
+POSTGRES_PASSWORD: {{ required "secrets.postgresPassword is required (unless postgresql.existingSecret is set)" .Values.secrets.postgresPassword | b64enc | quote }}
+{{- end }}
+{{- if and (eq .Values.postgresql.mode "managed") .Values.secrets.dbRuntimePassword (not .Values.postgresql.managed.runtimeExistingSecret) }}
+DB_RUNTIME_PASSWORD: {{ .Values.secrets.dbRuntimePassword | b64enc | quote }}
+{{- end }}
+{{- if and .Values.postgresql.owner.username (not .Values.postgresql.owner.existingSecret) }}
+DB_OWNER_PASSWORD: {{ required "secrets.dbOwnerPassword is required when postgresql.owner.username is set (unless postgresql.owner.existingSecret is set)" .Values.secrets.dbOwnerPassword | b64enc | quote }}
+{{- end }}
+AGENT_REGISTRATION_TOKEN: {{ required "secrets.agentRegistrationToken is required" .Values.secrets.agentRegistrationToken | b64enc | quote }}
+SECRET_KEYS: {{ required "secrets.secretKeys is required (\"<id>:<secret>\", see values.yaml)" .Values.secrets.secretKeys | b64enc | quote }}
+{{- with .Values.secrets.jwtSecretKey }}
+JWT_SECRET_KEY: {{ . | b64enc | quote }}
+{{- end }}
+{{- if .Values.switchCore.agentManagement.enabled }}
+{{- fail "switchCore.agentManagement.enabled has been replaced by a feature flag: remove it and add \"agent_management\" to switchCore.featureFlags.enabled." }}
+{{- end }}
+{{- if has "agent_management" .Values.switchCore.featureFlags.enabled }}
+{{- $controllerSecret := required "secrets.controllerTokenSecret is required with the agent_management feature flag on" .Values.secrets.controllerTokenSecret }}
+{{- if lt (len $controllerSecret) 32 }}
+{{- fail "secrets.controllerTokenSecret must be at least 32 characters; switch-core refuses to start with a shorter one." }}
+{{- end }}
+CONTROLLER_TOKEN_SECRET: {{ $controllerSecret | b64enc | quote }}
+{{- end }}
+GATEWAY_ADMIN_EMAIL: {{ required "secrets.gatewayAdminEmail is required" .Values.secrets.gatewayAdminEmail | b64enc | quote }}
+GATEWAY_ADMIN_PASSWORD: {{ required "secrets.gatewayAdminPassword is required" .Values.secrets.gatewayAdminPassword | b64enc | quote }}
+{{- if .Values.mattermost.enabled }}
+MATTERMOST_ADMIN_PASSWORD: {{ .Values.secrets.mattermostAdminPassword | default .Values.secrets.postgresPassword | b64enc | quote }}
+MATTERMOST_USER_PASSWORD: {{ .Values.secrets.mattermostUserPassword | default .Values.secrets.postgresPassword | b64enc | quote }}
+{{- end }}
+{{- if .Values.switchCore.oidc.enabled }}
+GATEWAY_OIDC_CLIENT_SECRET: {{ required "secrets.gatewayOidcClientSecret is required when switchCore.oidc.enabled" .Values.secrets.gatewayOidcClientSecret | b64enc | quote }}
+{{- end }}
+{{- if and .Values.switchCore.smtp.enabled (or .Values.switchCore.smtp.username .Values.switchCore.smtp.usernameFromSecret) }}
+GATEWAY_SMTP_PASSWORD: {{ required "secrets.gatewaySmtpPassword is required when an SMTP username is set" .Values.secrets.gatewaySmtpPassword | b64enc | quote }}
+{{- end }}
+{{- if and .Values.switchCore.smtp.enabled .Values.switchCore.smtp.usernameFromSecret }}
+GATEWAY_SMTP_USERNAME: {{ required "secrets.gatewaySmtpUsername is required when switchCore.smtp.usernameFromSecret is true" .Values.secrets.gatewaySmtpUsername | b64enc | quote }}
+{{- end }}
+{{- if .Values.secrets.otlpHeaders }}
+OTLP_HEADERS: {{ .Values.secrets.otlpHeaders | b64enc | quote }}
+{{- end }}
+{{- if .Values.switchCore.slackApp.enabled }}
+SLACK_APP_CLIENT_SECRET: {{ required "secrets.slackAppClientSecret is required when switchCore.slackApp.enabled" .Values.secrets.slackAppClientSecret | b64enc | quote }}
+SLACK_APP_SIGNING_SECRET: {{ required "secrets.slackAppSigningSecret is required when switchCore.slackApp.enabled" .Values.secrets.slackAppSigningSecret | b64enc | quote }}
+{{- end }}
+{{- if .Values.switchCore.discordApp.enabled }}
+DISCORD_APP_CLIENT_SECRET: {{ required "secrets.discordAppClientSecret is required when switchCore.discordApp.enabled" .Values.secrets.discordAppClientSecret | b64enc | quote }}
+DISCORD_APP_BOT_TOKEN: {{ required "secrets.discordAppBotToken is required when switchCore.discordApp.enabled" .Values.secrets.discordAppBotToken | b64enc | quote }}
+{{- end }}
+{{- if .Values.switchCore.teamsApp.enabled }}
+{{- if eq .Values.switchCore.teamsApp.credential "secret" }}
+TEAMS_APP_CLIENT_SECRET: {{ required "secrets.teamsAppClientSecret is required when switchCore.teamsApp.credential is secret" .Values.secrets.teamsAppClientSecret | b64enc | quote }}
+{{- end }}
+{{- if eq .Values.switchCore.teamsApp.credential "certificate" }}
+TEAMS_APP_CERTIFICATE: {{ required "secrets.teamsAppCertificate is required when switchCore.teamsApp.credential is certificate" .Values.secrets.teamsAppCertificate | b64enc | quote }}
+TEAMS_APP_CERTIFICATE_PRIVATE_KEY: {{ required "secrets.teamsAppCertificatePrivateKey is required when switchCore.teamsApp.credential is certificate" .Values.secrets.teamsAppCertificatePrivateKey | b64enc | quote }}
+{{- end }}
+TEAMS_APP_NOTIFICATION_CERTIFICATE: {{ required "secrets.teamsAppNotificationCertificate is required when switchCore.teamsApp.enabled" .Values.secrets.teamsAppNotificationCertificate | b64enc | quote }}
+TEAMS_APP_NOTIFICATION_PRIVATE_KEY: {{ required "secrets.teamsAppNotificationPrivateKey is required when switchCore.teamsApp.enabled" .Values.secrets.teamsAppNotificationPrivateKey | b64enc | quote }}
+{{- if .Values.secrets.teamsAppNotificationPreviousPrivateKey }}
+TEAMS_APP_NOTIFICATION_PREVIOUS_PRIVATE_KEY: {{ .Values.secrets.teamsAppNotificationPreviousPrivateKey | b64enc | quote }}
+{{- end }}
+{{- end }}
+{{- if .Values.switchCore.telegramApp.enabled }}
+TELEGRAM_APP_BOT_TOKEN: {{ required "secrets.telegramAppBotToken is required when switchCore.telegramApp.enabled" .Values.secrets.telegramAppBotToken | b64enc | quote }}
+TELEGRAM_APP_WEBHOOK_SECRET: {{ required "secrets.telegramAppWebhookSecret is required when switchCore.telegramApp.enabled" .Values.secrets.telegramAppWebhookSecret | b64enc | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+PostgreSQL connection details.
+
+  mode: managed  -> the chart's in-cluster StatefulSet.
+  mode: existing -> an operator-supplied external database (RDS / Cloud SQL /
+                    Azure / self-run), configured under postgresql.external.
+
+Every consumer (switch-core, mattermost, the wait-for init containers) resolves
+the host/port/user/database and the password secret through these helpers so the
+two modes stay in lockstep.
+*/}}
+{{- define "switch.postgresHost" -}}
+{{- if eq .Values.postgresql.mode "existing" -}}
+{{- required "postgresql.external.host is required when postgresql.mode=existing" .Values.postgresql.external.host -}}
+{{- else -}}
+{{- include "switch.fullname" . }}-postgresql
+{{- end -}}
+{{- end }}
+
+{{- define "switch.postgresPort" -}}
+{{- if eq .Values.postgresql.mode "existing" -}}
+{{- .Values.postgresql.external.port | default 5432 -}}
+{{- else -}}
+5432
+{{- end -}}
+{{- end }}
+
+{{/*
+The bootstrapped Postgres superuser: "postgres" in managed mode (the account
+POSTGRES_USER creates on the StatefulSet below), or postgresql.external.username
+in existing mode. The identity the managed StatefulSet, its initdb scripts and
+the create-runtime-role Job bootstrap and administer with. Distinct from
+switch.postgresUser below, which is DB_USER: the restricted role the RLS
+policies apply to.
+
+In managed mode those two are genuinely different accounts. In existing mode
+they are the same value, because the chart does not manage that database and
+has only the one username to go on — so this helper is *not* what Mattermost
+should connect as there; see switch.mattermostDbUser.
+*/}}
+{{- define "switch.postgresSuperUser" -}}
+{{- if eq .Values.postgresql.mode "existing" -}}
+{{- .Values.postgresql.external.username | default "postgres" -}}
+{{- else -}}
+postgres
+{{- end -}}
+{{- end }}
+
+{{/*
+DB_USER: the runtime role every request is actually served over, and the one
+the row-level-security policies apply to.
+
+  mode: existing -> postgresql.external.username, unchanged from what this
+                    chart has always sent. The chart does not manage that
+                    database, so it cannot create a role in it — DB_USER keeps
+                    pointing at whatever account you configure until you
+                    create a restricted one yourself and repoint this at it.
+  mode: managed  -> postgresql.managed.runtimeUsername, a role this chart
+                    creates itself (fresh installs: templates/postgresql/
+                    configmap-init.yaml; upgrades of a deployment that
+                    predates it: the create-runtime-role pre-upgrade hook Job).
+                    Managed mode is the one mode where the chart owns the
+                    Postgres it points at, so it is the only mode where it
+                    *can* create the role — leaving this at the superuser by
+                    default there would make the chart's own default install
+                    the one deployment shape with no tenant isolation in it,
+                    which is the opposite of what this change is for.
+*/}}
+{{- define "switch.postgresUser" -}}
+{{- if eq .Values.postgresql.mode "existing" -}}
+{{- .Values.postgresql.external.username | default "postgres" -}}
+{{- else -}}
+{{- .Values.postgresql.managed.runtimeUsername -}}
+{{- end -}}
+{{- end }}
+
+{{- define "switch.postgresDatabase" -}}
+{{- if eq .Values.postgresql.mode "existing" -}}
+{{- .Values.postgresql.external.database | default "switch" -}}
+{{- else -}}
+{{- .Values.postgresql.database -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name/key of the Secret holding the Postgres password. Defaults to the
+chart-managed Secret; set postgresql.existingSecret to source it from an
+external secret (e.g. one synced by external-secrets / sealed-secrets).
+*/}}
+{{- define "switch.postgresSecretName" -}}
+{{- if .Values.postgresql.existingSecret -}}
+{{- .Values.postgresql.existingSecret -}}
+{{- else -}}
+{{- include "switch.secretName" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "switch.postgresSecretKey" -}}
+{{- .Values.postgresql.existingSecretKey | default "POSTGRES_PASSWORD" -}}
+{{- end }}
+
+{{/*
+Where DB_USER's password comes from. In mode: managed the runtime role has a
+password of its own when secrets.dbRuntimePassword or
+postgresql.managed.runtimeExistingSecret is set, and shares the superuser's
+otherwise. In mode: existing DB_USER's password is POSTGRES_PASSWORD, as
+before.
+*/}}
+{{- define "switch.runtimePasswordSeparate" -}}
+{{- if and .Values.secrets.existingSecret .Values.secrets.dbRuntimePassword -}}
+{{- fail "secrets.dbRuntimePassword cannot be used with secrets.existingSecret: the chart renders no Secret to put it in. Store the password in a Secret and name it in postgresql.managed.runtimeExistingSecret (it may be the same Secret as secrets.existingSecret)." -}}
+{{- end -}}
+{{- if and (eq .Values.postgresql.mode "managed") (or .Values.postgresql.managed.runtimeExistingSecret .Values.secrets.dbRuntimePassword) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{- define "switch.runtimeSecretName" -}}
+{{- if not (include "switch.runtimePasswordSeparate" .) -}}
+{{- include "switch.postgresSecretName" . -}}
+{{- else if .Values.postgresql.managed.runtimeExistingSecret -}}
+{{- .Values.postgresql.managed.runtimeExistingSecret -}}
+{{- else -}}
+{{- include "switch.secretName" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "switch.runtimeSecretKey" -}}
+{{- if not (include "switch.runtimePasswordSeparate" .) -}}
+{{- include "switch.postgresSecretKey" . -}}
+{{- else if .Values.postgresql.managed.runtimeExistingSecret -}}
+{{- .Values.postgresql.managed.runtimeExistingSecretKey | default "DB_RUNTIME_PASSWORD" -}}
+{{- else -}}
+DB_RUNTIME_PASSWORD
+{{- end -}}
+{{- end }}
+
+{{/*
+DB_OWNER_USER: the schema owner switch-core migrates and grants as.
+
+  owner.username set       -> exactly that value, in either postgresql mode.
+  owner.username unset,
+    mode: managed           -> "postgres", the bootstrapped superuser: it
+                                already exists, already owns the schema, and
+                                its password is already tracked as
+                                secrets.postgresPassword, so a managed install
+                                needs no separate owner credential configured
+                                at all.
+  owner.username unset,
+    mode: existing          -> empty. The chart has no external database
+                                superuser to default to, so an unconfigured
+                                owner there really does mean "no owner
+                                configured" — see the values.yaml comment on
+                                postgresql.owner for what that implies at boot.
+*/}}
+{{- define "switch.postgresOwnerUser" -}}
+{{- if .Values.postgresql.owner.username -}}
+{{- .Values.postgresql.owner.username -}}
+{{- else if eq .Values.postgresql.mode "managed" -}}
+postgres
+{{- end -}}
+{{- end }}
+
+{{/*
+Name/key of the Secret holding the schema owner's password, mirroring
+switch.postgresSecretName/Key above for the runtime role.
+
+Only consulted when postgresql.owner.username is explicitly set — that is the
+only case with a DB_OWNER_PASSWORD key of its own (see switch.secretData). The
+managed default owner (switch.postgresOwnerUser resolving to "postgres" with
+no owner.username set) has no such key: it is the bootstrapped superuser, so
+its password is whatever switch.postgresSecretName/Key already resolve to, and
+callers must fall back to those directly rather than through this helper.
+*/}}
+{{- define "switch.postgresOwnerSecretName" -}}
+{{- if .Values.postgresql.owner.existingSecret -}}
+{{- .Values.postgresql.owner.existingSecret -}}
+{{- else -}}
+{{- include "switch.secretName" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "switch.postgresOwnerSecretKey" -}}
+{{- .Values.postgresql.owner.existingSecretKey | default "DB_OWNER_PASSWORD" -}}
+{{- end }}
+
+{{/*
+The credentials Mattermost connects to its own "mattermost" database with,
+and the reason they are not switch.postgresUser's.
+
+Mattermost creates and migrates its own schema, so it needs an account with
+rights in that database. The runtime role has none: it is granted CRUD on the
+tables switch-core's own migration created, in switch-core's own database, and
+nothing anywhere else. There is no isolation argument for restricting
+Mattermost either — its schema carries no row-level security and no tenant
+column — so the administrative account is simply the right one.
+
+In managed mode that is the bootstrapped superuser, unchanged: initdb creates
+the "mattermost" database as "postgres" and postgresql.owner.username does not
+move it, so this deliberately does not follow that value there.
+
+Existing mode is the case this exists for. switch.postgresSuperUser and
+switch.postgresUser both resolve to postgresql.external.username there, so the
+moment an operator repoints external.username at a restricted role — which is
+exactly what docs/old/rds-migration.md asks them to do — Mattermost would
+follow it onto a role with no rights in its database and fail to start. When an
+owner is configured, use it; when one is not, this is a deployment that has not
+split its roles yet and external.username is still the administrative account,
+which is the behaviour it has always had.
+
+The three helpers below share one condition, so it is written once and the
+other two ask it. It answers with a non-empty string or nothing, which is what
+`if` reads — deliberately not "true"/"false", since an `include` returning the
+string "false" is still truthy and inviting a reader to compare against it
+would be inviting a bug.
+*/}}
+{{- define "switch.mattermostUsesOwner" -}}
+{{- if and (eq .Values.postgresql.mode "existing") .Values.postgresql.owner.username -}}
+owner
+{{- end -}}
+{{- end }}
+
+{{- define "switch.mattermostDbUser" -}}
+{{- if include "switch.mattermostUsesOwner" . -}}
+{{- .Values.postgresql.owner.username -}}
+{{- else -}}
+{{- include "switch.postgresSuperUser" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "switch.mattermostDbSecretName" -}}
+{{- if include "switch.mattermostUsesOwner" . -}}
+{{- include "switch.postgresOwnerSecretName" . -}}
+{{- else -}}
+{{- include "switch.postgresSecretName" . -}}
+{{- end -}}
+{{- end }}
+
+{{- define "switch.mattermostDbSecretKey" -}}
+{{- if include "switch.mattermostUsesOwner" . -}}
+{{- include "switch.postgresOwnerSecretKey" . -}}
+{{- else -}}
+{{- include "switch.postgresSecretKey" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Other service hostnames (used in env vars and init containers).
+*/}}
+
+{{- define "switch.switchCoreHost" -}}
+{{- include "switch.fullname" . }}-switch-core
+{{- end }}
+
+{{- define "switch.gatewayHost" -}}
+{{- include "switch.fullname" . }}-gateway
+{{- end }}
+
+{{- define "switch.mattermostHost" -}}
+{{- include "switch.fullname" . }}-mattermost
+{{- end }}
+
+{{/*
+Public origin of the Teams bridge listener: the value the bridge's
+public_base_url must be set to.
+
+Always https, whatever `tls.enabled` says. That flag governs whether *this*
+Ingress carries a certificate, not what Microsoft dials — and Graph refuses a
+plaintext URL, so http is never the answer. Deriving the scheme from the flag
+printed `http://<host>` as the value to use whenever TLS terminated upstream,
+which is the documented ALB pattern.
+
+Empty only when the host is genuinely unknown to the chart: a host-less rule
+behind a CDN that owns the public name. The caller must then ask the operator
+rather than print a guess.
+*/}}
+{{- define "switch.teamsPublicOrigin" -}}
+{{- $teams := .Values.switchCore.teamsBridge -}}
+{{- if and (eq $teams.ingress.mode "dedicated") $teams.ingress.host -}}
+{{- printf "https://%s" $teams.ingress.host -}}
+{{- else if and (eq $teams.ingress.mode "shared") .Values.ingress.host -}}
+{{- printf "https://%s" .Values.ingress.host -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Reject Teams bridge configurations that would deploy a listener nothing can
+reach. Publishing the port without routing it produces a bridge that creates
+channels and posts fine while silently receiving nothing, which is the exact
+failure this block exists to prevent — so these are render-time errors rather
+than something you discover hours later at Graph subscription time.
+*/}}
+{{- define "switch.validateTeamsBridge" -}}
+{{- $teams := .Values.switchCore.teamsBridge -}}
+{{- $mode := $teams.ingress.mode -}}
+{{- $modes := list "dedicated" "shared" "external" -}}
+{{- if not $teams.enabled -}}
+{{- if $mode -}}
+{{- fail (printf "switchCore.teamsBridge.ingress.mode is %q but switchCore.teamsBridge.enabled is false: nothing publishes port %v for it to route to. Set enabled=true, or clear the mode." $mode $teams.port) -}}
+{{- end -}}
+{{- else -}}
+{{- if not $mode -}}
+{{- fail "switchCore.teamsBridge.enabled is true but switchCore.teamsBridge.ingress.mode is unset. Microsoft calls the Teams listener from the public internet, so publishing the port is only half the job — choose how the two callback paths are routed: \"dedicated\" (the chart renders an Ingress for them on their own host), \"shared\" (add them to the chart's managed Ingress), or \"external\" (you route them yourself; see samples/ingress.example.yaml)." -}}
+{{- end -}}
+{{- if not (has $mode $modes) -}}
+{{- fail (printf "switchCore.teamsBridge.ingress.mode must be one of dedicated, shared or external — got %q." $mode) -}}
+{{- end -}}
+{{- if and (eq $mode "shared") (ne .Values.ingress.mode "managed") -}}
+{{- fail (printf "switchCore.teamsBridge.ingress.mode is \"shared\" but ingress.mode is %q: there is no chart-managed Ingress to add the Teams paths to. Set ingress.mode=managed, or use teamsBridge.ingress.mode=dedicated to give Teams its own Ingress, or \"external\" to route it yourself." .Values.ingress.mode) -}}
+{{- end -}}
+{{- if and (eq $mode "shared") (not .Values.ingress.host) -}}
+{{- fail "switchCore.teamsBridge.ingress.mode is \"shared\" but ingress.host is empty. Microsoft resolves the notification URL from public DNS, so the Ingress needs a real hostname rather than a catch-all rule." -}}
+{{- end -}}
+{{- if and (ne $mode "external") (not .Values.ingress.teamsPaths) -}}
+{{- fail "ingress.teamsPaths is empty, so the Teams Ingress would render a rule with no paths — which Helm accepts and the Kubernetes API rejects at apply time. Restore the two callback paths, or set switchCore.teamsBridge.ingress.mode=external if you route them yourself." -}}
+{{- end -}}
+{{- if and (eq $mode "dedicated") (not $teams.ingress.host) $teams.ingress.tls.enabled -}}
+{{- fail "switchCore.teamsBridge.ingress.mode is \"dedicated\" with TLS enabled but switchCore.teamsBridge.ingress.host is empty: a host-less rule cannot carry a TLS certificate. Either set the host, or set tls.enabled=false if something upstream terminates TLS and owns the public name (a CDN or reverse proxy — then public_base_url is that name, not this Ingress's)." -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+preStop drain for a pod that rolls with a surge (a new pod is Ready before the
+old one stops): hold the old pod for a few seconds after it is marked
+terminating, so endpoint and load-balancer deregistration land before the
+process gets SIGTERM. Not for a Recreate Deployment, where nothing else is
+serving and the wait only lengthens the outage. Not for switch-core either:
+with more than one replica it drains itself after SIGTERM, first handing the
+work it owns to the other pods and then serving on for a few seconds out of
+readiness, and a sleep here would only hold that hand-over back. The native
+`sleep` action needs no shell (the images are distroless) but needs Kubernetes
+1.30+, so nothing renders on an older cluster.
+Usage: {{- include "switch.preStopDrain" . | nindent 10 }}
+*/}}
+{{- define "switch.preStopDrain" -}}
+{{- if and .Values.global.preStopSleepSeconds (semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version) -}}
+lifecycle:
+  preStop:
+    sleep:
+      seconds: {{ .Values.global.preStopSleepSeconds }}
+{{- end }}
+{{- end }}
+
+{{/*
+Prepend the global image registry if set, unless the reference already names
+a registry: a first path component with a "." or ":" in it, or "localhost",
+which is how a container runtime tells a registry host from a repository
+namespace. So `ghcr.io/acme/switch-core:1.0` is used as written whatever
+global.imageRegistry says.
+Usage: {{ include "switch.image" (dict "global" .Values.global "image" .Values.switchCore.image) }}
+*/}}
+{{- define "switch.image" -}}
+{{- $parts := splitList "/" .image -}}
+{{- $host := first $parts -}}
+{{- $hasRegistry := and (gt (len $parts) 1) (or (contains "." $host) (contains ":" $host) (eq $host "localhost")) -}}
+{{- if and .global.imageRegistry (not $hasRegistry) -}}
+{{- printf "%s/%s" .global.imageRegistry .image }}
+{{- else -}}
+{{- .image }}
+{{- end -}}
+{{- end }}
+
+{{/*
+Pull policy for a first-party image. An explicit policy wins. Otherwise a
+digest-pinned reference cannot change, so IfNotPresent; anything else may be a
+mutable tag, so Always, or nodes would keep running a stale cached image.
+Usage: {{ include "switch.imagePullPolicy" (dict "policy" .Values.switchCore.imagePullPolicy "image" .Values.switchCore.image) }}
+*/}}
+{{- define "switch.imagePullPolicy" -}}
+{{- if .policy -}}
+{{- .policy -}}
+{{- else if contains "@sha256:" .image -}}
+IfNotPresent
+{{- else -}}
+Always
+{{- end -}}
+{{- end }}
+
+{{/*
+imagePullSecrets block from .Values.global.imagePullSecrets (a list of Secret
+names) — for pulling images from a private registry. Renders nothing when the
+list is empty. Guard the include so the empty case leaves no stray line:
+  {{- if .Values.global.imagePullSecrets }}
+  {{- include "switch.imagePullSecrets" . | nindent 6 }}
+  {{- end }}
+*/}}
+{{- define "switch.imagePullSecrets" -}}
+imagePullSecrets:
+{{- range .Values.global.imagePullSecrets }}
+  - name: {{ . }}
+{{- end }}
+{{- end }}
+
+{{/*
+Name of the ConfigMap holding the database CA bundle — the user's own, or the
+chart-managed one rendered from postgresql.caBundle.contents. Empty when no
+bundle is configured, which is what every caller tests to decide whether to
+mount anything.
+*/}}
+{{- define "switch.dbCaBundleConfigMap" -}}
+{{- if .dbCaConfigMapOverride -}}
+{{- .dbCaConfigMapOverride -}}
+{{- else if .Values.postgresql.caBundle.existingConfigMap -}}
+{{- .Values.postgresql.caBundle.existingConfigMap -}}
+{{- else if .Values.postgresql.caBundle.contents -}}
+{{- include "switch.fullname" . }}-db-ca
+{{- end -}}
+{{- end }}
+
+{{/*
+The CA ConfigMap's data block, shared with the pre-upgrade copy for the same
+reason as the Secret's.
+*/}}
+{{- define "switch.dbCaBundleData" -}}
+{{ .Values.postgresql.caBundle.key }}: |
+{{ .Values.postgresql.caBundle.contents | indent 2 }}
+{{- end }}
+
+{{/*
+Path the CA bundle is mounted at inside every container that connects to the
+database.
+*/}}
+{{- define "switch.dbCaBundlePath" -}}
+{{- printf "%s/%s" (trimSuffix "/" .Values.postgresql.caBundle.mountPath) .Values.postgresql.caBundle.key -}}
+{{- end }}
+
+{{- define "switch.dbCaBundleVolume" -}}
+- name: db-ca-bundle
+  configMap:
+    name: {{ include "switch.dbCaBundleConfigMap" . }}
+    items:
+      - key: {{ .Values.postgresql.caBundle.key }}
+        path: {{ .Values.postgresql.caBundle.key }}
+{{- end }}
+
+{{- define "switch.dbCaBundleVolumeMount" -}}
+- name: db-ca-bundle
+  mountPath: {{ .Values.postgresql.caBundle.mountPath }}
+  readOnly: true
+{{- end }}
+
+{{/*
+Refuse a TLS configuration that cannot work, at template time rather than on
+the first connection of a rolled-out pod.
+*/}}
+{{- define "switch.validateDbTls" -}}
+{{- $ca := .Values.postgresql.caBundle -}}
+{{- if and $ca.contents $ca.existingConfigMap -}}
+{{- fail "postgresql.caBundle: set contents or existingConfigMap, not both." -}}
+{{- end -}}
+{{- $bundle := include "switch.dbCaBundleConfigMap" . -}}
+{{- $verifying := has .Values.postgresql.sslMode (list "verify-ca" "verify-full") -}}
+{{- if and $verifying (not $bundle) -}}
+{{- fail (printf "postgresql.sslMode=%s checks the server certificate against a CA bundle, but postgresql.caBundle is empty. Supply the provider's root CA (for RDS, https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem) or use sslMode=require." .Values.postgresql.sslMode) -}}
+{{- end -}}
+{{- if and $bundle (not $verifying) -}}
+{{- fail (printf "postgresql.caBundle is set but postgresql.sslMode=%s never checks the server certificate, so the bundle would have no effect. Use verify-ca or verify-full." .Values.postgresql.sslMode) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Reject a log format switch-core would refuse at startup, so a typo is a render
+error rather than a crash loop.
+*/}}
+{{- define "switch.validateLogging" -}}
+{{- if not (has .Values.switchCore.logging.format (list "text" "json")) -}}
+{{- fail (printf "switchCore.logging.format must be text or json, not %q." .Values.switchCore.logging.format) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Refuse to render an observability config that would report nothing.
+
+The collector drops payloads that do not identify the deployment, silently and
+with a 200, so a chart that shipped without an id would produce a pod that
+looks configured and appears on no dashboard. switch-core refuses to start in
+that state too; failing here means the operator finds out at `helm upgrade`
+rather than from a CrashLoopBackOff.
+*/}}
+{{- define "switch.validateObservability" -}}
+{{- with .Values.switchCore.observability }}
+{{- if and .otlpEndpoint (not .deploymentId) -}}
+{{- fail "switchCore.observability.deploymentId must be set when otlpEndpoint is: the collector drops payloads it cannot attribute to a deployment, so this server would report nothing while looking correctly configured. Use a UUID, and keep it stable across upgrades." -}}
+{{- end -}}
+{{- if and .deploymentId (not .otlpEndpoint) -}}
+{{- fail "switchCore.observability.deploymentId is set but otlpEndpoint is not, so nothing is reported anywhere. Set the endpoint, or remove the id." -}}
+{{- end -}}
+{{- if and .logs (not .otlpEndpoint) -}}
+{{- fail "switchCore.observability.logs is on but no otlpEndpoint is set." -}}
+{{- end -}}
+{{- if and .deploymentId (not (regexMatch "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$" .deploymentId)) -}}
+{{- fail (printf "switchCore.observability.deploymentId must be a UUID, got %q. switch-core validates the same thing and refuses to start, so without this check the render succeeds and the pod CrashLoopBackOffs instead. Generate one with `uuidgen`." .deploymentId) -}}
+{{- end -}}
+{{- if and .otlpEndpoint (not (regexMatch "^https?://[^/?#]+/?$" .otlpEndpoint)) -}}
+{{- fail (printf "switchCore.observability.otlpEndpoint must be an http(s) base URL with no path, query or fragment, got %q. The signal path is appended to it, so `.../v1/logs` would be posted to `.../v1/logs/v1/metrics`, and a query string is discarded entirely when the signal path is resolved against it. Put a credential in `headers`." .otlpEndpoint) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Refuse a controller release switch-core would refuse at startup: all three
+values or none, an x.y.z or x.y.z-<prerelease> version, an https URL, a lowercase
+SHA-256.
+*/}}
+{{- define "switch.validateControllerRelease" -}}
+{{- with .Values.switchCore.controllerRelease }}
+{{- if or .version .url .sha256 -}}
+{{- if not (and .version .url .sha256) -}}
+{{- fail "switchCore.controllerRelease.version, .url and .sha256 are set all together or not at all: switch-core refuses to start with only some of them." -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z]+(\\.[0-9A-Za-z]+)*)?$" .version) -}}
+{{- fail (printf "switchCore.controllerRelease.version must be x.y.z or x.y.z-<prerelease>, got %q." .version) -}}
+{{- end -}}
+{{- if not (regexMatch "^https://[^/?#\\s]+" .url) -}}
+{{- fail (printf "switchCore.controllerRelease.url must be an https URL, got %q." .url) -}}
+{{- end -}}
+{{- if not (regexMatch "^[0-9a-f]{64}$" .sha256) -}}
+{{- fail (printf "switchCore.controllerRelease.sha256 must be 64 lowercase hex characters, got %q." .sha256) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+switch-core container env. Shared by the switch-core Deployment and the
+pre-upgrade migration Job so they always run against the same configuration
+(env.py builds a full SwitchConfig, so the migration Job needs every var too).
+Include with `nindent 12`.
+
+Pass `omitOwnerCredentials: true` in the context for the serving container:
+it gets no DB_OWNER_* and DB_MIGRATE_ON_BOOT=false, because its init container
+has already migrated as the owner. Only the init container and the Job hold
+the owner's password.
+
+Pass `omitTeamsApp: true` for the two that migrate: they run no Teams app and
+mount no federated token, so TEAMS_APP_FEDERATED_TOKEN_FILE would name a file
+that is not there, and SwitchConfig refuses to load on that.
+*/}}
+{{- define "switch.coreEnv" -}}
+- name: DB_HOST
+  value: {{ include "switch.postgresHost" . | quote }}
+- name: DB_PORT
+  value: {{ include "switch.postgresPort" . | quote }}
+- name: DB_USER
+  value: {{ include "switch.postgresUser" . | quote }}
+- name: DB_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.runtimeSecretName" . }}
+      key: {{ include "switch.runtimeSecretKey" . }}
+- name: DB_NAME
+  value: {{ include "switch.postgresDatabase" . | quote }}
+{{- $ownerUser := include "switch.postgresOwnerUser" . }}
+{{- if .omitOwnerCredentials }}
+- name: DB_MIGRATE_ON_BOOT
+  value: "false"
+{{- else if $ownerUser }}
+- name: DB_OWNER_USER
+  value: {{ $ownerUser | quote }}
+- name: DB_OWNER_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      {{- if .Values.postgresql.owner.username }}
+      name: {{ include "switch.postgresOwnerSecretName" . }}
+      key: {{ include "switch.postgresOwnerSecretKey" . }}
+      {{- else }}
+      name: {{ include "switch.postgresSecretName" . }}
+      key: {{ include "switch.postgresSecretKey" . }}
+      {{- end }}
+{{- end }}
+{{- if not .Values.postgresql.requireRestrictedRole }}
+- name: DB_REQUIRE_RESTRICTED_ROLE
+  value: "false"
+{{- end }}
+- name: DB_SSL_MODE
+  value: {{ .Values.postgresql.sslMode | quote }}
+{{- if include "switch.dbCaBundleConfigMap" . }}
+- name: DB_SSL_ROOT_CERT
+  value: {{ include "switch.dbCaBundlePath" . | quote }}
+{{- end }}
+- name: DB_POOL_SIZE
+  value: {{ .Values.postgresql.pool.size | quote }}
+- name: DB_MAX_OVERFLOW
+  value: {{ .Values.postgresql.pool.maxOverflow | quote }}
+- name: DB_POOL_TIMEOUT
+  value: {{ .Values.postgresql.pool.timeout | quote }}
+- name: DB_TCP_KEEPALIVE_IDLE
+  value: {{ .Values.postgresql.tcp.keepaliveIdle | quote }}
+- name: DB_TCP_KEEPALIVE_INTERVAL
+  value: {{ .Values.postgresql.tcp.keepaliveInterval | quote }}
+- name: DB_TCP_KEEPALIVE_COUNT
+  value: {{ .Values.postgresql.tcp.keepaliveCount | quote }}
+- name: DB_TCP_USER_TIMEOUT
+  value: {{ .Values.postgresql.tcp.userTimeout | quote }}
+{{- with .Values.postgresql.idleInTransactionSessionTimeout }}
+- name: DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT
+  value: {{ . | quote }}
+{{- end }}
+- name: DB_MIGRATION_LOCK_TIMEOUT
+  value: {{ .Values.postgresql.migrationLockTimeout | quote }}
+{{- /* The pod's own name names the process on its lease, its signals, its
+logs and its metrics, so one pod can be told from another. */}}
+- name: POD_NAME
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.name
+{{- /* How many replicas share the database: sizes the connection budget
+switch-core checks at boot, and decides whether a dead LISTEN connection takes
+a pod out of service. */}}
+- name: CORE_REPLICAS
+  value: {{ .Values.switchCore.replicaCount | quote }}
+- name: AGENT_AUTH_CACHE_TTL_SECONDS
+  value: {{ .Values.switchCore.authCache.ttlSeconds | quote }}
+- name: ID_SERVER_NAME
+  value: {{ .Values.clientIdentity.serverName | quote }}
+{{- /* The old name, for an image released before the rename, which reads only
+this one. Drop it once the oldest supported image reads ID_SERVER_NAME. */}}
+- name: MATRIX_SERVER_NAME
+  value: {{ .Values.clientIdentity.serverName | quote }}
+- name: AGENT_REGISTRATION_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: AGENT_REGISTRATION_TOKEN
+- name: SECRET_KEYS
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: SECRET_KEYS
+- name: JWT_SECRET_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: JWT_SECRET_KEY
+      optional: true
+{{- if has "agent_management" .Values.switchCore.featureFlags.enabled }}
+- name: CONTROLLER_TOKEN_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: CONTROLLER_TOKEN_SECRET
+- name: CONTROLLER_STATUS_INTERVAL_SECONDS
+  value: {{ .Values.switchCore.agentManagement.statusIntervalSeconds | quote }}
+{{- end }}
+{{- with .Values.switchCore.controllerRelease }}
+{{- if .version }}
+- name: CONTROLLER_RELEASE_VERSION
+  value: {{ .version | quote }}
+- name: CONTROLLER_RELEASE_URL
+  value: {{ .url | quote }}
+- name: CONTROLLER_RELEASE_SHA256
+  value: {{ .sha256 | quote }}
+{{- end }}
+{{- end }}
+- name: GATEWAY_ADMIN_EMAIL
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: GATEWAY_ADMIN_EMAIL
+- name: GATEWAY_ADMIN_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: GATEWAY_ADMIN_PASSWORD
+{{- if .Values.switchCore.oidc.enabled }}
+- name: GATEWAY_OIDC_ISSUER_URL
+  value: {{ required "switchCore.oidc.issuerUrl is required when oidc.enabled" .Values.switchCore.oidc.issuerUrl | quote }}
+- name: GATEWAY_OIDC_CLIENT_ID
+  value: {{ required "switchCore.oidc.clientId is required when oidc.enabled" .Values.switchCore.oidc.clientId | quote }}
+- name: GATEWAY_OIDC_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: GATEWAY_OIDC_CLIENT_SECRET
+{{- $oidcScopes := required "switchCore.oidc.scopes is required when oidc.enabled" .Values.switchCore.oidc.scopes }}
+{{- if not (has "openid" (regexSplit "\\s+" (trim $oidcScopes) -1)) }}
+{{- fail (printf "switchCore.oidc.scopes must include \"openid\" — without it the provider issues no id_token and the gateway falls back to a userinfo call it may not answer. Got %q." $oidcScopes) }}
+{{- end }}
+- name: GATEWAY_OIDC_SCOPES
+  value: {{ $oidcScopes | quote }}
+- name: GATEWAY_OIDC_PROVIDER_LABEL
+  value: {{ .Values.switchCore.oidc.providerLabel | quote }}
+{{- with .Values.switchCore.oidc.loginOptions }}
+- name: GATEWAY_OIDC_LOGIN_OPTIONS
+  value: {{ toJson . | quote }}
+{{- end }}
+{{- if .Values.switchCore.oidc.redirectUrl }}
+- name: GATEWAY_OIDC_REDIRECT_URL
+  value: {{ .Values.switchCore.oidc.redirectUrl | quote }}
+{{- end }}
+{{- if not .Values.switchCore.oidc.requireEmailVerified }}
+- name: GATEWAY_OIDC_REQUIRE_EMAIL_VERIFIED
+  value: "false"
+{{- end }}
+{{- if not .Values.switchCore.oidc.passwordLoginEnabled }}
+- name: GATEWAY_PASSWORD_LOGIN_ENABLED
+  value: "false"
+{{- end }}
+{{- end }}
+- name: GATEWAY_SIGNUP_ENABLED
+  value: {{ .Values.switchCore.signupEnabled | quote }}
+- name: GATEWAY_SIGNUP_MAX_PER_HOUR
+  value: {{ .Values.switchCore.signupMaxPerHour | quote }}
+{{- $signupMode := .Values.switchCore.signup.mode }}
+{{- if not (has $signupMode (list "default_tenant" "invite_only" "open")) }}
+{{- fail (printf "switchCore.signup.mode must be one of default_tenant, invite_only, open. Got %q." $signupMode) }}
+{{- end }}
+- name: GATEWAY_SIGNUP_MODE
+  value: {{ $signupMode | quote }}
+- name: GATEWAY_MAX_WORKSPACES_PER_USER
+  value: {{ .Values.switchCore.signup.maxWorkspacesPerUser | quote }}
+- name: GATEWAY_TENANT_CHOICE_ENABLED
+  value: {{ .Values.switchCore.tenantChoiceEnabled | quote }}
+{{- $outboundHosts := .Values.switchCore.outbound.allowedPrivateHosts }}
+{{- if .Values.mattermost.enabled }}
+{{- $outboundHosts = append $outboundHosts (include "switch.mattermostHost" .) }}
+{{- end }}
+{{- if $outboundHosts }}
+- name: OUTBOUND_ALLOWED_PRIVATE_HOSTS
+  value: {{ join "," $outboundHosts | quote }}
+{{- end }}
+{{- with .Values.switchCore.featureFlags.enabled }}
+- name: FEATURE_FLAGS_ENABLED
+  value: {{ join "," . | quote }}
+{{- end }}
+{{- if has "follow_the_conversation" .Values.switchCore.featureFlags.enabled }}
+- name: FOLLOW_THE_CONVERSATION_WINDOW_SECONDS
+  value: {{ .Values.switchCore.followTheConversation.windowSeconds | quote }}
+{{- end }}
+{{- if not (or .Values.gateway.enabled .Values.switchCore.serveDashboard) }}
+{{- fail "gateway.enabled and switchCore.serveDashboard are both off, so nothing serves the operator dashboard. Turn one of them on." }}
+{{- end }}
+{{- with .Values.switchCore.smtp }}
+{{- if .enabled }}
+{{- if not (or $.Values.switchCore.frontendBaseUrl (and $.Values.switchCore.serveDashboard $.Values.switchCore.gatewayPublicUrl)) }}
+{{- fail "switchCore.frontendBaseUrl is required when switchCore.smtp.enabled — invitation e-mails link to the dashboard at that origin. (With switchCore.serveDashboard on, switchCore.gatewayPublicUrl does instead.)" }}
+{{- end }}
+{{- if not (has .tls (list "starttls" "tls" "none")) }}
+{{- fail (printf "switchCore.smtp.tls must be one of starttls, tls, none. Got %q." .tls) }}
+{{- end }}
+- name: GATEWAY_SMTP_HOST
+  value: {{ required "switchCore.smtp.host is required when smtp.enabled" .host | quote }}
+- name: GATEWAY_SMTP_PORT
+  value: {{ .port | quote }}
+- name: GATEWAY_SMTP_TLS
+  value: {{ .tls | quote }}
+- name: GATEWAY_SMTP_FROM
+  value: {{ required "switchCore.smtp.from is required when smtp.enabled" .from | quote }}
+- name: GATEWAY_INVITE_EMAILS_PER_DAY
+  value: {{ .emailsPerDayPerWorkspace | quote }}
+{{- if and .username .usernameFromSecret }}
+{{- fail "switchCore.smtp.username and switchCore.smtp.usernameFromSecret are mutually exclusive: set one." }}
+{{- end }}
+{{- if or .username .usernameFromSecret }}
+- name: GATEWAY_SMTP_USERNAME
+{{- if .usernameFromSecret }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" $ }}
+      key: GATEWAY_SMTP_USERNAME
+{{- else }}
+  value: {{ .username | quote }}
+{{- end }}
+- name: GATEWAY_SMTP_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" $ }}
+      key: GATEWAY_SMTP_PASSWORD
+{{- end }}
+{{- end }}
+{{- end }}
+- name: GATEWAY_COOKIE_SECURE
+  value: {{ .Values.switchCore.cookieSecure | quote }}
+- name: SWITCH_LOG_LEVEL
+  value: {{ .Values.switchCore.logLevel | default "INFO" | quote }}
+- name: LOG_FORMAT
+  value: {{ .Values.switchCore.logging.format | quote }}
+- name: LOG_LEVEL
+  value: {{ .Values.switchCore.logging.rootLevel | quote }}
+- name: TENANT_ID
+  value: {{ .Values.switchCore.logging.tenantId | quote }}
+- name: SERVICE_NAME
+  value: {{ .Values.switchCore.logging.serviceName | quote }}
+{{- with .Values.switchCore.logging.environment }}
+- name: ENVIRONMENT
+  value: {{ . | quote }}
+{{- end }}
+{{- with .Values.switchCore.observability }}
+{{- if .otlpEndpoint }}
+- name: OTLP_ENDPOINT
+  value: {{ .otlpEndpoint | quote }}
+- name: DEPLOYMENT_ID
+  value: {{ .deploymentId | quote }}
+- name: OTLP_METRICS_ENABLED
+  value: {{ .metrics | quote }}
+- name: OTLP_LOGS_ENABLED
+  value: {{ .logs | quote }}
+- name: OTLP_EXPORT_INTERVAL_SECONDS
+  value: {{ .exportIntervalSeconds | quote }}
+- name: OTLP_TIMEOUT_SECONDS
+  value: {{ .timeoutSeconds | quote }}
+{{- if $.Values.secrets.otlpHeaders }}
+- name: OTLP_HEADERS
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" $ }}
+      key: OTLP_HEADERS
+{{- end }}
+{{- end }}
+{{- end }}
+- name: TELEMETRY_ENABLED
+  value: {{ .Values.switchCore.telemetry.enabled | quote }}
+{{- if .Values.switchCore.telemetry.enabled }}
+- name: TELEMETRY_ENDPOINT
+  value: {{ .Values.switchCore.telemetry.endpoint | quote }}
+- name: TELEMETRY_SNAPSHOT_INTERVAL_HOURS
+  value: {{ .Values.switchCore.telemetry.snapshotIntervalHours | quote }}
+- name: TELEMETRY_ENVIRONMENT
+  value: {{ .Values.switchCore.telemetry.environment | quote }}
+- name: TELEMETRY_INTERNAL
+  value: {{ .Values.switchCore.telemetry.internal | quote }}
+{{- end }}
+- name: THIRD_PARTY_AVATARS_ENABLED
+  value: {{ .Values.switchCore.thirdPartyAvatars.enabled | quote }}
+# switch-core sits behind the cluster/ALB and enforces its own
+# BearerAuthMiddleware, so fastmcp's browser-oriented DNS-rebinding
+# Host/Origin guard (default-on since mcp 1.28) only rejects the
+# in-cluster Host (e.g. switch-switch-core:8000) with a 421.
+- name: FASTMCP_HTTP_HOST_ORIGIN_PROTECTION
+  value: "false"
+{{- if .Values.switchCore.frontendBaseUrl }}
+- name: FRONTEND_BASE_URL
+  value: {{ .Values.switchCore.frontendBaseUrl | quote }}
+{{- end }}
+{{- if .Values.switchCore.gatewayPublicUrl }}
+- name: GATEWAY_PUBLIC_URL
+  value: {{ .Values.switchCore.gatewayPublicUrl | quote }}
+{{- end }}
+{{- if not .Values.switchCore.serveDashboard }}
+{{- /* The image points it at its dashboard build; empty serves none. */}}
+- name: GATEWAY_UI_DIR
+  value: ""
+{{- end }}
+{{- if or .Values.switchCore.slackApp.enabled .Values.switchCore.discordApp.enabled .Values.switchCore.teamsApp.enabled .Values.switchCore.telegramApp.enabled }}
+- name: MESSAGING_PUBLIC_URL
+  value: {{ required "switchCore.messagingPublicUrl is required when a distributed messaging app is enabled" (include "switch.messagingPublicUrl" .) | quote }}
+{{- end }}
+{{- if .Values.switchCore.slackApp.enabled }}
+- name: SLACK_APP_CLIENT_ID
+  value: {{ required "switchCore.slackApp.clientId is required when switchCore.slackApp.enabled" .Values.switchCore.slackApp.clientId | quote }}
+- name: SLACK_APP_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: SLACK_APP_CLIENT_SECRET
+- name: SLACK_APP_SIGNING_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: SLACK_APP_SIGNING_SECRET
+{{- end }}
+{{- if .Values.switchCore.discordApp.enabled }}
+- name: DISCORD_APP_CLIENT_ID
+  value: {{ required "switchCore.discordApp.clientId is required when switchCore.discordApp.enabled" .Values.switchCore.discordApp.clientId | quote }}
+- name: DISCORD_APP_APPLICATION_ID
+  value: {{ required "switchCore.discordApp.applicationId is required when switchCore.discordApp.enabled" .Values.switchCore.discordApp.applicationId | quote }}
+- name: DISCORD_APP_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: DISCORD_APP_CLIENT_SECRET
+- name: DISCORD_APP_BOT_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: DISCORD_APP_BOT_TOKEN
+{{- if .Values.switchCore.discordApp.messageContent }}
+- name: DISCORD_APP_MESSAGE_CONTENT
+  value: "true"
+{{- end }}
+{{- if .Values.switchCore.discordApp.members }}
+- name: DISCORD_APP_MEMBERS
+  value: "true"
+{{- end }}
+{{- end }}
+{{- if and .Values.switchCore.teamsApp.enabled (not .omitTeamsApp) }}
+- name: TEAMS_APP_CLIENT_ID
+  value: {{ required "switchCore.teamsApp.clientId is required when switchCore.teamsApp.enabled" .Values.switchCore.teamsApp.clientId | quote }}
+- name: TEAMS_APP_TENANT_ID
+  value: {{ required "switchCore.teamsApp.tenantId is required when switchCore.teamsApp.enabled" .Values.switchCore.teamsApp.tenantId | quote }}
+- name: TEAMS_APP_PRIVACY_URL
+  value: {{ required "switchCore.teamsApp.privacyUrl is required when switchCore.teamsApp.enabled" .Values.switchCore.teamsApp.privacyUrl | quote }}
+- name: TEAMS_APP_TERMS_URL
+  value: {{ required "switchCore.teamsApp.termsUrl is required when switchCore.teamsApp.enabled" .Values.switchCore.teamsApp.termsUrl | quote }}
+{{- with .Values.switchCore.teamsApp.name }}
+- name: TEAMS_APP_NAME
+  value: {{ . | quote }}
+{{- end }}
+{{- if eq .Values.switchCore.teamsApp.credential "secret" }}
+- name: TEAMS_APP_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TEAMS_APP_CLIENT_SECRET
+{{- else if eq .Values.switchCore.teamsApp.credential "certificate" }}
+- name: TEAMS_APP_CERTIFICATE
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TEAMS_APP_CERTIFICATE
+- name: TEAMS_APP_CERTIFICATE_PRIVATE_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TEAMS_APP_CERTIFICATE_PRIVATE_KEY
+{{- else if eq .Values.switchCore.teamsApp.credential "federated" }}
+- name: TEAMS_APP_FEDERATED_TOKEN_FILE
+  value: {{ include "switch.teamsAppTokenPath" . | quote }}
+{{- else }}
+{{- fail "switchCore.teamsApp.credential must be secret, certificate or federated" }}
+{{- end }}
+- name: TEAMS_APP_NOTIFICATION_CERTIFICATE
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TEAMS_APP_NOTIFICATION_CERTIFICATE
+- name: TEAMS_APP_NOTIFICATION_PRIVATE_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TEAMS_APP_NOTIFICATION_PRIVATE_KEY
+{{- if .Values.secrets.teamsAppNotificationPreviousPrivateKey }}
+- name: TEAMS_APP_NOTIFICATION_PREVIOUS_PRIVATE_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TEAMS_APP_NOTIFICATION_PREVIOUS_PRIVATE_KEY
+{{- end }}
+{{- end }}
+{{- if .Values.switchCore.telegramApp.enabled }}
+- name: TELEGRAM_APP_BOT_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TELEGRAM_APP_BOT_TOKEN
+- name: TELEGRAM_APP_WEBHOOK_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "switch.secretName" . }}
+      key: TELEGRAM_APP_WEBHOOK_SECRET
+{{- end }}
+{{- end }}
+
+{{/*
+The one public origin every distributed messaging app is reached on. Read
+from switchCore.messagingPublicUrl, falling back to the per-app values earlier
+releases took, so an existing Slack or Discord deployment keeps working.
+*/}}
+{{- define "switch.messagingPublicUrl" -}}
+{{- coalesce .Values.switchCore.messagingPublicUrl .Values.switchCore.slackApp.messagingPublicUrl .Values.switchCore.discordApp.messagingPublicUrl | default "" -}}
+{{- end }}
+
+{{/*
+The ServiceAccount switch-core runs as. An account made elsewhere has to be
+named: falling back to `default` would quietly hand switch-core's identity,
+and whatever trusts it, to every pod in the namespace that names no account.
+*/}}
+{{- define "switch.coreServiceAccountName" -}}
+{{- $sa := .Values.switchCore.serviceAccount -}}
+{{- if $sa.name -}}
+{{- $sa.name -}}
+{{- else if $sa.create -}}
+{{- printf "%s-switch-core" (include "switch.fullname" .) -}}
+{{- else -}}
+{{- fail "switchCore.serviceAccount.name is required when switchCore.serviceAccount.create is false: name the existing ServiceAccount switch-core should run as." -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Where the projected service-account token the distributed Teams app presents
+to Microsoft (a federated credential, so no secret) is mounted.
+*/}}
+{{- define "switch.teamsAppTokenDir" -}}
+/var/run/secrets/microsoft/teams-app
+{{- end }}
+
+{{- define "switch.teamsAppTokenPath" -}}
+{{ include "switch.teamsAppTokenDir" . }}/token
+{{- end }}
+
+{{- define "switch.teamsAppFederated" -}}
+{{- if and .Values.switchCore.teamsApp.enabled (eq .Values.switchCore.teamsApp.credential "federated") }}true{{- end }}
+{{- end }}
+
+{{/*
+Wait-for init container template.
+Usage: {{ include "switch.waitFor" (dict "name" "postgres" "host" (include "switch.postgresHost" .) "port" "5432") }}
+*/}}
+{{- define "switch.waitFor" -}}
+- name: wait-for-{{ .name }}
+  image: busybox:1.36
+  command: ["sh", "-c", "until nc -z {{ .host }} {{ .port }}; do echo 'waiting for {{ .name }}...'; sleep 2; done"]
+{{- end }}
+
+{{/*
+Wait-for-http init container template.
+Usage: {{ include "switch.waitForHttp" (dict "name" "gateway" "url" "http://host:8000/health") }}
+*/}}
+{{- define "switch.waitForHttp" -}}
+- name: wait-for-{{ .name }}
+  image: busybox:1.36
+  command: ["sh", "-c", "until wget -q --spider {{ .url }}; do echo 'waiting for {{ .name }}...'; sleep 2; done"]
+{{- end }}

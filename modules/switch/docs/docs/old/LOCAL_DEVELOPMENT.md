@@ -1,0 +1,237 @@
+# Running Switch locally for development
+
+This covers the local-development path only: everything runs on your own
+machine, with hot-reload on the backend and the frontend. It's a different
+shape from the two paths the published docs cover —
+[`standalone`](../official/deploy/self-host.md) (single Docker Compose stack,
+built images, no host toolchain) and the Helm chart — so don't reach for
+those commands here; `just standalone-up` runs a whole different set of
+containers and none of what follows applies to it.
+
+Everything below is one recipe per `just` line, all defined in the root
+[`justfile`](../../justfile). Run `just` with no arguments any time to see
+the full list.
+
+## Prerequisites
+
+[Docker](https://docs.docker.com/get-docker/), [uv](https://docs.astral.sh/uv/),
+[just](https://github.com/casey/just) (`brew install just`), and Node for the
+gateway frontend.
+
+```bash
+just init-env            # first-time setup — generate .env with random secrets
+uv sync                  # install Python dependencies (core/)
+just gateway-install     # install gateway frontend deps (first time only)
+```
+
+`just init-env` copies `.env.example` to `.env` and fills every secret field
+that ships blank — `DB_PASSWORD`, `DB_OWNER_PASSWORD`,
+`AGENT_REGISTRATION_TOKEN`, `GATEWAY_ADMIN_PASSWORD`,
+`MATTERMOST_ADMIN_PASSWORD`, `MATTERMOST_USER_PASSWORD` — with a freshly
+generated `openssl rand -hex 24` value, sets `SECRET_KEYS` to one generated
+key (`local:<64 hex characters>`), then prints the gateway admin login
+it just set. The fields ship blank on purpose: it means no default
+credential (the old `admin`/`admin`) can ever reach a running stack by
+accident. The recipe refuses to touch an existing `.env`, so re-running it
+never rotates secrets out from under a stack that's already up — delete
+`.env` first if you actually want to regenerate everything. `just` loads
+`.env` automatically for every recipe below (`set dotenv-load := true` in
+the justfile), so nothing else needs to source it.
+
+An `.env` from before `SECRET_KEYS` existed makes `just run` fail at startup
+naming the missing setting. Add `SECRET_KEYS=local:$(openssl rand -hex 32)`
+(the generated value, not the command) and leave `JWT_SECRET_KEY` as it is:
+the first boot re-encrypts what it encrypted, and it keeps your current login
+valid. [key-rotation.md](key-rotation.md) explains both.
+
+### Two database roles, not one
+
+`.env` carries two sets of Postgres credentials, because row-level security
+is inert against the role that owns the tables it protects — Postgres
+exempts a table's owner from its own policies. `DB_USER` / `DB_PASSWORD` name
+the **runtime role**: a plain, unprivileged login that switch-core
+authenticates as for every request, and the one the tenant-isolation
+policies actually apply to. `DB_OWNER_USER` / `DB_OWNER_PASSWORD` name the
+**schema owner**, used for exactly two things at boot — running Alembic and
+re-issuing the runtime role's grants right after — and never to serve a
+request. `just up`'s `init-db` container creates the runtime role on a fresh
+volume; it does not grant it anything, because on a fresh volume there is
+nothing yet to grant — switch-core does that itself once the owner
+connection has migrated the schema.
+
+If you have an existing `.env` from before this split, add `DB_OWNER_USER`
+and `DB_OWNER_PASSWORD` to it and change `DB_USER` to `switch_app` (see
+`.env.example`), then run `just reset` to rebuild the Postgres volume from
+scratch — that's the clean way to get the runtime role created, since
+`init-db` only creates it on a fresh volume. Reusing an old volume with the
+new `.env` leaves the runtime role missing entirely. `just up` refuses to
+start while the two owner variables are absent, and says this, rather than
+bringing up a Postgres container with an empty `POSTGRES_USER` and leaving
+you to work backwards from whatever fails after it.
+
+Boot refuses to serve if the runtime connection turns out not to be
+restricted — a superuser, a role with `BYPASSRLS`, or the owner of a policied
+table — because that failure is silent otherwise: a deployment that believes
+it is isolating tenants and is not looks identical to one that is. Set
+`DB_REQUIRE_RESTRICTED_ROLE=false` as an escape hatch for a stack that has
+not created its runtime role yet; switch-core then logs an `error` on every
+boot instead, as a standing reminder that tenant isolation is not active.
+
+## Starting the stack
+
+```bash
+just up      # start the supporting services (Docker Compose)
+just migrate # apply database migrations
+just run     # run switch-core (:8000)
+just gateway-dev   # run the gateway frontend, in a separate terminal (:5173)
+```
+
+**`just up` starts the supporting services only**: PostgreSQL, Mattermost
+(seeded as the local collaboration bridge), and a one-shot `setup` container
+that provisions the Mattermost team/bot/admin accounts named by the
+`MATTERMOST_*` variables. It does **not** start switch-core and does **not**
+start the gateway frontend — you run both of those yourself, in their own
+terminals, so each gets hot-reload while you work. `just down` stops the
+stack; `just reset` also wipes its volumes (Postgres data included).
+
+switch-core refuses to connect to a private address at a URL a bridge config
+names, unless `OUTBOUND_ALLOWED_PRIVATE_HOSTS` lists it. The `.env.example`
+default, `localhost`, covers the local Mattermost. An `.env` from before that
+setting existed lacks it, and
+the Mattermost bridge then refuses to start with a message naming the variable:
+add the line from `.env.example`.
+
+`just migrate` runs `alembic upgrade head` against the Postgres started by
+`just up`. Run it once after the stack is up and again after pulling any
+change that adds a migration — `just run` does not apply migrations itself
+and will fail against a database that's behind.
+
+`just run` starts switch-core (`python -m switch_core.main`) on
+`SERVER_PORT` (`8000` by default). This one process is both the Agent Bridge
+API (where agents and the MCP server connect) and the gateway management API,
+mounted at `/gateway` on the same app — there is no separate backend process
+for the dashboard.
+
+### The part that's easy to miss: `just gateway-dev`
+
+**`just up` does not start the gateway frontend, and nothing warns you.**
+The operator dashboard you'd open in a browser is a separate Vite dev
+server, started with `just gateway-dev` (`cd gateway && npm run dev`), and it
+listens on **`:5173`**, not `:8000`. Forget to start it and there is simply
+nothing at `localhost:5173`; go to `localhost:8000` instead expecting a UI
+and you get switch-core's raw JSON API responses.
+
+That is a development default, not how a deployed server works. switch-core
+serves the dashboard itself, on its own port beside the API, whenever
+`GATEWAY_UI_DIR` names a built dashboard — and the server image sets it, so a
+deployed server has one address for everything. To get the same in dev, build
+the dashboard once (`cd gateway && npm run build`) and run with
+`GATEWAY_UI_DIR=gateway/dist`; Vite stays the way to work on the dashboard
+itself, because it reloads as you edit. The separate `gateway` image (an nginx
+container serving the same build and forwarding `/gateway` to switch-core)
+still works in standalone and Helm deployments, but nothing needs it any more.
+
+The Vite dev server proxies every `/gateway/*` request to
+`http://127.0.0.1:8000` (see `gateway/vite.config.ts`), so from the browser's
+point of view the dashboard and its API calls share one origin
+(`localhost:5173`) even though two separate processes are actually serving
+them. That's also why cookie-based gateway auth (including OIDC login, see
+[`GATEWAY_OIDC_SETUP.md`](GATEWAY_OIDC_SETUP.md)) just works in dev without
+any CORS configuration: as far as the browser can tell, it never left
+`:5173`.
+
+## Which URL is which
+
+| URL | What's there | Started by |
+| --- | --- | --- |
+| `http://localhost:5173` | The operator dashboard (Vite dev server). Open this in a browser. | `just gateway-dev` |
+| `http://localhost:8000` | switch-core: the Agent Bridge API, the MCP server, and the gateway management API under `/gateway/*`. Also the dashboard when `GATEWAY_UI_DIR` points at a build; otherwise JSON, not a UI. | `just run` |
+| `http://localhost:8081` | switch-core's collaboration callback listener — where Mattermost delivers a button press. Bound only once a bridge asks to be called back, so it is often not there at all. | `just run` |
+| `http://localhost:8065` | Mattermost, seeded as the local collaboration bridge. | `just up` |
+| `http://localhost:5432` | PostgreSQL. | `just up` |
+
+`FRONTEND_BASE_URL` in `.env` (default `http://localhost:5173`) tells
+switch-core where to send the browser back to after a flow that leaves the
+dashboard, such as the OIDC login redirect — it should match wherever
+`just gateway-dev` is actually listening.
+
+## Connecting Switch Console to your local server
+
+Switch Console (the desktop app) connects to a Switch server by one address:
+switch-core's. In local dev that is **`http://localhost:8000`**. Console
+writes it into each connected agent's own config as the endpoint it
+registers against (the Agent Bridge / MCP surface), calls the gateway
+management API under `/gateway/*` on it (signing in, listing agents and
+rooms, the reachability check), and opens dashboard pages on it — the
+**Open** button under "Full admin interface", and links to rooms and agents.
+
+Those dashboard pages are the one thing that needs more than `just run`:
+switch-core serves them only when `GATEWAY_UI_DIR` names a built dashboard
+(see above). Without it, everything else works and the **Open** button loads
+a bare JSON response instead of the admin UI. Either run with
+`GATEWAY_UI_DIR=gateway/dist` after building the dashboard, or open the Vite
+dev server at `localhost:5173` in a browser yourself.
+
+If you paste `http://localhost:5173` by mistake, Console refuses it when you
+save, because it answers with a web page rather than the API.
+
+In Switch Console, add a server, choose **Connect to an existing server**,
+and enter `http://localhost:8000`.
+
+A server saved by an older Console with two addresses keeps working: its API
+address became its one address, and the old Gateway URL is kept, out of
+sight, for opening dashboard pages until the server serves its own dashboard
+and the old address stops answering.
+
+## A local Switch Cloud
+
+A shared deployment runs whatever was last deployed to it, which is often
+older than the branch you are testing. Switch Console can instead treat a
+server run from your checkout as **Switch Cloud**, so the first-run Cloud
+path, invite links and invitation e-mails can all be tried against your
+code:
+
+```bash
+just up                  # Postgres and the rest, as usual
+just local-cloud         # switch-core on :8000, plus a mail catcher
+just local-cloud-console # the Console, with Switch Cloud at http://localhost:8000
+```
+
+- **Sign-in** is by password. The gateway admin from `.env` works, and
+  `just local-cloud-user <email> "<name>" <password>` adds more accounts.
+  Every account made this way joins the admin's workspace; create another
+  workspace in the Console to invite people into, or to open to a domain.
+- **Invitation e-mails** are sent to Mailpit, which keeps them rather than
+  delivering them: read them at `http://localhost:8025`. Their links point at
+  `http://localhost:8000`, so pasting one into the Console's "Paste your
+  invite link" finds the local Cloud. That comes from `FRONTEND_BASE_URL`,
+  which `just local-cloud` sets to `:8000`. The dashboard's own links follow
+  it, so they open switch-core's JSON rather than the dashboard unless
+  switch-core is serving it: build it (`just gateway-build`) and run
+  `GATEWAY_UI_DIR=gateway/dist just local-cloud`, and they open the dashboard
+  on `:8000`, as they do on a deployed Cloud.
+- **Joining by domain** is offered only for the domain of the admin's own
+  address: `switch.local` for the default admin. Give test accounts
+  addresses there.
+- **The Cloud address** must be https, except for `localhost`, `127.0.0.1`
+  and `[::1]`, which may be plain http for exactly this. The Console matches
+  its Switch Cloud entry by address, so an install that has signed in to the
+  real Cloud gets a second "Switch Cloud" server for the local one rather
+  than reusing it.
+- **The Console's data** (servers, sign-ins, its database) lives in its own
+  directory, `switchdash-local-cloud` under the system's app-data folder,
+  rather than the one every other dev build shares. Branches that number
+  their migrations differently cannot break each other's database this
+  way. Delete that directory to start the Console from scratch.
+
+## Other useful recipes
+
+| Command | What it does |
+| --- | --- |
+| `just local-cloud` / `just local-cloud-console` | Run switch-core as a stand-in for Switch Cloud, and the Console pointed at it (see above) |
+| `just format` / `just check` | Format with ruff / lint-check in CI mode (no changes) |
+| `just typecheck` | mypy over `core/switch_core/` |
+| `just test` / `just test -k name` | Run the test suite / a single test |
+| `just test-integration` | Integration tests against a real Postgres via testcontainers |
+| `just migration "message"` | Autogenerate a new Alembic migration |
+| `just gateway-build` | Build the gateway frontend's production bundle |

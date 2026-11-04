@@ -1,0 +1,116 @@
+import z from 'zod';
+import { hostDependencyCapability } from '../../host-dependencies/capability';
+import { createPluginFramework } from '../../lib/plugins/framework';
+import { iconAsset } from './assets/icon';
+import { autoApproveCapability } from './capabilities/auto-approve';
+import { effortCapability } from './capabilities/effort';
+import { mcpCapability } from './capabilities/mcp';
+import { modelsCapability } from './capabilities/models';
+import { pluginsCapability } from './capabilities/plugins';
+import { promptCapability } from './capabilities/prompt';
+import { repoAgentsCapability } from './capabilities/repo-agents';
+import { sessionsCapability } from './capabilities/sessions';
+
+export const PLUGIN_CAPABILITIES = {
+  autoApprove: autoApproveCapability,
+  effort: effortCapability,
+  hostDependency: hostDependencyCapability,
+  mcp: mcpCapability,
+  models: modelsCapability,
+  plugins: pluginsCapability,
+  prompt: promptCapability,
+  sessions: sessionsCapability,
+  repoAgents: repoAgentsCapability,
+} as const;
+
+export type Capabilities = typeof PLUGIN_CAPABILITIES;
+
+export const PLUGIN_ASSETS = {
+  icon: iconAsset,
+} as const;
+
+export type Assets = typeof PLUGIN_ASSETS;
+
+const metadataSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  websiteUrl: z.string(),
+  compatibleVersions: z.string().optional(),
+  /**
+   * What to tell someone to install, where the product name alone would be
+   * ambiguous ("Cursor CLI" rather than the editor). Defaults to `name`.
+   */
+  cliLabel: z.string().optional(),
+  /**
+   * The Switch gateway's known-agent type for this provider, sent when an agent
+   * registers. Must be a key the gateway's known-agent list accepts. Defaults to
+   * `id`.
+   */
+  knownAgentType: z.string().optional(),
+  /**
+   * Whether starting a session may sign the CLI in — opening a browser when it
+   * holds no usable token. Listing a provider's models starts a session, so
+   * when this is set the app asks the read-only sign-in check first and lists
+   * models only once that says signed in. Defaults to false.
+   */
+  sessionStartMaySignIn: z.boolean().optional(),
+});
+
+export type CLIAgentPluginMetadata = z.infer<typeof metadataSchema>;
+
+export const { definePlugin, registerPluginBehavior } = createPluginFramework(
+  PLUGIN_CAPABILITIES,
+  metadataSchema,
+  PLUGIN_ASSETS
+);
+
+export type CLIAgentPluginDefinition = ReturnType<typeof definePlugin>;
+export type CLIAgentPluginProvider = ReturnType<typeof registerPluginBehavior>;
+
+export type { AgentIconAsset, AgentIconVariant } from './assets/icon';
+
+// Convenience re-exports for impl packages
+export type { AgentCommand, CommandContext } from './capabilities/prompt';
+export type { PluginFs } from '../runtime/fs';
+// Capability behavior interfaces — needed for dts portability
+export type { IHostDependencyBehavior } from '../../host-dependencies/capability';
+export type {
+  IMcpBehavior,
+  LaunchProfileHostExec,
+  LaunchProfileModel,
+  McpServerRegistration,
+  SwitchLaunchProfile,
+  SwitchLaunchProfileFile,
+  SwitchLaunchSpecialization,
+} from './capabilities/mcp';
+export {
+  LAUNCH_PROFILE_HOME_PLACEHOLDER,
+  resolveLaunchProfileEnv,
+  resolveLaunchProfileHome,
+} from './capabilities/mcp';
+export type { IPlugins, PluginScope } from './capabilities/plugins';
+export type { ISessionsBehavior } from './capabilities/sessions';
+export {
+  RECOGNISED_SWITCH_TOOL_RULES,
+  SWITCH_AGENT_SETTINGS_DIR,
+  SWITCH_TOOL_RULES,
+} from './capabilities/repo-agents';
+export type {
+  AdvancedSettingKind,
+  AdvancedSettings,
+  IRepoAgentsBehavior,
+  LocalRepoAgent,
+  RepoAgentAttributes,
+  RepoAgentLaunchDefinition,
+  RepoAgentAttributeValue,
+  RepoAgentDefinition,
+  RepoAgentField,
+  RepoAgentFieldCatalogue,
+  RepoAgentFieldOption,
+  RepoAgentFieldType,
+  RepoAgentsDescriptor,
+} from './capabilities/repo-agents';
+
+// Typed registry factory
+export { createPluginRegistry } from '../../lib/plugins/registry';

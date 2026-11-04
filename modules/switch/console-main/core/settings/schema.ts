@@ -1,0 +1,170 @@
+import z from 'zod';
+import { BROWSER_ISOLATED_PROFILE_ID } from '@shared/browser';
+import { isValidProviderId } from '@shared/core/providers/agent-provider-registry';
+import type { AppSettingsKeyName } from '@shared/core/settings/setting-keys';
+import { openInAppIdSchema } from '@shared/openInApps';
+import { DEFAULT_AGENT_ID } from './settings-registry';
+
+export const localLocationSettingsSchema = z.object({
+  defaultLocationsDirectory: z.string(),
+  defaultWorktreeDirectory: z.string(),
+  writeAgentConfigToGitIgnore: z.boolean(),
+});
+
+export const notificationSettingsSchema = z.object({
+  enabled: z.boolean(),
+  sound: z.boolean(),
+  customSoundPath: z.string(),
+  soundFocusMode: z.enum(['always', 'unfocused']),
+});
+
+export const sessionSettingsSchema = z.object({
+  autoGenerateName: z.boolean(),
+  autoTrustWorktrees: z.boolean(),
+  preserveNameCapitalization: z.boolean(),
+});
+
+export const themeSchema = z
+  .enum(['emlight', 'emdark'])
+  .nullable()
+  .catch(null)
+  .optional()
+  .default(null);
+
+export const defaultAgentSchema = z
+  .optional(
+    z.string().refine((id) => isValidProviderId(id), { message: 'Unknown agent provider.' })
+  )
+  .default(DEFAULT_AGENT_ID);
+
+/**
+ * Per-provider execution settings stored as host-agnostic overrides.
+ * Installation source/path/cli overrides are now stored host-specifically
+ * in the HostDependencyStore (KV for local, SSH connection metadata for remote).
+ */
+export const providerCustomConfigEntrySchema = z.object({
+  extraArgs: z.string().optional(),
+  env: z.record(z.string(), z.string()).optional(),
+});
+
+export const providerConfigDefaults: Record<string, unknown> = {};
+
+export const interfaceSettingsSchema = z.object({
+  sessionHoverAction: z.enum(['delete', 'archive']),
+  autoRightSidebarBehavior: z.boolean(),
+});
+
+export const changesViewModeSchema = z.object({
+  unstaged: z.enum(['flat', 'tree']),
+  staged: z.enum(['flat', 'tree']),
+  pr: z.enum(['flat', 'tree']),
+});
+
+export const browserPreviewSettingsSchema = z.object({ enabled: z.boolean() });
+
+export const browserProfileIdSchema = z
+  .string()
+  .regex(/^[a-z0-9][a-z0-9-]{0,63}$/)
+  .refine((value) => value !== BROWSER_ISOLATED_PROFILE_ID);
+
+export const browserSettingsSchema = z
+  .object({
+    defaultProfileId: z.union([browserProfileIdSchema, z.literal(BROWSER_ISOLATED_PROFILE_ID)]),
+    relaxCorsForLocalhost: z.boolean(),
+    profiles: z
+      .array(
+        z.object({
+          id: browserProfileIdSchema,
+          name: z.string().trim().min(1).max(40),
+        })
+      )
+      .min(1),
+  })
+  .refine(
+    (settings) =>
+      new Set(settings.profiles.map((profile) => profile.id)).size === settings.profiles.length
+  )
+  .refine(
+    (settings) =>
+      settings.defaultProfileId === BROWSER_ISOLATED_PROFILE_ID ||
+      settings.profiles.some((profile) => profile.id === settings.defaultProfileId)
+  );
+
+/**
+ * Whether the user lets the app send anonymous usage data, and when they were
+ * asked.
+ *
+ * `enabled` defaults to on, and is the whole of the answer: see
+ * `isTelemetryAllowed` in `@main/core/telemetry/consent`, which is the only
+ * supported way to read this setting before emitting.
+ *
+ * `askedAt` is null until the user has acknowledged the first-run notice, and
+ * decides only whether that notice still needs showing. It does not gate
+ * sending.
+ */
+export const telemetrySettingsSchema = z.object({
+  enabled: z.boolean(),
+  askedAt: z.number().nullable(),
+});
+
+export const openInSettingsSchema = z.object({
+  default: openInAppIdSchema,
+});
+
+/**
+ * Whether the first-run setup checklist is shown (CHOO-2022).
+ *
+ * Dismissing the checklist with its ✕ clears this, and the Settings toggle is
+ * the way back — a dismissal that could not be undone would make the checklist
+ * a one-shot, which is the wrong shape for something a user may dismiss before
+ * they know what it was.
+ */
+export const onboardingSettingsSchema = z.object({
+  showChecklist: z.boolean(),
+});
+
+export const APP_SETTINGS_SCHEMA_MAP = {
+  localLocation: localLocationSettingsSchema,
+  sessions: sessionSettingsSchema,
+  defaultAgent: defaultAgentSchema,
+  notifications: notificationSettingsSchema,
+  theme: themeSchema,
+  openIn: openInSettingsSchema,
+  interface: interfaceSettingsSchema,
+  browserPreview: browserPreviewSettingsSchema,
+  browser: browserSettingsSchema,
+  changesViewMode: changesViewModeSchema,
+  onboarding: onboardingSettingsSchema,
+  telemetry: telemetrySettingsSchema,
+} as const;
+
+/**
+ * The schema map and the shared list of setting names say the same thing.
+ *
+ * The list is what a setting change is reported against and cannot import this
+ * file. Asserted both ways, so adding a group without naming it there — or
+ * leaving a name behind after removing one — fails to compile.
+ */
+const _settingKeysAreExhaustive: AppSettingsKeyName extends keyof typeof APP_SETTINGS_SCHEMA_MAP
+  ? true
+  : never = true;
+const _settingKeysAreComplete: keyof typeof APP_SETTINGS_SCHEMA_MAP extends AppSettingsKeyName
+  ? true
+  : never = true;
+void _settingKeysAreExhaustive;
+void _settingKeysAreComplete;
+
+export const appSettingsSchema = z.object({
+  localLocation: localLocationSettingsSchema,
+  sessions: sessionSettingsSchema,
+  defaultAgent: defaultAgentSchema,
+  notifications: notificationSettingsSchema,
+  theme: themeSchema,
+  openIn: openInSettingsSchema,
+  interface: interfaceSettingsSchema,
+  browserPreview: browserPreviewSettingsSchema,
+  browser: browserSettingsSchema,
+  changesViewMode: changesViewModeSchema,
+  onboarding: onboardingSettingsSchema,
+  telemetry: telemetrySettingsSchema,
+});

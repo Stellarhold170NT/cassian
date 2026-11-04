@@ -1,0 +1,20 @@
+{
+  "name": "@switch-console/tooling-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end harness for Switch: a provider-free fast lane over plain HTTP, and a provider lane that drives real agent sessions through Switch Console.",
+  "scripts": {
+    "test": "vitest run",
+    "test:e2e": "vitest run",
+    "cleanup": "node --experimental-strip-types src/cleanup.ts",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p src/explore/spec"
+  },
+  "devDependencies": {
+    "@antithesishq/bombadil": "0.7.10",
+    "playwright": "1.60.0",
+    "typescript": "^5.9.2",
+    "vitest": "^5.0.1",
+    "yaml": "2.9.0"
+  }
+}

@@ -1,0 +1,136 @@
+import { describe, expect, it } from 'vitest';
+import {
+  flintEnvFor,
+  resolveTelemetryEnvironment,
+  sameMachineServerTelemetryEndpointFor,
+  TELEMETRY_RELAY_ENDPOINT,
+  TELEMETRY_RELAY_ORIGIN,
+  type TelemetryBuildChannel,
+  type TelemetryEnvironment,
+} from './config';
+
+function resolve(
+  build: TelemetryBuildChannel,
+  env: TelemetryEnvironment['env'] = {},
+  release = build !== 'dev'
+) {
+  return resolveTelemetryEnvironment({ build, release, env });
+}
+
+describe('a dev run', () => {
+  it('is off until a developer opts in', () => {
+    expect(resolve('dev')).toEqual({ enabled: false, reason: 'dev_build' });
+  });
+
+  it('reports to the relay once opted in', () => {
+    expect(resolve('dev', { SWITCHDASH_TELEMETRY_DEV: '1' })).toEqual({
+      enabled: true,
+      config: { endpoint: TELEMETRY_RELAY_ENDPOINT, build: 'dev', flintEnv: 'local' },
+    });
+  });
+
+  it('can be pointed at a local listener, so what it sends can be watched', () => {
+    const resolution = resolve('dev', {
+      SWITCHDASH_TELEMETRY_DEV: '1',
+      SWITCHDASH_TELEMETRY_ENDPOINT: 'http://127.0.0.1:9009',
+    });
+
+    expect(resolution.enabled && resolution.config.endpoint).toBe('http://127.0.0.1:9009');
+  });
+
+  it('ignores a blank override rather than posting nowhere', () => {
+    const resolution = resolve('dev', {
+      SWITCHDASH_TELEMETRY_DEV: '1',
+      SWITCHDASH_TELEMETRY_ENDPOINT: '   ',
+    });
+
+    expect(resolution.enabled && resolution.config.endpoint).toBe(TELEMETRY_RELAY_ENDPOINT);
+  });
+});
+
+describe.each(['stable', 'canary'] as const)('a %s build', (build) => {
+  it('reports to the relay, with nothing to configure', () => {
+    // The relay holds the vendor keys, so unlike the direct-to-Amplitude shape
+    // this replaced, there is no build that is inert for want of a key.
+    expect(resolve(build)).toEqual({
+      enabled: true,
+      config: {
+        endpoint: TELEMETRY_RELAY_ENDPOINT,
+        build,
+        flintEnv: build === 'canary' ? 'staging' : 'prod',
+      },
+    });
+  });
+
+  it('cannot be redirected away from the relay', () => {
+    // Otherwise anything able to set a variable before launch — a shell
+    // profile, a launch script, an MDM policy — could collect a consenting
+    // user's events somewhere of its own.
+    const resolution = resolve(build, {
+      SWITCHDASH_TELEMETRY_ENDPOINT: 'http://somewhere.example',
+    });
+
+    expect(resolution.enabled && resolution.config.endpoint).toBe(TELEMETRY_RELAY_ENDPOINT);
+  });
+
+  it('ignores the dev opt-in switch', () => {
+    const resolution = resolve(build, { SWITCHDASH_TELEMETRY_DEV: '1' });
+
+    expect(resolution.enabled && resolution.config.build).toBe(build);
+  });
+});
+
+describe('the Amplitude project a build reports to', () => {
+  // The relay files each event under the project its flint_env names, so only a
+  // released stable build's events are production's.
+  it.each([
+    ['stable', true, 'prod'],
+    ['canary', true, 'staging'],
+    ['stable', false, 'dev'],
+    ['canary', false, 'dev'],
+    ['dev', false, 'local'],
+    ['dev', true, 'local'],
+  ] as const)('is %s, released %s → %s', (build, release, environment) => {
+    expect(flintEnvFor({ build, release })).toBe(environment);
+  });
+
+  it('is carried in the resolved config, so every event of a build agrees', () => {
+    const resolution = resolve('stable', {}, false);
+
+    expect(resolution.enabled && resolution.config.flintEnv).toBe('dev');
+  });
+});
+
+describe('where a server on this machine sends its usage', () => {
+  it('is the relay the app reports to, as the base the server appends its path to', () => {
+    expect(sameMachineServerTelemetryEndpointFor(resolve('stable'))).toBe(TELEMETRY_RELAY_ORIGIN);
+    expect(TELEMETRY_RELAY_ENDPOINT).toBe(`${TELEMETRY_RELAY_ORIGIN}/v1/logs`);
+  });
+
+  it('follows a dev run pointed at a local listener, path and all dropped', () => {
+    const resolution = resolve('dev', {
+      SWITCHDASH_TELEMETRY_DEV: '1',
+      SWITCHDASH_TELEMETRY_ENDPOINT: 'http://127.0.0.1:9009/v1/logs',
+    });
+    expect(sameMachineServerTelemetryEndpointFor(resolution)).toBe('http://127.0.0.1:9009');
+  });
+
+  it('gives up a listener no server could post to, for the caller to replace', () => {
+    for (const listener of [
+      '127.0.0.1:9009/v1/logs',
+      'localhost:9009',
+      'not a url',
+      'ftp://x.test',
+    ]) {
+      const resolution = resolve('dev', {
+        SWITCHDASH_TELEMETRY_DEV: '1',
+        SWITCHDASH_TELEMETRY_ENDPOINT: listener,
+      });
+      expect(sameMachineServerTelemetryEndpointFor(resolution)).toBeNull();
+    }
+  });
+
+  it('still names the relay for a build that sends nothing itself', () => {
+    expect(sameMachineServerTelemetryEndpointFor(resolve('dev'))).toBe(TELEMETRY_RELAY_ORIGIN);
+  });
+});

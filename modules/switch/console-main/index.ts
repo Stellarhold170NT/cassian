@@ -1,0 +1,366 @@
+import './app/configure-app-identity';
+// Installs the agent provider catalogue before any module that reads it loads.
+import './core/providers/plugin-registry';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { config as dotenvConfig } from 'dotenv';
+import { app, BrowserWindow, dialog, ipcMain, powerMonitor } from 'electron';
+import dockIcon from '@/assets/images/switch-console/icon-dock.png?asset';
+import { PRODUCT_NAME } from '@shared/app-identity';
+import { registerRPCRouter } from '@shared/lib/ipc/rpc';
+import { deeplinkFromArgv, flushPendingDeeplink, setupDeeplinks } from './app/deeplinks';
+import { setupApplicationMenu } from './app/menu';
+import { APP_ORIGIN, registerAppScheme, setupAppProtocol } from './app/protocol';
+import { LaunchesWhileQuitting } from './app/relaunch-on-quit';
+import { createMainWindow, getMainWindow } from './app/window';
+import { startAutoMigration, stopAutoMigration } from './core/agent-migration/agent-migration';
+import { bridgeAgentEventsToRenderer } from './core/agents/agent-events-renderer-bridge';
+import { setAgentStorageMigrationReady } from './core/agents/agent-storage-migration-ready';
+import { migrateAgentStorage } from './core/agents/migrate-agent-storage';
+import { initializeRemoteDiscovery, initializeRemoteWatchers } from './core/agents/remote-watcher';
+import { appService } from './core/app/service';
+import { controlService } from './core/control-api/control-service';
+import { localDependencyManager } from './core/dependencies/dependency-managers';
+import { embeddedControllerService } from './core/embedded-controller/embedded-controllers';
+import { featureFlagsService } from './core/feature-flags/feature-flags';
+import { locationManager } from './core/locations/location-manager';
+import { locationSettingsService } from './core/locations/settings/location-settings-service';
+import { deleteUnusedLocations } from './core/locations/store';
+import { localServerService } from './core/managed-switch-server/local-server-service';
+import { remoteServerService } from './core/managed-switch-server/remote-server-service';
+import { serverVersionChoice } from './core/managed-switch-server/server-version';
+import { initializeHostReachability } from './core/remote-hosts/host-reachability-startup';
+import { hostReachabilityService } from './core/remote-hosts/production-host-reachability';
+import {
+  reconcileResourceSampler,
+  stopResourceSampler,
+} from './core/resource-monitor/resource-sampler';
+import { reapDetachedLocalWatchers } from './core/sdk-host/reap-local-hosts';
+import { searchService } from './core/search/search-service';
+import { appSettingsService } from './core/settings/settings-service';
+import { sshConnectionManager } from './core/ssh/lifecycle/production-ssh-connection-manager';
+import { autoSessionWatcher } from './core/switch-rooms/auto-session-watcher';
+import { retireDashboardFallbacks } from './core/switch-servers/server-address';
+import { currentInternalFlag } from './core/telemetry/internal-account';
+import { readThisLaunch, reportLaunch } from './core/telemetry/launch-history';
+import { registerTelemetryListeners } from './core/telemetry/telemetry-listeners';
+import { telemetryService } from './core/telemetry/telemetry-service';
+import { updateService } from './core/updates/update-service';
+import { viewStateService } from './core/view-state/view-state-service';
+import { reconcileAllWorkspaces } from './core/workspaces/reconcile-workspaces';
+import { initializeDatabase } from './db/initialize';
+import { databaseOpenFailureDialog } from './db/open-failure-dialog';
+import { logAppExit, logAppStart, registerAppDiagnostics } from './lib/app-diagnostics';
+import {
+  getLogFilePath,
+  initializeFileLogger,
+  registerProcessErrorLogging,
+  registerRendererLogHandler,
+} from './lib/file-logger';
+import { registerLogEnrichment } from './lib/log-enrichment';
+import { log } from './lib/logger';
+import { withRPCLogContext } from './lib/rpc-logging';
+import { rpcRouter } from './rpc';
+import { ensureUserBinDirsInPath, resolveUserEnv } from './utils/userEnv';
+
+if (import.meta.env.DEV) {
+  dotenvConfig({ path: '.env.local', override: false });
+}
+
+// A SWITCH_CONSOLE_SERVER_VERSION this run cannot honour stops the launch here,
+// naming the variable, rather than leaving managed servers on another version.
+serverVersionChoice();
+
+const LOCAL_HOST_SHUTDOWN_MS = 5000;
+
+if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('ozone-platform-hint', 'auto');
+}
+
+registerAppScheme();
+setupDeeplinks();
+
+initializeFileLogger();
+registerLogEnrichment();
+registerAppDiagnostics();
+registerProcessErrorLogging(log);
+registerRendererLogHandler(ipcMain);
+logAppStart();
+
+// A launch while Console is quitting finds no window to show, and one opened
+// now would close with the exit, so Console starts again once it has quit.
+let quitting = false;
+const launchesWhileQuitting = new LaunchesWhileQuitting(deeplinkFromArgv);
+
+app.on('second-instance', (_event, commandLine) => {
+  if (quitting) {
+    launchesWhileQuitting.note(commandLine.slice(1));
+    return;
+  }
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win?.isMinimized()) win.restore();
+  win?.focus();
+});
+
+if (!import.meta.env.DEV && !app.requestSingleInstanceLock()) {
+  app.quit();
+  process.exit(0);
+}
+
+if (import.meta.env.DEV) {
+  try {
+    app.dock?.setIcon(dockIcon);
+  } catch (err) {
+    log.warn('Failed to set dock icon:', err);
+  }
+}
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createMainWindow();
+  }
+});
+
+void app.whenReady().then(async () => {
+  await resolveUserEnv();
+  ensureUserBinDirsInPath();
+
+  try {
+    await initializeDatabase();
+    searchService.initialize();
+    try {
+      await deleteUnusedLocations();
+    } catch (e: unknown) {
+      log.warn('locations: failed to delete locations no agent uses', { error: e });
+    }
+    try {
+      viewStateService.pruneOrphans();
+    } catch (e: unknown) {
+      log.warn('view-state: failed to prune orphaned entries', { error: e });
+    }
+  } catch (error) {
+    log.error('Failed to initialize database:', error);
+    const { title, body } = databaseOpenFailureDialog(
+      error,
+      PRODUCT_NAME,
+      app.getPath('userData'),
+      getLogFilePath()
+    );
+    dialog.showErrorBox(title, body);
+    app.quit();
+    return;
+  }
+
+  locationSettingsService.initialize();
+  appService.initialize();
+  await appSettingsService.initialize();
+
+  // After the settings store, which owns the consent gate every event asks
+  // before it is sent, and never before the database it is read from.
+  registerTelemetryListeners();
+  telemetryService.setInternalSource(currentInternalFlag);
+  void reportLaunch(readThisLaunch);
+
+  // Kept off the boot path: this can open an SSH/SFTP connection per remote
+  // agent, so awaiting it here delayed the window opening. Session relaunch below
+  // waits on it (it needs each agent's definitionName); nothing else does.
+  const migrationReady = migrateAgentStorage().catch((e) => {
+    log.warn('switch-agents: failed to migrate agent storage layout at boot', { error: e });
+  });
+  setAgentStorageMigrationReady(migrationReady);
+
+  controlService.initialize().catch((e) => {
+    log.error('Failed to start control API service:', e);
+  });
+
+  const rendererURL = new URL(
+    import.meta.env.DEV ? process.env.ELECTRON_RENDERER_URL! : APP_ORIGIN
+  );
+  registerRPCRouter(
+    rpcRouter,
+    ipcMain,
+    (event) => {
+      const contents = getMainWindow()?.webContents;
+      if (!contents || event.sender !== contents || event.senderFrame !== contents.mainFrame)
+        return false;
+      const senderURL = new URL(event.senderFrame.url);
+      return senderURL.protocol === rendererURL.protocol && senderURL.host === rendererURL.host;
+    },
+    withRPCLogContext
+  );
+
+  void reconcileResourceSampler();
+
+  // Reflect a managed local Switch stack that survived the last quit, so the UI
+  // shows it running without the user restarting it.
+  const localServerReady = localServerService.initialize();
+  // Re-establish desktop-side forwards for remote-managed stacks that survived
+  // the last quit, restoring their reachability from this machine.
+  const remoteServerReady = remoteServerService.initialize();
+
+  // A server registered before its account's memberships were known carries one
+  // tenant-less workspace; this is what gives it its tenant, and what notices a
+  // membership added or withdrawn since the last launch. It runs after the two
+  // services above because they are what make a stack that survived the last
+  // quit report itself as running — before them every managed server still
+  // looks stopped and would be passed over. Unawaited: it talks to every
+  // signed-in server, and the window must not wait on any of them.
+  void Promise.allSettled([localServerReady, remoteServerReady])
+    .then(reconcileAllWorkspaces)
+    .catch((error: unknown) => {
+      log.error('Workspace reconcile could not run; every server was left as it was:', error);
+    });
+
+  // A server registered with a separate dashboard address keeps it until the
+  // server serves its own dashboard and the old address has gone. Unawaited
+  // for the same reason as the reconcile: it asks every external server.
+  void retireDashboardFallbacks().catch((error: unknown) => {
+    log.error('Could not check which servers still need a separate dashboard address:', error);
+  });
+
+  // Each server's feature flags, read on a schedule so a redeploy that changes
+  // them reaches the window without a restart. Started once the managed stacks
+  // report themselves, for the same reason as the reconcile above.
+  void Promise.allSettled([localServerReady, remoteServerReady]).then(() =>
+    featureFlagsService.start()
+  );
+
+  const dependenciesReady = localDependencyManager.probeAll().catch((e: unknown) => {
+    log.error('Failed to probe dependencies:', e);
+  });
+
+  // Relaunch every session that was connected to a Switch room before this
+  // restart, so it resumes receiving and responding to room events without the
+  // user reopening it. Wait for the dependency probe first — a spawned session
+  // needs it to resolve its CLI.
+  // Restore first so already-live sessions register their room connections,
+  // then start the agents' controllers — the controller's "is a session already
+  // attending this room?" check relies on those connections being present.
+  void Promise.all([dependenciesReady, migrationReady]).then(async () => {
+    try {
+      bridgeAgentEventsToRenderer();
+      await initializeRemoteDiscovery();
+    } catch (e) {
+      log.error('Failed to initialise remote session discovery at startup:', e);
+    }
+    // Must precede the remote watchers: they gate on host reachability, and
+    // starting them first would let every agent on a known-down host attempt a
+    // connect before the persisted state is loaded.
+    try {
+      await initializeHostReachability();
+    } catch (e) {
+      log.error('Failed to initialise host reachability at startup:', e);
+    }
+    // Must precede the watchers: an earlier build left detached watchers behind
+    // for local agents, and one still holding a root would block the in-process
+    // watcher that replaces it.
+    try {
+      await reapDetachedLocalWatchers();
+    } catch (e) {
+      log.error('Failed to reap detached local watchers at startup:', e);
+    }
+    try {
+      await autoSessionWatcher.initialize();
+    } catch (e) {
+      log.error('Failed to initialise auto_session watcher at startup:', e);
+    }
+    try {
+      await initializeRemoteWatchers();
+    } catch (e) {
+      log.error('Failed to initialise remote watchers at startup:', e);
+    }
+    // The managed agents this computer runs for a server, through the embedded
+    // agent controller. After the dependency probe, like the watchers above:
+    // the controller resolves provider CLIs from the same environment.
+    try {
+      await embeddedControllerService.initialize();
+    } catch (e) {
+      log.error('Failed to start the embedded agent controllers at startup:', e);
+    }
+    // After the controllers: moving an agent onto this computer's controller needs it running.
+    startAutoMigration();
+  });
+
+  // A laptop waking from sleep usually has stale (frozen) SSH sockets to remote
+  // agents; refresh them immediately rather than waiting out keepalive probes,
+  // so remote sessions reconnect and re-attach on their own.
+  powerMonitor.on('resume', () => {
+    log.info('powerMonitor: system resumed — refreshing SSH connections');
+    sshConnectionManager.handleSystemResume();
+    hostReachabilityService.handleSystemResume();
+  });
+
+  setupAppProtocol(join(app.getAppPath(), 'out', 'renderer'));
+  setupApplicationMenu();
+  createMainWindow();
+  // A deeplink that launched the app (cold start) is buffered until the
+  // renderer has loaded its event subscribers, then delivered. The short delay
+  // lets React mount and attach the listener after the page finishes loading.
+  getMainWindow()?.webContents.on('did-finish-load', () => {
+    setTimeout(() => flushPendingDeeplink(), 1000);
+  });
+
+  try {
+    await updateService.initialize();
+  } catch (error) {
+    if (app.isPackaged) {
+      log.error('Failed to initialize auto-update service:', error);
+    }
+  }
+});
+
+app.on('before-quit', (event) => {
+  event.preventDefault();
+  if (quitting) return;
+  quitting = true;
+  // Installing an update quits through here too, and the installer starts the
+  // new version itself. Starting Console as well could run the old executable
+  // while it is being replaced.
+  const updaterRestarts = updateService.getState().status === 'installing';
+  logAppExit('before-quit');
+  controlService.dispose();
+  stopAutoMigration();
+  stopResourceSampler();
+  featureFlagsService.stop();
+  localServerService.dispose();
+  remoteServerService.dispose();
+  updateService.dispose();
+  void (async () => {
+    // Locally hosted watchers and sessions are Console's own children. Stop them
+    // before exiting, bounded so a stuck host cannot keep Console from quitting.
+    await Promise.all([
+      Promise.race([
+        autoSessionWatcher.dispose(),
+        delay(LOCAL_HOST_SHUTDOWN_MS).then(() =>
+          log.warn('Local SDK hosts did not stop in time; they may outlive Console.')
+        ),
+      ]).catch((e) => {
+        log.error('Failed to stop local SDK hosts:', e);
+      }),
+      // The embedded agent controllers stop, and their agents and sessions with them.
+      embeddedControllerService.dispose().catch((e) => {
+        log.error('Failed to stop the embedded agent controllers:', e);
+      }),
+    ]);
+    await locationManager.dispose().catch((e) => {
+      log.error('Failed to shutdown location manager:', e);
+    });
+    const relaunchArgs = launchesWhileQuitting.relaunchArgs();
+    if (relaunchArgs && !updaterRestarts) {
+      app.relaunch({ args: relaunchArgs });
+    } else if (relaunchArgs && launchesWhileQuitting.deeplink) {
+      // Nothing carries a deep link across a restart, so the updated Console
+      // starts without it.
+      log.warn('Dropped a deep link that arrived while Console quit to install an update', {
+        url: launchesWhileQuitting.deeplink,
+      });
+    }
+    app.exit(0);
+  })();
+});

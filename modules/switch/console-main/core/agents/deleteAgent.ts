@@ -1,0 +1,331 @@
+import { eq } from 'drizzle-orm';
+import { forgetManagedAgent } from '@main/core/agent-migration/managed-agents-store';
+import { deleteLocationIfUnused } from '@main/core/locations/store';
+import { getPlugin } from '@main/core/providers/plugin-registry';
+import { releaseHostIfUnused } from '@main/core/remote-hosts/production-host-reachability';
+import { discardControllerState } from '@main/core/sdk-host/agent-host';
+import { sessionHooks } from '@main/core/sessions/session-hooks';
+import { setControllerStopped } from '@main/core/switch-rooms/auto-session-store';
+import { autoSessionWatcher } from '@main/core/switch-rooms/auto-session-watcher';
+import {
+  deleteAgent as gatewayDeleteAgent,
+  GatewayError,
+} from '@main/core/switch-servers/gateway-client';
+import { agentTypeOf } from '@main/core/telemetry/agent-type';
+import type {
+  TelemetryAgentRemoveFailure,
+  TelemetryAgentRemoveTrigger,
+  TelemetryLocationKind,
+} from '@main/core/telemetry/events';
+import { agentRemoveTriggerOf } from '@main/core/telemetry/narrow';
+import { trackEvent } from '@main/core/telemetry/telemetry-service';
+import { viewStateService } from '@main/core/view-state/view-state-service';
+import { withWorkspaceSession } from '@main/core/workspaces/workspace-session';
+import { db } from '@main/db/client';
+import { agents, sessions } from '@main/db/schema';
+import { log } from '@main/lib/logger';
+import type { Agent } from '@shared/core/agents/agents';
+import type { Location } from '@shared/core/locations/locations';
+import { sessionRuntimeManager } from '../sessions/session-runtime-manager';
+import { agentEvents } from './agent-events';
+import { getAgentLocation } from './agent-location';
+import { resolveWorkdirFsFor } from './agent-workdir-fs';
+import { getAgentById } from './getAgentById';
+import { stopRemoteWatcher } from './remote-watcher';
+import { removeAgentLaunchProfile } from './remove-launch-profile';
+import { removeSwitchCredentials } from './remove-switch-settings';
+import { stopSharedAgentSessions } from './stop-shared-agent-sessions';
+import { agentConfigRelativePath, agentSettingsRelativePath } from './switch-settings-paths';
+
+export type DeleteAgentOptions = {
+  /**
+   * Also delete the agent's identity on the Switch server (via the gateway).
+   * When false, the agent is removed from Switch Console only; its Switch identity is
+   * left registered on the server.
+   */
+  deleteInSwitch: boolean;
+  /**
+   * Also tear down what was provisioned on disk for this agent (its
+   * `.switch/agents/<name>.json` credentials, provider definition files, launch
+   * profile) and kill its sidecar on the host. Implied by `deleteInSwitch` for
+   * a remote agent.
+   *
+   * Required with no default, because the right answer depends on who owns the
+   * on-disk state: an agent this Console created can carry its files out, but an
+   * agent merely loaded from a shared host (CHOO-2560) has credentials that
+   * belong to ANOTHER install — deleting them there is data loss on a
+   * colleague's machine. Plain remove must mirror attach's guarantee: nothing in
+   * the working directory is touched.
+   */
+  removeProvisionedFiles: boolean;
+  /**
+   * Whether a person removed this agent or a server teardown swept it up.
+   *
+   * Required, because the same function serves both: wiping a managed server
+   * deletes every agent on it one at a time, and a default here would file that
+   * as a room full of people deleting their agents at once.
+   */
+  trigger: TelemetryAgentRemoveTrigger;
+};
+
+/**
+ * The agent has no Switch identity to delete.
+ *
+ * A class rather than a message, so the reason can be reported as a code
+ * without matching on prose that a later edit would quietly change.
+ */
+class AgentNotLinkedToSwitchError extends Error {}
+
+/** What went wrong, as a code taken from the error's own type. */
+function removeFailureReason(error: unknown): TelemetryAgentRemoveFailure {
+  if (error instanceof AgentNotLinkedToSwitchError) return 'not_linked_to_switch';
+  if (error instanceof GatewayError) return `gateway_${error.kind}`;
+  return 'error';
+}
+
+/** Where the agent runs, from a row already read. `unknown` when it has gone. */
+function locationKindOfRow(location: Location | null): TelemetryLocationKind {
+  if (!location) return 'unknown';
+  return location.sshHost ? 'remote' : 'local';
+}
+
+/**
+ * Delete this agent's own identity on the Switch server — and ONLY this one.
+ *
+ * Switch Console agents are flat: a directory is a container of independent agents
+ * with no parent/child hierarchy (CHOO-1440), so deleting one never affects any
+ * other agent, even a sibling in the same directory. (Legacy agents may still
+ * carry a gateway parent/child link from the old subagent model; we deliberately
+ * do not follow it — deleting a former "parent" simply orphans those links, it
+ * must not cascade-delete the other agents.) Runs before any local teardown so a
+ * gateway failure surfaces loudly and aborts the delete with local state intact,
+ * rather than leaving the row gone but the Switch identity orphaned.
+ */
+async function deleteAgentInSwitch(agent: Agent): Promise<void> {
+  const { workspaceId, switchAgentId } = agent;
+  if (!workspaceId || !switchAgentId) {
+    throw new AgentNotLinkedToSwitchError(
+      `Agent ${agent.id} is not linked to a Switch workspace, so it cannot be deleted in Switch.`
+    );
+  }
+
+  await withWorkspaceSession(workspaceId, async (server) => {
+    try {
+      await gatewayDeleteAgent(server, switchAgentId);
+    } catch (error) {
+      // Already gone on the server (an old identity, or a server since reset): the
+      // local delete still has to happen, or the agent can never be removed.
+      if (!(error instanceof GatewayError && error.kind === 'http' && error.status === 404)) {
+        throw error;
+      }
+      log.warn('deleteAgent: the Switch identity was already gone', {
+        agentId: agent.id,
+        switchAgentId,
+      });
+    }
+  });
+}
+
+/**
+ * Reverse the on-disk state Switch Console provisioned for this one agent: its
+ * per-agent Switch credentials, its config file, and any provider definition
+ * (`.claude/agents/<name>.md`) an earlier version wrote. Runs against the agent's local dir or its remote SSH host
+ * transparently. Only THIS agent's files are removed — sibling agents sharing the
+ * directory are untouched (CHOO-1440).
+ *
+ * Best-effort: a working directory that is gone or a host that is unreachable
+ * should not block removing the agent from Switch Console, so failures are logged
+ * (visibly) rather than thrown — the credentials being torn down are already dead.
+ */
+async function removeProvisionedFiles(agent: Agent, location: Location): Promise<void> {
+  const ctx = await resolveWorkdirFsFor(location.sshHost, location.dir);
+  try {
+    const behavior = getPlugin(agent.providerId).behavior.repoAgents;
+    if (behavior && agent.name) {
+      await behavior.removeLocal(ctx.fs, agent.name).catch((error) => {
+        log.warn('deleteAgent: failed to remove agent definition files', {
+          agentId: agent.id,
+          name: agent.name,
+          error: String(error),
+        });
+      });
+    }
+    // The per-agent credentials are written for every provider, so they are
+    // removed for every provider — a provider without repo-agent definitions has
+    // no `removeLocal` to carry the token file out with it.
+    //
+    // Isolated like `removeLocal` above: each teardown step must run even if an
+    // earlier one fails, or one unwritable file leaves the rest of the agent's
+    // credentials behind.
+    await ctx.fs.delete(agentSettingsRelativePath(agent.name ?? agent.id)).catch((error) => {
+      log.warn('deleteAgent: failed to remove the per-agent Switch credentials', {
+        agentId: agent.id,
+        name: agent.name,
+        error: String(error),
+      });
+    });
+    // The config file goes too: an agent created later under the same name must
+    // start from what it was created with, not from this one's settings.
+    await ctx.fs.delete(agentConfigRelativePath(agent.name ?? agent.id)).catch((error) => {
+      log.warn('deleteAgent: failed to remove the agent config file', {
+        agentId: agent.id,
+        name: agent.name,
+        error: String(error),
+      });
+    });
+    await removeSwitchCredentials(ctx.fs, agent.switchAgentId);
+    // A provider that registers the Switch server itself (Codex) leaves a
+    // per-agent launch profile under the user's home — a different scope than
+    // ctx.fs, reached through its own home filesystem (local or remote).
+    await removeAgentLaunchProfile(agent, location, agent.name ?? agent.id);
+  } finally {
+    ctx.close();
+  }
+}
+
+/**
+ * Delete an agent — the one real delete entry point (the sidebar's Remove
+ * Agent routes here). Tears down everything a bare row delete would leak:
+ *
+ * 1. The agent's own identity on the Switch server (never any other agent) —
+ *    only when `deleteInSwitch` is set (the opt-in "also delete in Switch").
+ * 2. The agent's running sessions (runtime + view-state), which previously
+ *    only the location-delete path handled.
+ * 3. Its local controller and the state that controller left behind. The controller caches the agent's Switch
+ *    credentials in memory, so without an explicit stop it keeps heartbeating
+ *    and answering rooms for an agent that no longer exists. A controller on a
+ *    remote host is stopped and discarded only for a full cleanup — see 4.
+ * 4. Only when `removeProvisionedFiles` or `deleteInSwitch` is set: the remote
+ *    controller and its state, and (for `removeProvisionedFiles`, or a remote
+ *    agent deleted in Switch) the Switch credentials + definition file
+ *    provisioned on disk for THIS agent and its sidecar. A plain remove leaves the working directory and the host's
+ *    processes untouched — on a shared host they may belong to another install
+ *    (CHOO-2560). Sibling agents' files are never touched either way.
+ *
+ * The agent's location row goes with its last agent (its directory never
+ * does); a location other agents still use is kept. A remote host nothing
+ * uses any more stops being probed.
+ */
+export async function deleteAgent(agentId: string, options: DeleteAgentOptions): Promise<void> {
+  const agent = await getAgentById(agentId);
+  const location = agent ? await getAgentLocation(agent).catch(() => null) : null;
+  // Captured before the row goes: after the delete below there is nothing left
+  // to describe what was removed.
+  const shape = {
+    agent_type: agent ? agentTypeOf(agent.providerId) : ('unknown' as const),
+    location: locationKindOfRow(location),
+    delete_in_switch: options.deleteInSwitch,
+    trigger: agentRemoveTriggerOf(options.trigger),
+  };
+
+  try {
+    await removeAgent(agentId, agent, location, options);
+  } catch (error) {
+    trackEvent('agent_removed', {
+      ...shape,
+      outcome: 'failure',
+      failure_reason: removeFailureReason(error),
+    });
+    throw error;
+  }
+  trackEvent('agent_removed', { ...shape, outcome: 'success', failure_reason: 'none' });
+}
+
+async function removeAgent(
+  agentId: string,
+  agent: Agent | undefined,
+  location: Location | null,
+  options: DeleteAgentOptions
+): Promise<void> {
+  // A remote agent deleted in Switch has nothing left to run, so it is removed
+  // from its host too.
+  const removeFiles =
+    options.removeProvisionedFiles || (options.deleteInSwitch && !!location?.sshHost);
+  const terminate = removeFiles || options.deleteInSwitch;
+  const stopController = () =>
+    location?.sshHost ? stopRemoteWatcher(agentId) : autoSessionWatcher.stopForAgent(agentId);
+  // Gateway cascade first: fail loud before touching local state (the controller
+  // included) so a failure leaves the agent exactly as it was.
+  if (options.deleteInSwitch && agent) {
+    await deleteAgentInSwitch(agent);
+  }
+  const stoppedUpFront = terminate && agent !== undefined;
+  if (stoppedUpFront) {
+    await stopController();
+    await stopSharedAgentSessions(agent);
+  }
+
+  const sessionRows = await db
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(eq(sessions.agentId, agentId));
+  await Promise.all(
+    sessionRows.map(async (row) => {
+      const result = await sessionRuntimeManager.teardownSession(
+        row.id,
+        terminate ? 'terminate' : 'detach'
+      );
+      if (!result.success) throw new Error('Session cleanup failed; agent removal was cancelled.');
+      await viewStateService.del(`session:${row.id}`);
+    })
+  );
+
+  // Required where it runs at all, and the last thing that may refuse — a full
+  // cleanup has already stopped the controller above, before the sessions it
+  // owns were torn down under it, so only the discard is left to do here. A
+  // controller outlives the row it is not stopped with: it holds this agent's
+  // credentials and connection and goes on answering as an agent the app says
+  // is gone, and the journal it leaves is adopted by anything later registered
+  // under the same Switch identity, which then resumes from a dead cursor.
+  // Deleting over the top of that also destroys the id needed to try again. So
+  // a failure here keeps the row — the same trade as the gateway cascade above,
+  // and the reason the files below stay best-effort: litter on an unreachable
+  // host is not a live impostor.
+  //
+  // On a remote host it runs only for a full cleanup. Controller identity is
+  // deterministic, so the process answering for this agent there may have been
+  // started by another install and won the connection, and a plain remove is
+  // this Console forgetting the agent rather than a claim over the host.
+  // Locally there is no such ambiguity: the controller is this process.
+  if (location === null || location.sshHost === null || terminate) {
+    if (!stoppedUpFront) await stopController();
+    await discardControllerState(agentId);
+  }
+
+  await setControllerStopped(agentId, false);
+
+  if (agent && location && removeFiles) {
+    await removeProvisionedFiles(agent, location).catch((error) => {
+      log.warn('deleteAgent: failed to remove provisioned files', {
+        agentId,
+        error: String(error),
+      });
+    });
+  }
+
+  // A moved agent stays managed by Switch; this Console just stops being the
+  // place it can be brought back to.
+  await forgetManagedAgent(agentId);
+  await db.delete(agents).where(eq(agents.id, agentId));
+  // The session rows go with it, by a foreign key rather than by any code here,
+  // so nothing else announces their end. Without this every session an agent
+  // owned reports a start and no finish — the row is gone and no later pass can
+  // notice it left.
+  for (const row of sessionRows) sessionHooks._emit('session:deleted', row.id);
+  agentEvents._emit('agent:deleted', agentId);
+
+  if (location) await releaseLocationIfUnused(location);
+}
+
+/** Housekeeping after the agent is gone: a failure here must not report the delete as failed. */
+async function releaseLocationIfUnused(location: Location): Promise<void> {
+  try {
+    await deleteLocationIfUnused(location.id);
+    if (location.sshHost) await releaseHostIfUnused(location.sshHost);
+  } catch (error) {
+    log.warn('deleteAgent: failed to release the unused location', {
+      locationId: location.id,
+      error: String(error),
+    });
+  }
+}

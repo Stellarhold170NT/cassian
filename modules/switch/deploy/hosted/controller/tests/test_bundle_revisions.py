@@ -1,0 +1,512 @@
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from uuid import NAMESPACE_URL, uuid5
+
+import pytest
+from test_controller import MACHINE_ID, config
+
+from switch_hosted_controller.gateway import CoreMachine, Gateway, GatewayConfig, GatewayError
+from switch_hosted_controller.model import DesiredState, ObservedState
+from switch_hosted_controller.reconciler import Reconciler
+from switch_hosted_controller.store import MachineStore
+
+VOLUME_ID = "vol-0123456789abcdef0"
+INSTANCE_ID = "i-0123456789abcdef0"
+SEAT_A = "5e1c2b4a-0000-4000-8000-0000000000a1"
+SEAT_B = "5e1c2b4a-0000-4000-8000-0000000000b1"
+CONTROLLER_A = "9a1c2b4a-0000-4000-8000-0000000000aa"
+
+
+def code(revision: int, seat: int = 0) -> str:
+    if seat == 0:
+        return f"swce_SyntheticCodeRevision{revision:04d}"
+    return f"swce_SyntheticCode{seat}Revision{revision:04d}"
+
+
+class FakeCore:
+    """Core's controller routes: one machine, a revision, and one controller per
+    seated workspace, each enrolled or with one enrollment code per revision."""
+
+    def __init__(self, machine_id: str):
+        self.machine_id = machine_id
+        self.state = "provisioning"
+        self.revision = 1
+        self.desired_state = "running"
+        self.retain_until: str | None = None
+        self.code_revision: int | None = None
+        self.seats = [SEAT_A]
+        self.codes: dict[str, tuple[int, str]] = {}
+        self.controller_ids: dict[str, str] = {}
+        self.prepared_revisions: list[int] = []
+        self.observations: list[dict] = []
+        self.prepare_failures = 0
+
+    def machine(self, revision: int | None = None) -> dict:
+        return {
+            "machine_id": self.machine_id,
+            "state": self.state,
+            "desired_state": self.desired_state,
+            "revision": self.revision if revision is None else revision,
+            "data_volume_id": None,
+            "retain_until": self.retain_until,
+            "bundle_revision": self.code_revision,
+            "owner_hint": "ignored by the controller",
+        }
+
+    def request(self, path: str, body: dict | None = None):
+        if path == "/machines":
+            return {"machines": [self.machine()], "cursor": "ignored"}
+        if path == f"/machines/{self.machine_id}/observation":
+            self.observations.append(body or {})
+            return {}
+        assert path == f"/machines/{self.machine_id}/prepare"
+        assert body == {}
+        if self.prepare_failures:
+            self.prepare_failures -= 1
+            raise GatewayError(503)
+        self.prepared_revisions.append(self.revision)
+        self.code_revision = self.revision
+        return {
+            "machine_id": self.machine_id,
+            "revision": self.revision,
+            "bundle_revision": self.revision,
+            "api_endpoint": "https://switch.example.test/agent-api",
+            "controllers": [self.controller(index, key) for index, key in enumerate(self.seats)],
+            "extra": "ignored",
+        }
+
+    def controller(self, index: int, key: str) -> dict:
+        if key in self.controller_ids:
+            return {"key": key, "id": self.controller_ids[key], "enrollment_code": None}
+        if self.codes.get(key, (None, ""))[0] != self.revision:
+            self.codes[key] = (self.revision, code(self.revision, index))
+        return {"key": key, "id": None, "enrollment_code": self.codes[key][1]}
+
+    def sleep(self) -> None:
+        self.revision += 1
+        self.desired_state = "stopped"
+
+    def wake(self) -> None:
+        self.revision += 1
+        self.desired_state = "running"
+
+
+class FakeCloud:
+    availability_zone = "us-east-1a"
+    image_id = "ami-0123456789abcdef0"
+
+    def __init__(self, store: MachineStore):
+        self.store = store
+        self.volume: dict | None = None
+        self.instance: dict | None = None
+        self.user_data: str | None = None
+        self.calls: list[str] = []
+        self.codes_at_boot: list[list[str | None]] = []
+
+    def get_volume(self, machine):
+        return self.volume
+
+    def create_volume(self, machine):
+        self.calls.append("create_volume")
+        self.volume = {
+            "VolumeId": VOLUME_ID,
+            "AvailabilityZone": self.availability_zone,
+            "State": "available",
+            "Attachments": [],
+        }
+        return VOLUME_ID
+
+    def get_instance(self, machine):
+        if (
+            machine.instance_id is None
+            and self.instance is not None
+            and self.instance["State"]["Name"] == "terminated"
+        ):
+            return None
+        return self.instance
+
+    def validate_image(self, machine):
+        pass
+
+    def validate_capacity(self):
+        pass
+
+    def _boot(self) -> None:
+        assert self.instance is not None and self.volume is not None
+        assert self.user_data is not None
+        self.codes_at_boot.append(
+            [entry["enrollmentCode"] for entry in json.loads(self.user_data)["controllers"]]
+        )
+        self.calls.append("boot")
+        self.instance["State"] = {"Name": "running"}
+        self.volume["State"] = "in-use"
+        self.volume["Attachments"] = [
+            {"InstanceId": self.instance["InstanceId"], "Device": "/dev/sdf", "State": "attached"}
+        ]
+
+    def run_instance(self, machine):
+        self.calls.append("run_instance")
+        self.user_data = machine.bundle
+        launched = self.calls.count("run_instance")
+        self.instance = {
+            "InstanceId": INSTANCE_ID if launched == 1 else f"i-{launched:017x}",
+            "BlockDeviceMappings": [
+                {
+                    "DeviceName": "/dev/sdf",
+                    "Ebs": {"VolumeId": VOLUME_ID, "DeleteOnTermination": False},
+                }
+            ],
+        }
+        self._boot()
+        return self.instance["InstanceId"]
+
+    def terminate_instance(self, machine):
+        self.calls.append("terminate_instance")
+        assert self.instance is not None and self.instance["State"]["Name"] == "stopped"
+        assert self.volume is not None
+        self.instance["State"] = {"Name": "terminated"}
+        self.volume["State"] = "available"
+        self.volume["Attachments"] = []
+        self.user_data = None
+
+    def start_instance(self, machine):
+        self.calls.append("start_instance")
+        self._boot()
+
+    def stop_instance(self, machine):
+        self.calls.append("stop_instance")
+        assert self.instance is not None
+        self.instance["State"] = {"Name": "stopped"}
+
+
+def token(machine_id: str, revision: int) -> str:
+    return str(uuid5(NAMESPACE_URL, f"{machine_id}:{revision}"))
+
+
+def harness(tmp_path):
+    cfg = config(tmp_path)
+    store = MachineStore(cfg.state_db_path, cfg.fingerprint())
+    core = FakeCore(MACHINE_ID)
+    gateway = Gateway(
+        GatewayConfig("https://switch.example.com", "SYNTHETIC-CONTROLLER", "m6i.large"),
+        cfg,
+        store,
+    )
+    gateway.request = core.request
+    return store, core, gateway
+
+
+def sync(gateway: Gateway, core: FakeCore, revision: int | None = None) -> None:
+    gateway.sync_machine(CoreMachine.parse(core.machine(revision)))
+
+
+def stored_bundle(store: MachineStore) -> dict:
+    bundle = store.get(MACHINE_ID).bundle
+    assert bundle is not None
+    return json.loads(bundle)
+
+
+def launched(tmp_path, *, instance_launch_issued: bool = False):
+    store, core, gateway = harness(tmp_path)
+    sync(gateway, core)
+    store.record_volume(MACHINE_ID, VOLUME_ID, "us-east-1a")
+    sync(gateway, core)
+    if instance_launch_issued:
+        machine = store.mark_instance_launch_intent(store.get(MACHINE_ID))
+        machine = store.mark_instance_launch_issued(machine, datetime.now(UTC))
+        store.record_instance(MACHINE_ID, INSTANCE_ID, machine.bundle)
+    assert store.get(MACHINE_ID).instance_launch_issued is instance_launch_issued
+    return store, core, gateway
+
+
+@pytest.mark.parametrize("instance_launch_issued", [False, True])
+def test_new_revision_prepares_once_and_records_its_bundle(tmp_path, instance_launch_issued):
+    store, core, gateway = launched(tmp_path, instance_launch_issued=instance_launch_issued)
+    first = token(core.machine_id, 1)
+    first_bundle = store.get(MACHINE_ID).bundle
+    assert core.prepared_revisions == [1]
+    assert store.get(MACHINE_ID).bundle_token == first
+    assert stored_bundle(store)["controllers"][0]["enrollmentCode"] == code(1)
+
+    core.revision = 2
+    sync(gateway, core)
+    sync(gateway, core)
+
+    second = token(core.machine_id, 2)
+    assert core.prepared_revisions == [1, 2]
+    bundle = stored_bundle(store)
+    assert bundle == {
+        "version": 5,
+        "installationId": "test-installation",
+        "machineId": MACHINE_ID,
+        "dataVolumeId": VOLUME_ID,
+        "apiEndpoint": "https://switch.example.test/agent-api",
+        "controllers": [{"key": SEAT_A, "id": None, "enrollmentCode": code(2)}],
+    }
+    machine = store.get(MACHINE_ID)
+    assert machine.required_bundle_token == machine.bundle_token == second
+    assert machine.required_bundle_revision == 2
+    assert machine.instance_bundle == (first_bundle if instance_launch_issued else None)
+    store.close()
+
+
+def test_older_revision_is_a_no_op(tmp_path):
+    store, core, gateway = launched(tmp_path)
+    core.revision = 2
+    sync(gateway, core)
+
+    sync(gateway, core, 1)
+
+    assert core.prepared_revisions == [1, 2]
+    machine = store.get(MACHINE_ID)
+    assert machine.required_bundle_revision == 2
+    assert machine.bundle_token == token(core.machine_id, 2)
+    assert stored_bundle(store)["controllers"][0]["enrollmentCode"] == code(2)
+    store.close()
+
+
+def test_revision_moved_before_prepare_writes_nothing(tmp_path):
+    store, core, gateway = launched(tmp_path)
+    core.revision = 3
+    sync(gateway, core, 2)
+    machine = store.get(MACHINE_ID)
+    assert machine.bundle_token == token(core.machine_id, 1)
+    assert machine.required_bundle_token == token(core.machine_id, 2)
+    assert stored_bundle(store)["controllers"][0]["enrollmentCode"] == code(1)
+
+    sync(gateway, core)
+    assert core.prepared_revisions == [1, 3, 3]
+    assert store.get(MACHINE_ID).bundle_token == token(core.machine_id, 3)
+    assert stored_bundle(store)["controllers"][0]["enrollmentCode"] == code(3)
+    store.close()
+
+
+def test_failed_prepare_keeps_the_previous_bundle_until_a_retry_succeeds(tmp_path):
+    store, core, gateway = launched(tmp_path)
+    core.revision = 2
+    core.prepare_failures = 1
+    with pytest.raises(GatewayError):
+        sync(gateway, core)
+    machine = store.get(MACHINE_ID)
+    assert machine.required_bundle_token == token(core.machine_id, 2)
+    assert machine.bundle_token == token(core.machine_id, 1)
+    assert stored_bundle(store)["controllers"][0]["enrollmentCode"] == code(1)
+
+    sync(gateway, core)
+    assert core.prepared_revisions == [1, 2]
+    assert store.get(MACHINE_ID).bundle_token == token(core.machine_id, 2)
+    assert stored_bundle(store)["controllers"][0]["enrollmentCode"] == code(2)
+    store.close()
+
+
+def test_a_bundle_for_a_superseded_revision_is_not_recorded(tmp_path):
+    store, core, gateway = launched(tmp_path)
+    store.require_bundle(MACHINE_ID, 2, token(core.machine_id, 2))
+    store.record_bundle(MACHINE_ID, token(core.machine_id, 1), '{"stale":true}')
+    machine = store.get(MACHINE_ID)
+    assert machine.bundle_token == token(core.machine_id, 1)
+    assert stored_bundle(store)["controllers"][0]["enrollmentCode"] == code(1)
+    store.close()
+
+
+def test_sleep_wake_refreshes_the_bundle_before_the_instance_starts(tmp_path):
+    store, core, gateway = harness(tmp_path)
+    cloud = FakeCloud(store)
+    reconciler = Reconciler(store, cloud, instance_type=None)
+
+    def poll() -> None:
+        gateway.sync_machines(gateway.machines())
+        reconciler.reconcile_all()
+        gateway.report_observations(gateway.machines())
+
+    for _ in range(4):
+        poll()
+    first = token(core.machine_id, 1)
+    machine = store.get(MACHINE_ID)
+    assert machine.observed_state is ObservedState.RUNNING
+    assert machine.instance_bundle == machine.bundle
+    assert cloud.codes_at_boot == [[code(1)]]
+    assert core.observations[-1] == {
+        "state": "running",
+        "revision": 1,
+        "error": None,
+        "error_code": None,
+        "data_volume_id": VOLUME_ID,
+        "instance_id": INSTANCE_ID,
+        "instance_type": "m6i.large",
+    }
+
+    core.sleep()
+    poll()
+    poll()
+    assert store.get(MACHINE_ID).desired_state is DesiredState.STOPPED
+    assert cloud.instance is not None and cloud.instance["State"]["Name"] == "stopped"
+    assert core.observations[-1]["state"] == "stopped"
+    assert core.observations[-1]["revision"] == 2
+
+    core.wake()
+    core.prepare_failures = 1
+    poll()
+    assert store.get(MACHINE_ID).desired_state is DesiredState.RUNNING
+    assert "terminate_instance" not in cloud.calls
+    assert cloud.calls.count("start_instance") == 0
+    assert cloud.instance["State"]["Name"] == "stopped"
+    assert core.observations[-1]["state"] == "provisioning"
+    assert store.get(MACHINE_ID).bundle_token == first
+
+    poll()
+    woken = token(core.machine_id, 3)
+    assert core.prepared_revisions == [1, 3]
+    assert cloud.calls[-1] == "terminate_instance"
+    poll()
+    poll()
+    assert cloud.calls[-2:] == ["run_instance", "boot"]
+    assert cloud.codes_at_boot == [[code(1)], [code(3)]]
+    assert json.loads(cloud.user_data) == stored_bundle(store)
+    assert store.get(MACHINE_ID).bundle_token == woken
+    assert store.get(MACHINE_ID).instance_bundle == store.get(MACHINE_ID).bundle
+    poll()
+    machine = store.get(MACHINE_ID)
+    assert machine.observed_state is ObservedState.RUNNING
+    assert machine.instance_launch_issued
+    assert machine.data_volume_id == VOLUME_ID
+    assert machine.previous_instance_id == INSTANCE_ID
+    assert machine.recovery_count == 0
+    assert cloud.calls.count("terminate_instance") == 1
+    store.close()
+
+
+def test_an_enrolled_machine_wakes_on_the_user_data_it_enrolled_with(tmp_path):
+    store, core, gateway = harness(tmp_path)
+    cloud = FakeCloud(store)
+    reconciler = Reconciler(store, cloud, instance_type=None)
+
+    def poll() -> None:
+        gateway.sync_machines(gateway.machines())
+        reconciler.reconcile_all()
+        gateway.report_observations(gateway.machines())
+
+    def sleep_and_wake() -> None:
+        core.sleep()
+        poll()
+        poll()
+        assert cloud.instance is not None and cloud.instance["State"]["Name"] == "stopped"
+        core.wake()
+        poll()
+
+    for _ in range(4):
+        poll()
+    enrolled_with = store.get(MACHINE_ID).bundle
+    core.controller_ids[SEAT_A] = CONTROLLER_A
+
+    sleep_and_wake()
+    assert "terminate_instance" not in cloud.calls
+    assert cloud.calls[-2:] == ["start_instance", "boot"]
+    assert json.loads(store.get(MACHINE_ID).bundle)["controllers"] == [
+        {"key": SEAT_A, "id": CONTROLLER_A, "enrollmentCode": None}
+    ]
+    assert store.get(MACHINE_ID).instance_bundle == cloud.user_data == enrolled_with
+
+    core.controller_ids.clear()
+    sleep_and_wake()
+    poll()
+    poll()
+    assert cloud.calls[-3:] == ["terminate_instance", "run_instance", "boot"]
+    assert cloud.codes_at_boot == [[code(1)], [code(1)], [code(5)]]
+    assert store.get(MACHINE_ID).instance_bundle == cloud.user_data == store.get(MACHINE_ID).bundle
+
+
+def running_machine(tmp_path):
+    store, core, gateway = harness(tmp_path)
+    cloud = FakeCloud(store)
+    reconciler = Reconciler(store, cloud, instance_type=None)
+
+    def poll() -> None:
+        gateway.sync_machines(gateway.machines())
+        reconciler.reconcile_all()
+        gateway.report_observations(gateway.machines())
+
+    for _ in range(4):
+        poll()
+    machine = store.get(MACHINE_ID)
+    assert machine.observed_state is ObservedState.RUNNING
+    assert machine.instance_bundle == machine.bundle
+    return store, core, cloud, poll
+
+
+def test_a_workspace_joining_a_running_machine_relaunches_it_on_the_same_volume(tmp_path):
+    store, core, cloud, poll = running_machine(tmp_path)
+    core.controller_ids[SEAT_A] = CONTROLLER_A
+    core.seats.append(SEAT_B)
+    core.revision += 1
+
+    poll()
+    assert cloud.calls[-1] == "stop_instance"
+    assert core.observations[-1]["state"] == "provisioning"
+    assert json.loads(store.get(MACHINE_ID).bundle)["controllers"] == [
+        {"key": SEAT_A, "id": CONTROLLER_A, "enrollmentCode": None},
+        {"key": SEAT_B, "id": None, "enrollmentCode": code(2, 1)},
+    ]
+    poll()
+    assert cloud.calls[-1] == "terminate_instance"
+    poll()
+    poll()
+    assert cloud.calls[-2:] == ["run_instance", "boot"]
+    assert cloud.codes_at_boot == [[code(1)], [None, code(2, 1)]]
+    assert json.loads(cloud.user_data) == stored_bundle(store)
+    for _ in range(3):
+        poll()
+    machine = store.get(MACHINE_ID)
+    assert machine.observed_state is ObservedState.RUNNING
+    assert machine.instance_bundle == machine.bundle
+    assert machine.data_volume_id == VOLUME_ID
+    assert machine.previous_instance_id == INSTANCE_ID
+    assert machine.instance_id != INSTANCE_ID
+    assert machine.recovery_count == 0
+    assert cloud.calls.count("stop_instance") == 1
+    assert cloud.calls.count("terminate_instance") == 1
+    assert cloud.calls.count("run_instance") == 2
+    store.close()
+
+
+def test_a_revision_that_only_names_the_enrolled_controller_keeps_the_machine_running(
+    tmp_path,
+):
+    store, core, cloud, poll = running_machine(tmp_path)
+    enrolled_with = store.get(MACHINE_ID).bundle
+    core.controller_ids[SEAT_A] = CONTROLLER_A
+    core.revision += 1
+
+    for _ in range(3):
+        poll()
+    machine = store.get(MACHINE_ID)
+    assert core.prepared_revisions == [1, 2]
+    assert json.loads(machine.bundle)["controllers"] == [
+        {"key": SEAT_A, "id": CONTROLLER_A, "enrollmentCode": None}
+    ]
+    assert machine.instance_bundle == enrolled_with
+    assert machine.observed_state is ObservedState.RUNNING
+    assert machine.instance_id == INSTANCE_ID
+    assert cloud.calls.count("stop_instance") == 0
+    assert cloud.calls.count("run_instance") == 1
+    store.close()
+
+
+def test_a_running_instance_whose_user_data_is_unknown_is_left_running(tmp_path):
+    store, core, cloud, poll = running_machine(tmp_path)
+    store._connection.execute("UPDATE machines SET instance_bundle = NULL")
+    core.seats.append(SEAT_B)
+    core.revision += 1
+
+    for _ in range(3):
+        poll()
+    machine = store.get(MACHINE_ID)
+    assert len(json.loads(machine.bundle)["controllers"]) == 2
+    assert machine.instance_bundle is None
+    assert machine.observed_state is ObservedState.RUNNING
+    assert cloud.instance is not None and cloud.instance["State"]["Name"] == "running"
+    assert cloud.calls.count("stop_instance") == 0
+    assert cloud.calls.count("run_instance") == 1
+    store.close()

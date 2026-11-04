@@ -1,0 +1,67 @@
+{{- if .Values.switchCore.migrations.preUpgradeJob }}
+{{- $secretOverride := "" }}
+{{- if not .Values.secrets.existingSecret }}
+{{- $secretOverride = printf "%s-migrate" (include "switch.secretName" .) }}
+{{- end }}
+{{- $caOverride := "" }}
+{{- if and .Values.postgresql.caBundle.contents (not .Values.postgresql.caBundle.existingConfigMap) }}
+{{- $caOverride = printf "%s-db-ca-migrate" (include "switch.fullname" .) }}
+{{- end }}
+{{- $ctx := merge (dict "secretNameOverride" $secretOverride "dbCaConfigMapOverride" $caOverride "omitTeamsApp" true) . }}
+# Migrates before an upgrade rolls the new switch-core pods, so a failed
+# migration blocks the release instead of crash-looping the new pods.
+# pre-upgrade only: on a fresh install the managed Postgres does not exist yet
+# when pre-install hooks run, and switch-core self-migrates on startup anyway
+# (the same idempotent upgrade), so install is covered without a hook.
+#
+# `switch-migrate` rather than `alembic upgrade head`: it is the same code the
+# server runs at boot, so the job takes the boot advisory lock — without which
+# it and a still-running old replica restarting could apply DDL at the same
+# time — and reissues the runtime role's grants, without which a table this
+# migration created is unreadable by the pods that follow it.
+#
+# It runs as the namespace's default account, not switch-core's: a pre-upgrade
+# hook runs before the release's own objects are applied, so on the upgrade
+# that introduces switch-core's account the Job could not be created. It needs
+# no identity of its own, and mounts no token anything outside trusts.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "switch.fullname" . }}-migrate
+  labels:
+    {{- include "switch.labels" . | nindent 4 }}
+    {{- include "switch.selectorLabels" (dict "Release" .Release "component" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "switch.labels" . | nindent 8 }}
+        {{- include "switch.selectorLabels" (dict "Release" .Release "component" "migrate") | nindent 8 }}
+    spec:
+      {{- if .Values.global.imagePullSecrets }}
+      {{- include "switch.imagePullSecrets" . | nindent 6 }}
+      {{- end }}
+      restartPolicy: OnFailure
+      initContainers:
+        {{- include "switch.waitFor" (dict "name" "postgres" "host" (include "switch.postgresHost" .) "port" (include "switch.postgresPort" .)) | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "switch.image" (dict "global" .Values.global "image" .Values.switchCore.image) }}
+          imagePullPolicy: {{ include "switch.imagePullPolicy" (dict "policy" .Values.switchCore.imagePullPolicy "image" .Values.switchCore.image) }}
+          command: ["switch-migrate"]
+          env:
+            {{- include "switch.coreEnv" $ctx | nindent 12 }}
+          {{- if include "switch.dbCaBundleConfigMap" $ctx }}
+          volumeMounts:
+            {{- include "switch.dbCaBundleVolumeMount" $ctx | nindent 12 }}
+          {{- end }}
+      {{- if include "switch.dbCaBundleConfigMap" $ctx }}
+      volumes:
+        {{- include "switch.dbCaBundleVolume" $ctx | nindent 8 }}
+      {{- end }}
+{{- end }}

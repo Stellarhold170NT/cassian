@@ -1,0 +1,1831 @@
+"""Room lifecycle: provisioning, membership, and bridge binding.
+
+Invite and kick calls write on their own database session, separate from the
+caller's, and the two commit independently. That splits atomicity, and the
+split has a deliberate direction: **transport membership must never exceed
+what the database records.** Write the membership row before inviting; revoke
+the transport membership before dropping the row. A crash in the window then
+leaves an agent Switch believes is a member but which cannot see the room —
+under-privileged, visible, and repairable — rather than one silently reading a
+room Switch has no record of it being in.
+
+`reconcile_room_clients` closes that window at startup: a member with no
+`room_clients` row is (re-)invited, invites being idempotent.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable, Collection
+from typing import TYPE_CHECKING, Any, Literal
+
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.aliases import validate_alias_format, validate_alias_map
+from switch_core.authz import Principal, can, validate_visibility_pair
+from switch_core.bridges.collaboration.models import (
+    ChannelCreationUnsupported,
+    ChannelType,
+    RetireOutcome,
+)
+from switch_core.bridges.resource.service import ResourceService
+from switch_core.clients.client_lifecycle_service import ClientLifecycleService
+from switch_core.db.models import Room, RoomGroup, RoomRole
+from switch_core.db.session_scope import tenant_session
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.room_role_store import validate_role_name
+from switch_core.db.stores.room_store import (
+    LINKED_CHANNEL_NAME_KEY,
+    NAME_SOURCE_KEY,
+    RoomStore,
+)
+from switch_core.db.tenant_lookup import all_tenant_ids
+from switch_core.provisioning import Provisioning
+from switch_core.telemetry import TelemetryService, emit_safely
+from switch_core.telemetry.ages import age_days
+from switch_core.telemetry.snapshot import (
+    normalise_actor_kind,
+    normalise_channel_type,
+    normalise_platform,
+    room_had_human_activity,
+)
+from switch_core.tenant_context import tenant_scope
+
+if TYPE_CHECKING:
+    from switch_core.bridges.collaboration.collaboration_core import CollaborationCore
+    from switch_core.bridges.collaboration.lifecycle_service import (
+        CollaborationBridgeLifecycleService,
+    )
+    from switch_core.transport.room_cache import RoomDeliveryCache
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_CLIENT_TYPES = ("observe", "admin")
+
+# Rooms whose memberships `reconcile_room_clients` reads in one query, kept
+# well under Postgres' limit on bound parameters.
+RECONCILE_BATCH_SIZE = 1000
+
+
+class LinkedRoomSpec(BaseModel):
+    target_room_id: str
+    label: str
+
+
+class RoleSpec(BaseModel):
+    name: str
+    instructions: str
+    exclusive: bool = False
+
+
+class RoomCreateConfig(BaseModel):
+    name: str
+    description: str
+    agent_ids: list[str] | None = None
+    agent_names: list[str] | None = None
+    # Per-agent opt-in: the identifiers (same space as agent_ids/agent_names)
+    # of selected agents whose subagents (child agents) should also be added.
+    # A subset of the selection — only these parents are expanded, not all.
+    include_subagents_for: list[str] | None = None
+    # Per-agent opt-in: the identifiers (same space as agent_ids/agent_names)
+    # of selected agents that should receive `room_join` events in this room.
+    # Agents not listed keep the default (off).
+    join_event_listeners: list[str] | None = None
+    user_names: list[str] | None = None
+    channel_type: ChannelType | None = None
+    bridge_id: str | None = None
+    # Opt out of the instance default bridge and create a room with no external
+    # channel. Only meaningful when ``bridge_id`` is unset: omitting the bridge
+    # now means "use the default", so making a room agent-only has to be said
+    # rather than implied.
+    internal_only: bool = False
+    external_channel_id: str | None = None
+    instructions: str | None = None
+    protection_config: dict[str, object] | None = None
+    observe_config: dict[str, object] | None = None
+    admin_mode: bool = False
+    created_by: str | None = None
+    # Set when an agent operation creates the room; see the `Room` columns.
+    created_by_agent_id: str | None = None
+    parent_room_id: str | None = None
+    run_id: str | None = None
+    kickoff_hash: str | None = None
+    # The template the room came from, for runs to show; see `Room`.
+    template_name: str | None = None
+    # Optional group to file the room under at creation (navigation layer).
+    group_id: str | None = None
+    # Authorization owner (the acting user, or an agent's owner for MCP-created
+    # rooms). `created_by` is immutable audit; `owner_id` is what `can()` reads.
+    owner_id: str | None = None
+    # Rooms are collaborative by default — public read & write. Set private to
+    # lock a room down to its owner (and admins).
+    read_visibility: str = "public"
+    write_visibility: str = "public"
+    # Attachments applied after the room is provisioned. Reference/package
+    # access is checked against ``acting_user_id`` using the same predicates
+    # the gateway uses; ``acting_user_id`` is required when any of these are
+    # set. Linked rooms have no access check (matching the existing
+    # attach_linked_room behaviour).
+    reference_ids: list[str] | None = None
+    package_ids: list[str] | None = None
+    linked_rooms: list[LinkedRoomSpec] | None = None
+    # Room-roles to define at creation (assumable instruction bundles).
+    roles: list[RoleSpec] | None = None
+    # Per-room agent aliases to seed at creation, keyed by agent name → alias.
+    # `@<alias>` then addresses that agent in the room like its real name.
+    aliases: dict[str, str] | None = None
+    acting_user_id: str | None = None
+    acting_is_admin: bool = False
+    # Not derivable from `created_by`, which holds the *agent's owner* on the
+    # agent path. Stamped into the room's metadata so it survives. `system` is
+    # a channel the platform delivered to the bridge, so it is the one kind
+    # whose `external_channel_id` the bridge is not asked to vouch for.
+    created_by_kind: Literal["user", "agent", "system"] = "user"
+    # Provisioned from a room template rather than created directly.
+    from_template: bool = False
+    # The Switch Console chat creation this room is for, stamped into the
+    # room's metadata in the same insert so a retried creation finds it.
+    chat_operation_id: str | None = None
+    # `{agent_id, body}`: what that agent says as it joins, in place of its
+    # usual line. Stamped with the room, so it is there before the agent is.
+    agent_greeting: dict[str, str] | None = None
+    # The linked channel's name when the room is named after it (a bridge's
+    # own room), so it follows the channel's renames (`NAME_SOURCE_KEY`).
+    named_after_channel: str | None = None
+
+
+class RoomCreateResult(BaseModel):
+    """Result of create_room. ``failed_attachments`` collects post-creation
+    attachment failures that did not abort room creation (validate-upfront
+    catches predictable errors; this list captures races and other
+    surprises). Each entry is ``{"kind": ..., "id": ..., "error": ...}``.
+    """
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    room: Room
+    failed_attachments: list[dict[str, Any]] = []
+
+
+ROOM_NAME_MAX = 200
+
+
+class RoomService:
+    # Class-level defaults so a caller that builds this without `__init__` —
+    # several tests assemble a minimal instance directly — still has the
+    # attributes. Telemetry is genuinely optional here; `emit_safely` treats
+    # None as "report nothing".
+    _telemetry: TelemetryService | None = None
+    _room_agents_listeners: tuple[Callable[[str, str], Awaitable[None]], ...] = ()
+    _room_listeners: tuple[Callable[[str, str, list[str]], None], ...] = ()
+
+    def __init__(
+        self,
+        *,
+        provisioning: Provisioning,
+        room_store: RoomStore,
+        agent_store: AgentStore,
+        client_lifecycle: ClientLifecycleService,
+        collab_lifecycle: CollaborationBridgeLifecycleService,
+        collab_bridge_store: CollaborationBridgeStore,
+        resource_service: ResourceService,
+        session_factory: async_sessionmaker[AsyncSession],
+        room_cache: RoomDeliveryCache,
+        telemetry: TelemetryService | None = None,
+    ) -> None:
+        self._provisioning = provisioning
+        self._room_store = room_store
+        self._agent_store = agent_store
+        self._client_lifecycle = client_lifecycle
+        self._collab_lifecycle = collab_lifecycle
+        self._collab_bridge_store = collab_bridge_store
+        self._resource_service = resource_service
+        self._session_factory = session_factory
+        # Optional because several tests and tooling build a RoomService
+        # without one; `emit_safely` treats None as "report nothing".
+        self._telemetry = telemetry
+        # The shared delivery read; told when a room goes.
+        self._room_cache = room_cache
+
+    def on_room_changed(self, listener: Callable[[str, str, list[str]], None]) -> None:
+        """Call `listener(tenant_id, room_id, [])` once a room is created,
+        archived or unarchived, or its agents change (`room_changes`). It must
+        not block."""
+        self._room_listeners = (*self._room_listeners, listener)
+
+    def room_changed(self, tenant_id: str, room_id: str) -> None:
+        for listener in self._room_listeners:
+            try:
+                listener(tenant_id, room_id, [])
+            except Exception:
+                logger.exception("Room listener failed for room %s", room_id)
+
+    def on_room_agents_changed(
+        self, listener: Callable[[str, str], Awaitable[None]]
+    ) -> None:
+        """Call `listener(tenant_id, room_id)` after a room's agents change."""
+        self._room_agents_listeners = (*self._room_agents_listeners, listener)
+
+    async def room_agents_changed(self, tenant_id: str, room_id: str) -> None:
+        """Tell the listeners a room's agents (or their owners) changed.
+
+        The change itself is already committed, so a listener that fails is
+        reported rather than raised; listeners re-read on their own schedule.
+        """
+        for listener in self._room_agents_listeners:
+            try:
+                await listener(tenant_id, room_id)
+            except Exception:
+                logger.exception(
+                    "Room-agents listener failed for room %s; it will catch up "
+                    "on its next re-read",
+                    room_id,
+                )
+
+    async def _resolve_agent_ids(self, config: RoomCreateConfig) -> list[str]:
+        if config.agent_ids is not None:
+            agent_ids = list(config.agent_ids)
+            expand_parent_ids = list(config.include_subagents_for or [])
+        elif config.agent_names is not None:
+            agent_ids = await self._resolve_names_to_ids(config.agent_names)
+            expand_parent_ids = (
+                await self._resolve_names_to_ids(config.include_subagents_for)
+                if config.include_subagents_for
+                else []
+            )
+        else:
+            # Neither provided → an agentless room. Still valid: system clients
+            # are added below.
+            agent_ids = []
+            expand_parent_ids = []
+        if expand_parent_ids:
+            agent_ids = await self._expand_with_children(agent_ids, expand_parent_ids)
+        return agent_ids
+
+    async def _resolve_join_event_listeners(self, config: RoomCreateConfig) -> set[str]:
+        """Resolve `config.join_event_listeners` to a set of agent ids, in the
+        same identifier space (ids or names) the agent selection used."""
+        listeners = config.join_event_listeners
+        if not listeners:
+            return set()
+        if config.agent_ids is not None:
+            return set(listeners)
+        return set(await self._resolve_names_to_ids(listeners))
+
+    async def _expand_with_children(
+        self, agent_ids: list[str], parent_ids: list[str]
+    ) -> list[str]:
+        """Append the subagents of `parent_ids` to `agent_ids`, de-duplicated.
+
+        Order-preserving: the original ids come first, then any children not
+        already present. One level deep — subagents cannot themselves have
+        subagents.
+        """
+        async with self._session_factory() as session:
+            children = await self._agent_store.get_children(session, parent_ids)
+        result = list(agent_ids)
+        seen = set(agent_ids)
+        for child in children:
+            if child.id not in seen:
+                seen.add(child.id)
+                result.append(child.id)
+        return result
+
+    async def _resolve_ids_to_names(self, agent_ids: list[str]) -> list[str]:
+        async with self._session_factory() as session:
+            names = []
+            for agent_id in agent_ids:
+                agent = await self._agent_store.get(session, agent_id)
+                if agent is None:
+                    raise ValueError(f"Unknown agent ID: {agent_id}")
+                names.append(agent.name)
+            return names
+
+    def _validate_dm_room(self, config: RoomCreateConfig, agent_ids: list[str]) -> None:
+        """A DM room (channel_type="direct", outbound-created) is strictly 1:1 —
+        exactly one agent and exactly one user."""
+        if len(agent_ids) != 1:
+            raise ValueError(
+                f"A DM room requires exactly one agent; got {len(agent_ids)}."
+            )
+        n_users = len(config.user_names or [])
+        if n_users != 1:
+            raise ValueError(f"A DM room requires exactly one user; got {n_users}.")
+
+    async def _validate_attachments(self, config: RoomCreateConfig) -> None:
+        """Resolve existence + access for refs/packages/linked-rooms before
+        provisioning anything. Race-time failures during attach are caught later
+        and surfaced via failed_attachments; this catches the common cases
+        (bad ids, no access) cheaply.
+        """
+        has_attachments = bool(
+            config.reference_ids or config.package_ids or config.linked_rooms
+        )
+        if not has_attachments:
+            return
+        if config.reference_ids or config.package_ids:
+            if config.acting_user_id is None:
+                raise ValueError(
+                    "acting_user_id is required to attach references or packages"
+                )
+        async with self._session_factory() as session:
+            principal = Principal(config.acting_user_id, config.acting_is_admin)
+            for ref_id in config.reference_ids or []:
+                ref = await self._resource_service._references.get(session, ref_id)
+                if ref is None:
+                    raise ValueError(f"Reference not found: {ref_id}")
+                if not can(principal, "read", ref):
+                    raise PermissionError(
+                        f"User {config.acting_user_id} cannot attach reference {ref_id}"
+                    )
+            for pkg_id in config.package_ids or []:
+                pkg = await self._resource_service._packages.get(session, pkg_id)
+                if pkg is None:
+                    raise ValueError(f"Package not found: {pkg_id}")
+                if not can(principal, "read", pkg):
+                    raise PermissionError(
+                        f"User {config.acting_user_id} cannot attach package {pkg_id}"
+                    )
+            for link in config.linked_rooms or []:
+                target = await self._room_store.get(session, link.target_room_id)
+                if target is None:
+                    raise ValueError(f"Linked room not found: {link.target_room_id}")
+                if not link.label.strip():
+                    raise ValueError("Linked room label must not be empty")
+
+    async def _attach_after_creation(
+        self, room_id: str, config: RoomCreateConfig
+    ) -> list[dict[str, Any]]:
+        """Attach references, packages, and linked rooms to a freshly
+        created room. Returns a list of failures (empty on full success).
+        """
+        failures: list[dict[str, Any]] = []
+        async with self._session_factory() as session:
+            for ref_id in config.reference_ids or []:
+                try:
+                    await self._resource_service.attach_reference_to_room(
+                        session,
+                        room_id,
+                        ref_id,
+                        user_id=config.acting_user_id,  # type: ignore[arg-type]
+                        is_admin=config.acting_is_admin,
+                    )
+                except Exception as e:
+                    failures.append(
+                        {"kind": "reference", "id": ref_id, "error": str(e)}
+                    )
+            for pkg_id in config.package_ids or []:
+                try:
+                    await self._resource_service.attach_package_to_room(
+                        session,
+                        room_id,
+                        pkg_id,
+                        user_id=config.acting_user_id,  # type: ignore[arg-type]
+                        is_admin=config.acting_is_admin,
+                    )
+                except Exception as e:
+                    failures.append({"kind": "package", "id": pkg_id, "error": str(e)})
+            for link in config.linked_rooms or []:
+                try:
+                    await self._resource_service.attach_linked_room(
+                        session,
+                        source_room_id=room_id,
+                        target_room_id=link.target_room_id,
+                        label=link.label,
+                    )
+                except Exception as e:
+                    failures.append(
+                        {
+                            "kind": "linked_room",
+                            "id": link.target_room_id,
+                            "error": str(e),
+                        }
+                    )
+            await session.commit()
+        return failures
+
+    async def _resolve_bridge_id(self, config: RoomCreateConfig) -> str | None:
+        """Pick the bridge for a new room: the one named, else the instance
+        default, else none.
+
+        A standalone Switch always ships a bridge (the bundled Mattermost), so
+        defaulting to it means every room has somewhere humans can read it
+        without the caller having to know the deployment's topology. Callers
+        that genuinely want an agent-only room pass ``internal_only``.
+
+        A default that is configured but not currently running is reported
+        rather than skipped — silently creating an unbridged room would look
+        identical to success and only surface much later as a room nobody can
+        see.
+        """
+        if config.bridge_id:
+            return config.bridge_id
+        if config.internal_only:
+            return None
+
+        async with self._session_factory() as session:
+            default = await self._collab_bridge_store.get_default(session)
+        if default is None:
+            return None
+
+        if self._collab_lifecycle.get(default.id) is None:
+            raise ValueError(
+                f"Default bridge '{default.display_name}' ({default.id}) is not "
+                "running, so the room cannot be bridged. Start the bridge, name "
+                "a different bridge_id, or pass internal_only to create an "
+                "agent-only room."
+            )
+        return default.id
+
+    async def _require_tenant_bridge(self, bridge_id: str) -> None:
+        """Refuse a bridge id that is not one of the bound tenant's bridges.
+
+        The collaboration lifecycle's registry of running bridges is
+        process-wide and holds every tenant's, so finding a bridge there says
+        nothing about whether this caller may use it. The bridge's row, read
+        under the tenant's row-level security, does. Checked before anything
+        is provisioned on the platform behind it.
+        """
+        async with self._session_factory() as session:
+            bridge = await self._collab_bridge_store.get(session, bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+
+    async def _require_channel_creation(self, bridge_id: str) -> None:
+        """Refuse to make a channel on a connection an operator has withheld it
+        from, before anything is provisioned.
+
+        Only the operator's switch is checked here. A platform that cannot
+        create channels at all is caught by its own adapter raising, which says
+        so in the platform's terms — naming the bot, the link, the step to take
+        — and that is a better error than anything this layer could compose.
+        """
+        async with self._session_factory() as session:
+            bridge = await self._collab_bridge_store.get(session, bridge_id)
+        if bridge is None:
+            raise ValueError(f"Bridge not found: {bridge_id}")
+        if bridge.channel_creation_enabled:
+            return
+        raise ChannelCreationUnsupported(
+            f"Creating channels is turned off for the '{bridge.display_name}' "
+            "connection. Create the channel on the platform and add the Switch "
+            "app to it — Switch adopts it as a room — or ask an administrator to "
+            "allow channel creation for this connection."
+        )
+
+    @staticmethod
+    async def _add_users_to_channel(
+        collaboration_core: CollaborationCore,
+        external_channel_id: str,
+        user_names: list[str],
+    ) -> list[dict[str, Any]]:
+        """Add the room's people to its channel; report who did not make it.
+
+        Returns ``failed_attachments``-shaped entries, because that is what this
+        is: a post-creation step that can partly fail without the room being
+        wrong. Two ways to miss — Switch not knowing the person on this bridge,
+        and the platform refusing to add them — and both used to disappear into
+        a log line, leaving a room that silently lacked the people it was asked
+        for.
+        """
+        resolved = await collaboration_core.resolve_external_user_id_map(user_names)
+        failures: list[dict[str, Any]] = [
+            {
+                "kind": "user",
+                "id": name,
+                "error": "no account with this name is known on the bridge",
+            }
+            for name in user_names
+            if name not in resolved
+        ]
+        # Paired positionally by contract, so build both from the same mapping
+        # rather than passing the caller's full name list beside a shorter list
+        # of ids — an adapter that zips them would otherwise mis-attribute.
+        names = list(resolved)
+        failed_ids = await collaboration_core.adapter.add_users_to_channel(
+            external_channel_id, names, [resolved[name] for name in names]
+        )
+        by_id = {resolved[name]: name for name in names}
+        failures.extend(
+            {
+                "kind": "user",
+                "id": by_id.get(external_id, external_id),
+                "error": "the platform would not add them to the channel",
+            }
+            for external_id in failed_ids
+        )
+        return failures
+
+    @staticmethod
+    async def _ensure_channel_capture(
+        collaboration_core: CollaborationCore,
+        external_channel_id: str,
+        channel_type: ChannelType,
+    ) -> None:
+        """Establish server-side message capture for a channel bound to a room.
+
+        Provisioning a channel subscribes to it on the way past, but binding one
+        that already exists does not — and on a bridge whose capture is a
+        per-channel subscription (Teams, via Graph) that leaves the room
+        receiving only what @mentions the bot, until the bridge next restarts
+        and its startup reconciliation notices. A no-op for adapters whose
+        capture is a single bridge-wide stream, and idempotent for those where
+        it is not.
+        """
+        await collaboration_core.adapter.ensure_channel_subscriptions(
+            [(external_channel_id, channel_type)]
+        )
+
+    async def create_room(self, config: RoomCreateConfig) -> RoomCreateResult:
+        await self._validate_attachments(config)
+        # Before anything is provisioned: a name refused after the channel and
+        # the room exist would leave both behind. Alias collisions need the
+        # resolved agents and are checked with them, below.
+        for spec in config.roles or []:
+            validate_role_name(spec.name)
+        for alias in (config.aliases or {}).values():
+            validate_alias_format(alias)
+        # Validate the group up front so a bad id fails before we provision a
+        # room / external channel.
+        if config.group_id is not None:
+            async with self._session_factory() as session:
+                if await session.get(RoomGroup, config.group_id) is None:
+                    raise ValueError(f"Room group not found: {config.group_id}")
+        agent_ids = await self._resolve_agent_ids(config)
+        join_event_listeners = await self._resolve_join_event_listeners(config)
+        channel_type = config.channel_type
+        external_channel_id = config.external_channel_id
+        bridge_id = await self._resolve_bridge_id(config)
+        collaboration_core = None
+        if bridge_id:
+            await self._require_tenant_bridge(bridge_id)
+            collaboration_core = self._collab_lifecycle.get(bridge_id)
+            if collaboration_core is None:
+                raise ValueError(f"Bridge not running: {bridge_id}")
+
+        # A channel the platform delivered to this bridge is its own by
+        # construction; one named by the caller has to be shown to be.
+        if (
+            collaboration_core
+            and external_channel_id is not None
+            and config.created_by_kind != "system"
+        ):
+            await collaboration_core.adapter.require_bindable_channel(
+                external_channel_id
+            )
+
+        if (
+            collaboration_core
+            and external_channel_id is not None
+            and channel_type is None
+        ):
+            channel_type = await collaboration_core.adapter.get_channel_type(
+                external_channel_id
+            )
+
+        if channel_type is None:
+            channel_type = "channel_public"
+
+        is_dm = (
+            channel_type == "direct"
+            and collaboration_core is not None
+            and external_channel_id is None
+        )
+        if is_dm:
+            self._validate_dm_room(config, agent_ids)
+
+        if collaboration_core and external_channel_id is None:
+            await self._require_channel_creation(bridge_id)  # type: ignore[arg-type]
+            if is_dm:
+                user_name = (config.user_names or [])[0]
+                agent_name = (await self._resolve_ids_to_names(agent_ids))[0]
+                ext_id_map = await collaboration_core.resolve_external_user_id_map(
+                    [user_name]
+                )
+                user_external_id = ext_id_map.get(user_name)
+                if user_external_id is None:
+                    raise ValueError(
+                        f"Cannot create DM room: no user '{user_name}' is known on "
+                        "this bridge. The user must have interacted with Switch on "
+                        "the platform before a DM can be opened with them."
+                    )
+                external_channel_id = (
+                    await collaboration_core.adapter.create_dm_channel(
+                        agent_name=agent_name,
+                        user_name=user_name,
+                        user_external_id=user_external_id,
+                    )
+                )
+            else:
+                external_channel_id = await collaboration_core.adapter.create_channel(
+                    config.name,
+                    config.description,
+                    channel_type=channel_type,
+                )
+
+        # Guard the channel from the moment it exists until the room↔channel
+        # mapping is registered. Creating the channel makes the bot auto-join
+        # it, which fires an inbound join; without this guard that join would
+        # not see the not-yet-committed mapping and would auto-create a second
+        # room for the same channel (CHOO-1660).
+        if collaboration_core and external_channel_id:
+            collaboration_core.begin_provisioning(external_channel_id)
+        try:
+            transport_room_id = await self._provisioning.create_room(
+                config.name, config.description
+            )
+
+            room = Room(
+                transport_room_id=transport_room_id,
+                name=config.name,
+                description=config.description,
+                channel_type=channel_type,
+                bridge_id=bridge_id,
+                external_channel_id=external_channel_id,
+                admin_mode=config.admin_mode,
+                instructions=config.instructions,
+                protection_config=config.protection_config,
+                observe_config=config.observe_config,
+                created_by=config.created_by,
+                created_by_agent_id=config.created_by_agent_id,
+                parent_room_id=config.parent_room_id,
+                run_id=config.run_id,
+                kickoff_hash=config.kickoff_hash,
+                template_name=config.template_name,
+                owner_id=config.owner_id,
+                read_visibility=config.read_visibility,
+                write_visibility=config.write_visibility,
+                # Nothing else on the row can answer this afterwards.
+                metadata_={
+                    "created_by_kind": config.created_by_kind,
+                    **(
+                        {"chat_operation_id": config.chat_operation_id}
+                        if config.chat_operation_id is not None
+                        else {}
+                    ),
+                    **(
+                        {"agent_greeting": config.agent_greeting}
+                        if config.agent_greeting is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            NAME_SOURCE_KEY: "channel",
+                            LINKED_CHANNEL_NAME_KEY: config.named_after_channel,
+                        }
+                        if config.named_after_channel is not None
+                        else {}
+                    ),
+                },
+            )
+
+            async with self._session_factory() as session:
+                await self._room_store.create(session, room)
+                if config.group_id is not None:
+                    await self._room_store.set_group(session, room.id, config.group_id)
+                if agent_ids:
+                    await self._room_store.add_agents(
+                        session,
+                        room.id,
+                        agent_ids,
+                        join_event_listeners=join_event_listeners,
+                    )
+                for spec in config.roles or []:
+                    session.add(
+                        RoomRole(
+                            room_id=room.id,
+                            name=spec.name,
+                            instructions=spec.instructions,
+                            exclusive=spec.exclusive,
+                        )
+                    )
+                if config.aliases:
+                    await self._seed_aliases(session, room.id, agent_ids, config)
+                await session.commit()
+
+            if collaboration_core and external_channel_id:
+                collaboration_core.add_room_mapping(
+                    room.id, transport_room_id, external_channel_id, room.tenant_id
+                )
+            if bridge_id and external_channel_id:
+                self._collab_lifecycle.rooms_changed(bridge_id)
+        finally:
+            if collaboration_core and external_channel_id:
+                collaboration_core.end_provisioning(external_channel_id)
+
+        # The room row is durably committed above. Everything from here down —
+        # channel capture, invites, adding agents/users on the external
+        # platform — is best-effort against another system and can still fail
+        # (and, on failure, still propagate out of this call, same as before).
+        # Reported here rather than at the end of the function so a failure in
+        # any of that does not also make the room's existence go unreported:
+        # the row is the thing the event describes, and it is already true.
+        #
+        # Resolved on its own line, never inside the argument list below: an
+        # `await` there is evaluated before `emit_safely` is entered, outside
+        # the guard meant to contain it.
+        platform = await self._bridge_platform(bridge_id)
+
+        emit_safely(
+            self._telemetry,
+            "room_created",
+            {
+                "channel_type": normalise_channel_type(channel_type),
+                "bridge_platform": platform,
+                "agent_count": len(agent_ids),
+                "human_count": len(config.user_names or []),
+                "has_instructions": config.instructions is not None,
+                "created_by_kind": config.created_by_kind,
+                "from_template": config.from_template,
+            },
+        )
+
+        # Only a room a person made counts as activation. Guarded like the
+        # emit above it: this runs ahead of the invite, the agent adds and the
+        # client joins, so an unguarded raise would leave a committed room
+        # nobody is in.
+        if self._telemetry is not None and config.created_by_kind == "user":
+            try:
+                await self._telemetry.emit_milestone(
+                    "first_room_created",
+                    channel_type=normalise_channel_type(channel_type),
+                    bridge_platform=platform,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not report the first_room_created milestone for room %s",
+                    room.id,
+                )
+
+        if collaboration_core and external_channel_id:
+            await self._ensure_channel_capture(
+                collaboration_core, external_channel_id, channel_type
+            )
+
+        # Invite the bridge client before the agent clients so it is joined (and
+        # thus replicating) before any agent can post — otherwise messages sent
+        # in the gap predate the bridge's join and are dropped by _should_ignore,
+        # never reaching the external channel. Mirrors change_bridge's ordering.
+        if collaboration_core:
+            await self._provisioning.invite_to_room(
+                transport_room_id,
+                collaboration_core._workspace_consumer_transport_user_id,
+            )
+
+        unreachable_users: list[dict[str, Any]] = []
+        if (
+            collaboration_core
+            and external_channel_id
+            and channel_type not in ("direct", "group")
+        ):
+            agent_names = await self._resolve_ids_to_names(agent_ids)
+            await collaboration_core.adapter.add_agents_to_channel(
+                external_channel_id, agent_names
+            )
+            if config.user_names:
+                unreachable_users = await self._add_users_to_channel(
+                    collaboration_core, external_channel_id, config.user_names
+                )
+                await collaboration_core.ensure_users_in_room(
+                    room.id, transport_room_id, config.user_names
+                )
+
+        if collaboration_core and external_channel_id and is_dm and config.user_names:
+            await collaboration_core.ensure_users_in_room(
+                room.id, transport_room_id, config.user_names
+            )
+
+        agent_clients = self._resolve_agent_clients(agent_ids)
+        system_clients = self._resolve_system_clients(room.tenant_id)
+        all_clients = {**agent_clients, **system_clients}
+
+        await self._invite_clients(transport_room_id, all_clients)
+
+        async with tenant_session(self._session_factory, room.tenant_id) as session:
+            for client_id in all_clients:
+                await self._room_store.add_client(session, client_id, room.id)
+            await session.commit()
+
+        logger.info(
+            "Created room %s (%s) with %d agents and %d system clients",
+            config.name,
+            transport_room_id,
+            len(agent_clients),
+            len(system_clients),
+        )
+
+        if agent_ids:
+            await self.room_agents_changed(room.tenant_id, room.id)
+
+        failed_attachments = unreachable_users + await self._attach_after_creation(
+            room.id, config
+        )
+        if failed_attachments:
+            logger.warning(
+                "Room %s created with %d attachment failure(s): %s",
+                room.id,
+                len(failed_attachments),
+                failed_attachments,
+            )
+
+        self.room_changed(room.tenant_id, room.id)
+        return RoomCreateResult(room=room, failed_attachments=failed_attachments)
+
+    async def _seed_aliases(
+        self,
+        session: AsyncSession,
+        room_id: str,
+        agent_ids: list[str],
+        config: RoomCreateConfig,
+    ) -> None:
+        """Validate and persist the config's per-room aliases at creation time."""
+        agents = []
+        for aid in agent_ids:
+            agent = await self._agent_store.get(session, aid)
+            if agent is not None:
+                agents.append(agent)
+        agent_names = [a.name for a in agents]
+        role_names = [spec.name for spec in config.roles or []]
+        validate_alias_map(
+            config.aliases or {},
+            agent_names=agent_names,
+            role_names=role_names,
+        )
+        id_by_name = {a.name.lower(): a.id for a in agents}
+        for agent_name, alias in (config.aliases or {}).items():
+            await self._room_store.set_alias(
+                session, room_id, id_by_name[agent_name.lower()], alias
+            )
+
+    async def delete_room(
+        self, room_id: str, *, retire_channel: bool
+    ) -> RetireOutcome | None:
+        """Delete a room, and with `retire_channel` retire its platform channel.
+
+        A person deleting a room asks for the channel to go with it; removing a
+        whole connection does not, because the bot may already have lost its
+        access. Returns what became of the channel, or None when the room has
+        none or was not asked to retire it. A channel that could not be retired
+        does not stop the room being deleted: it comes back as `failed`.
+        """
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+
+            bridge_id = room.bridge_id
+
+            client_ids = await self._room_store.get_client_ids(session, room_id)
+            agent_count = (
+                len(await self._room_store.get_agent_ids(session, room_id))
+                if self._telemetry is not None
+                else 0
+            )
+
+        # Before the delete: the cascade takes the messages with the room.
+        was_ever_active = await self._was_ever_active(room.tenant_id, room_id)
+
+        # `kick_user` and the delete below both write rows scoped to this
+        # room's tenant (a membership removal, then the room itself), so both
+        # bind it — one scope for the whole unit of work rather than one per
+        # session opened along the way.
+        with tenant_scope(room.tenant_id):
+            for client_id in client_ids:
+                client = self._client_lifecycle.get(client_id)
+                if client:
+                    await self._provisioning.kick_user(
+                        room.transport_room_id, client.transport_user_id
+                    )
+
+            channel: RetireOutcome | None = None
+            if retire_channel and bridge_id and room.external_channel_id:
+                if room.channel_type == "direct":
+                    # A direct message cannot be archived or deleted by anyone.
+                    channel = RetireOutcome(outcome="kept")
+                else:
+                    channel = await self._retire_channel(
+                        room_id, bridge_id, room.external_channel_id
+                    )
+
+            await self._provisioning.delete_room(room.transport_room_id)
+
+            async with self._session_factory() as session:
+                await self._room_store.delete(session, room_id)
+                await session.commit()
+
+        # Kicking the members above already emptied it if they were all
+        # running here; this covers any that were not.
+        self._room_cache.invalidate(room.tenant_id, room_id)
+
+        if bridge_id:
+            collaboration_core = self._collab_lifecycle.get(bridge_id)
+            if collaboration_core:
+                collaboration_core.remove_room_mapping(room.id, room.transport_room_id)
+            self._collab_lifecycle.rooms_changed(bridge_id)
+
+        logger.info("Deleted room %s", room_id)
+
+        if self._telemetry is None:
+            return channel
+        emit_safely(
+            self._telemetry,
+            "room_deleted",
+            {
+                "bridge_platform": await self._bridge_platform(bridge_id),
+                "channel_type": normalise_channel_type(room.channel_type),
+                "created_by_kind": normalise_actor_kind(
+                    (room.metadata_ or {}).get("created_by_kind")
+                ),
+                "age_days": age_days(room.created_at),
+                "was_ever_active": was_ever_active,
+                "agent_count": agent_count,
+            },
+        )
+        return channel
+
+    async def _retire_channel(
+        self, room_id: str, bridge_id: str, external_channel_id: str
+    ) -> RetireOutcome:
+        collaboration_core = self._collab_lifecycle.get(bridge_id)
+        if collaboration_core is None:
+            outcome = RetireOutcome.failed(
+                "The messaging connection is not running, so Switch could not "
+                "reach the channel"
+            )
+        else:
+            try:
+                outcome = await collaboration_core.adapter.retire_channel(
+                    external_channel_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "Retiring channel %s of deleted room %s raised",
+                    external_channel_id,
+                    room_id,
+                    exc_info=True,
+                )
+                return RetireOutcome.failed(str(e) or type(e).__name__)
+        if outcome.outcome == "failed":
+            logger.warning(
+                "Channel %s of deleted room %s was not retired: %s",
+                external_channel_id,
+                room_id,
+                outcome.reason,
+            )
+        return outcome
+
+    async def _resolve_names_to_ids(self, agent_names: list[str]) -> list[str]:
+        unique_names = list(dict.fromkeys(agent_names))
+        async with self._session_factory() as session:
+            agents = await self._agent_store.get_by_names(session, unique_names)
+        name_to_id = {a.name: a.id for a in agents}
+        missing = [n for n in unique_names if n not in name_to_id]
+        if missing:
+            raise ValueError(f"Unknown agents: {', '.join(missing)}")
+        return [name_to_id[n] for n in unique_names]
+
+    async def add_agents_to_room(
+        self,
+        room_id: str,
+        agent_ids: list[str] | None = None,
+        agent_names: list[str] | None = None,
+        include_subagents_for: list[str] | None = None,
+        join_event_listeners: list[str] | None = None,
+        added_by_kind: Literal["user", "agent", "system"] = "user",
+        with_agents: Callable[[AsyncSession], Awaitable[None]] | None = None,
+    ) -> None:
+        """`with_agents` runs in the transaction that records the agents, so
+        what it writes commits with them or not at all."""
+        by_name = agent_ids is None and agent_names is not None
+        if by_name:
+            assert agent_names is not None
+            agent_ids = await self._resolve_names_to_ids(agent_names)
+        if agent_ids is None:
+            raise ValueError("Either agent_ids or agent_names must be provided")
+        if include_subagents_for:
+            agent_ids = await self._expand_with_children(
+                agent_ids, include_subagents_for
+            )
+        listeners: set[str] = set()
+        if join_event_listeners:
+            listeners = (
+                set(await self._resolve_names_to_ids(join_event_listeners))
+                if by_name
+                else set(join_event_listeners)
+            )
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+
+            existing = await self._room_store.get_agent_ids(session, room.id)
+
+        new_agent_ids = [aid for aid in agent_ids if aid not in existing]
+        if not new_agent_ids:
+            logger.debug(
+                "All agents are already part of the room, existing %s, new agent ids %s, agent ids %s",
+                existing,
+                new_agent_ids,
+                agent_ids,
+            )
+            return
+
+        agent_clients = self._resolve_agent_clients(new_agent_ids)
+
+        # One binding for the whole membership change: the two writes below
+        # and the invite between them (which itself writes a membership row
+        # and an arrival message) all belong to this room's tenant.
+        with tenant_scope(room.tenant_id):
+            async with self._session_factory() as session:
+                await self._room_store.add_agents(
+                    session,
+                    room.id,
+                    new_agent_ids,
+                    join_event_listeners={
+                        aid for aid in new_agent_ids if aid in listeners
+                    },
+                )
+                if with_agents is not None:
+                    await with_agents(session)
+                await session.commit()
+
+            await self._invite_clients(room.transport_room_id, agent_clients)
+
+            async with self._session_factory() as session:
+                for client_id in agent_clients:
+                    await self._room_store.add_client(session, client_id, room.id)
+                await session.commit()
+
+        if room.bridge_id and room.external_channel_id:
+            collaboration_core = self._collab_lifecycle.get(room.bridge_id)
+            if collaboration_core:
+                agent_names_resolved = await self._resolve_ids_to_names(new_agent_ids)
+                await collaboration_core.adapter.add_agents_to_channel(
+                    room.external_channel_id, agent_names_resolved
+                )
+
+        logger.info("Added %d agents to room %s", len(agent_ids), room_id)
+        await self.room_agents_changed(room.tenant_id, room.id)
+        self.room_changed(room.tenant_id, room.id)
+
+        emit_safely(
+            self._telemetry,
+            "room_agents_added",
+            {
+                # Added, not requested.
+                "agent_count": len(new_agent_ids),
+                "added_by_kind": added_by_kind,
+            },
+        )
+
+    async def remove_agents_from_room(
+        self,
+        room_id: str,
+        agent_ids: list[str],
+        removed_by_kind: Literal["user", "agent", "system"] = "user",
+    ) -> None:
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+
+        agent_clients = self._resolve_agent_clients(agent_ids)
+
+        with tenant_scope(room.tenant_id):
+            # Both records of the membership before the wake-up. `kick_user`
+            # takes `client_rooms`; `room_agents` is the one
+            # `get_rooms_for_agent` reads, so a client reacting to the kick by
+            # re-reading its rooms must not still find this one.
+            async with self._session_factory() as session:
+                for client_id in agent_clients:
+                    await self._room_store.remove_client(session, client_id, room_id)
+                await self._room_store.remove_agents(session, room_id, agent_ids)
+                await session.commit()
+
+            for transport_user_id in agent_clients.values():
+                await self._provisioning.kick_user(
+                    room.transport_room_id, transport_user_id
+                )
+
+        logger.info("Removed %d agents from room %s", len(agent_ids), room_id)
+        await self.room_agents_changed(room.tenant_id, room.id)
+        self.room_changed(room.tenant_id, room.id)
+
+        emit_safely(
+            self._telemetry,
+            "room_agents_removed",
+            {"agent_count": len(agent_ids), "removed_by_kind": removed_by_kind},
+        )
+
+    async def _load_room(self, room_id: str) -> Room:
+        """A room row, read on the caller's session.
+
+        Deliberately *not* unscoped, even though its callers go on to bind the
+        tenant it returns. Every entry point here is a request or an inbound
+        event that already has a tenant bound and has already authorised the
+        caller against this room, so an unscoped read followed by
+        `tenant_session(room.tenant_id)` would be a confused deputy: read a
+        row from any tenant, then act as that tenant. Reading it scoped keeps
+        the elevation impossible rather than merely unreachable — under
+        policies a room the caller may not see is `Room not found`, which is
+        the correct answer.
+
+        Nothing is cached: no caller here holds a room for longer than a call.
+        """
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+        if room is None:
+            raise ValueError(f"Room not found: {room_id}")
+        return room
+
+    async def _room_tenant(self, room_id: str) -> str:
+        return (await self._load_room(room_id)).tenant_id
+
+    async def update_room(
+        self,
+        room_id: str,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        instructions: str | None = None,
+        admin_mode: bool | None = None,
+        read_visibility: str | None = None,
+        write_visibility: str | None = None,
+    ) -> None:
+        if name is not None:
+            name = name.strip()
+            if not name or len(name) > ROOM_NAME_MAX:
+                raise ValueError(
+                    f"A room's name must be 1 to {ROOM_NAME_MAX} characters."
+                )
+        tenant_id = await self._room_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            if read_visibility is not None or write_visibility is not None:
+                room = await self._room_store.get(session, room_id)
+                if room is None:
+                    raise ValueError(f"Room not found: {room_id}")
+                validate_visibility_pair(
+                    read_visibility
+                    if read_visibility is not None
+                    else room.read_visibility,
+                    write_visibility
+                    if write_visibility is not None
+                    else room.write_visibility,
+                )
+            await self._room_store.update_fields(
+                session,
+                room_id,
+                name=name,
+                description=description,
+                instructions=instructions,
+                admin_mode=admin_mode,
+                read_visibility=read_visibility,
+                write_visibility=write_visibility,
+            )
+            await session.commit()
+        self.room_changed(tenant_id, room_id)
+
+    async def take_platform_name(
+        self, room_id: str, name: str, channel_name: str
+    ) -> None:
+        """Name a bridged room after its channel, so it follows the channel's
+        renames from now on, and tell whoever sees it."""
+        tenant_id = await self._room_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            await self._room_store.set_platform_name(
+                session, room_id, name, channel_name
+            )
+            await session.commit()
+        self.room_changed(tenant_id, room_id)
+
+    async def follow_channel_name(
+        self, room_id: str, name: str, channel_name: str, legacy_name: str
+    ) -> bool:
+        """Rename a bridged room after its renamed channel when it still follows
+        the channel (`RoomStore.follow_channel_name`); False when it does not."""
+        tenant_id = await self._room_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            followed = await self._room_store.follow_channel_name(
+                session, room_id, name, channel_name, legacy_name
+            )
+            await session.commit()
+        if followed:
+            self.room_changed(tenant_id, room_id)
+        return followed
+
+    async def record_channel_name(self, room_id: str, channel_name: str) -> None:
+        """Keep the linked channel's current name on a room that does not
+        follow it, so whoever sees the room can be offered it."""
+        tenant_id = await self._room_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            await self._room_store.record_channel_name(session, room_id, channel_name)
+            await session.commit()
+        self.room_changed(tenant_id, room_id)
+
+    async def set_join_event_listeners(
+        self, room_id: str, settings: dict[str, bool]
+    ) -> None:
+        """Set, per agent id, whether it receives `room_join` events in the
+        room. `settings` maps agent id → on/off. Raises ValueError if the room
+        does not exist or an agent is not a member of it."""
+        if not settings:
+            return
+        tenant_id = await self._room_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            for agent_id, value in settings.items():
+                await self._room_store.set_receives_join_events(
+                    session, room_id, agent_id, value
+                )
+            await session.commit()
+
+    async def update_protection_config(
+        self, room_id: str, config: dict[str, object]
+    ) -> None:
+        tenant_id = await self._room_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            await self._room_store.update_protection_config(session, room_id, config)
+            await session.commit()
+
+    async def update_observe_config(
+        self, room_id: str, config: dict[str, object]
+    ) -> None:
+        tenant_id = await self._room_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            await self._room_store.update_observe_config(session, room_id, config)
+            await session.commit()
+
+    async def set_room_archived(self, room_id: str, archived: bool) -> None:
+        """Archive or unarchive a room (metadata-only, reversible).
+
+        Raises ValueError if the room does not exist.
+        """
+        # The whole row: archiving reports its age and platform.
+        room = await self._load_room(room_id)
+        async with tenant_session(self._session_factory, room.tenant_id) as session:
+            await self._room_store.set_archived(session, room_id, archived)
+            await session.commit()
+        self.room_changed(room.tenant_id, room_id)
+
+        if not archived or self._telemetry is None:
+            return
+        emit_safely(
+            self._telemetry,
+            "room_archived",
+            {
+                "bridge_platform": await self._bridge_platform(room.bridge_id),
+                "age_days": age_days(room.created_at),
+                "was_ever_active": await self._was_ever_active(room.tenant_id, room_id),
+            },
+        )
+
+    async def _bridge_platform(self, bridge_id: str | None) -> str:
+        """The platform a bridge id names, as the telemetry catalogue spells it.
+
+        `none` for an internal-only room; `unknown` for a lookup that failed —
+        the two must stay distinct, or a transient error reports a
+        Slack-bridged room as internal-only. Never raises: the operations this
+        labels must not fail because it did.
+        """
+        if bridge_id is None or self._telemetry is None:
+            return "none"
+        try:
+            async with self._session_factory() as session:
+                bridge = await self._collab_bridge_store.get(session, bridge_id)
+        except Exception:
+            logger.warning(
+                "Could not resolve the platform of bridge %s for telemetry; "
+                "reporting it as unknown.",
+                bridge_id,
+                exc_info=True,
+            )
+            return "unknown"
+        return normalise_platform(bridge.type if bridge else None)
+
+    async def _was_ever_active(self, tenant_id: str, room_id: str) -> str:
+        """Whether a human ever posted in this room: `"true"`, `"false"`, or
+        `"unknown"` when the lookup itself failed.
+
+        Asked only on archive/delete, so the cost lands on a rare operation.
+        `"unknown"` rather than `"false"` on failure — a count that could not
+        run is not evidence the room was never used, which is exactly the
+        fact this property exists to carry.
+        """
+        try:
+            async with tenant_session(self._session_factory, tenant_id) as session:
+                active = await room_had_human_activity(session, tenant_id, room_id)
+        except Exception:
+            logger.warning(
+                "Could not determine whether room %s was ever active; "
+                "reporting it as unknown.",
+                room_id,
+                exc_info=True,
+            )
+            return "unknown"
+        return "true" if active else "false"
+
+    async def add_users_to_room(self, room_id: str, user_names: list[str]) -> list[str]:
+        """Add users to a bridged room; returns the names that did not make it
+        (added users are omitted from the result).
+
+        Two ways to miss. The bridge may have no external user for the name —
+        the person has not yet signed into that workspace — or the platform may
+        refuse to add someone it does know. Both come back here, because to the
+        caller they are the same fact: that person is not in the room."""
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+        if not room.bridge_id or not room.external_channel_id:
+            raise ValueError(f"Room {room_id} is not bridged")
+        collaboration_core = self._collab_lifecycle.get(room.bridge_id)
+        if collaboration_core is None:
+            raise ValueError(f"Bridge not running: {room.bridge_id}")
+        resolved = await collaboration_core.resolve_external_user_id_map(user_names)
+        unresolved = [name for name in user_names if name not in resolved]
+        resolved_names = list(resolved.keys())
+        failed_ids = await collaboration_core.adapter.add_users_to_channel(
+            room.external_channel_id, resolved_names, list(resolved.values())
+        )
+        by_id = {resolved[name]: name for name in resolved_names}
+        unresolved.extend(by_id.get(fid, fid) for fid in failed_ids)
+        await collaboration_core.ensure_users_in_room(
+            room.id, room.transport_room_id, resolved_names
+        )
+        logger.info("Added %d users to room %s", len(resolved_names), room_id)
+        if unresolved:
+            logger.warning(
+                "Could not resolve %d user(s) on bridge %s for room %s: %s",
+                len(unresolved),
+                room.bridge_id,
+                room_id,
+                unresolved,
+            )
+        emit_safely(
+            self._telemetry,
+            # Resolved, not requested: an unknown name adds nobody.
+            "room_users_added",
+            {"user_count": max(len(user_names) - len(unresolved), 0)},
+        )
+        return unresolved
+
+    async def link_bridge_to_room(
+        self,
+        room_id: str,
+        bridge_id: str,
+        channel_type: ChannelType,
+        external_channel_id: str | None = None,
+    ) -> None:
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+
+        await self._require_tenant_bridge(bridge_id)
+        collaboration_core = self._collab_lifecycle.get(bridge_id)
+
+        if external_channel_id is None and collaboration_core is not None:
+            await self._require_channel_creation(bridge_id)
+            external_channel_id = await collaboration_core.adapter.create_channel(
+                room.name, room.description
+            )
+
+        async with tenant_session(self._session_factory, room.tenant_id) as session:
+            await self._room_store.update_bridge(
+                session,
+                room_id,
+                bridge_id=bridge_id,
+                channel_type=channel_type,
+                external_channel_id=external_channel_id,
+            )
+            await session.commit()
+
+        if collaboration_core and external_channel_id:
+            collaboration_core.add_room_mapping(
+                room.id, room.transport_room_id, external_channel_id, room.tenant_id
+            )
+        if external_channel_id:
+            self._collab_lifecycle.rooms_changed(bridge_id)
+        if collaboration_core and external_channel_id:
+            await self._ensure_channel_capture(
+                collaboration_core, external_channel_id, channel_type
+            )
+
+        logger.info("Linked bridge %s to room %s", bridge_id, room_id)
+
+    async def unlink_bridge_from_room(self, room_id: str) -> None:
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+
+            bridge_id = room.bridge_id
+
+        async with tenant_session(self._session_factory, room.tenant_id) as session:
+            await self._room_store.clear_bridge(session, room_id)
+            await session.commit()
+
+        if bridge_id:
+            collaboration_core = self._collab_lifecycle.get(bridge_id)
+            if collaboration_core:
+                collaboration_core.remove_room_mapping(room.id, room.transport_room_id)
+            self._collab_lifecycle.rooms_changed(bridge_id)
+
+        logger.info("Unlinked bridge from room %s", room_id)
+
+    async def unlink_bridge_channel(
+        self, bridge_id: str, external_channel_id: str
+    ) -> None:
+        """Detach the one room a bridge holds for an external channel.
+
+        For a bridge that serves many installs and loses one: the rest of its
+        rooms stay bridged, and this one becomes internal-only, as every room
+        does when a whole bridge goes. A channel with no room — never
+        provisioned, or already deleted — has nothing to detach.
+
+        Reads under the tenant bound by the caller, like the rest of this
+        service's unscoped sessions.
+        """
+        async with self._session_factory() as session:
+            room = await self._room_store.get_by_external_channel(
+                session, bridge_id, external_channel_id
+            )
+        if room is None:
+            logger.info(
+                "Bridge %s holds no room for channel %s; nothing to detach",
+                bridge_id,
+                external_channel_id,
+            )
+            return
+        await self.unlink_bridge_from_room(room.id)
+
+    async def change_bridge(
+        self,
+        room_id: str,
+        *,
+        bridge_id: str,
+        channel_type: ChannelType | None = None,
+        external_channel_id: str | None = None,
+    ) -> None:
+        """Move a room onto a different collaboration bridge.
+
+        Provisions a fresh external channel on the target bridge and re-adds
+        the room's current agents to it, then joins the target bridge's
+        client so events route to the new channel.
+
+        Pass ``external_channel_id`` to bind to an **existing** channel on the
+        target bridge instead of provisioning a new one — e.g. to move a room
+        back onto a channel it previously used (channels are left in place on
+        bridge change, so the old one still exists). The caller is responsible
+        for the id being a real channel on that bridge whose bridge bot is a
+        member, and the bridge refuses one that is not its own to bind
+        (`require_bindable_channel`); agents are still (re-)added to it.
+
+        Human users are **not** carried over. A user's identity is
+        bridge-specific (a Mattermost account is not the same as a Slack
+        account), so there is no reliable cross-bridge mapping — they must be
+        re-invited to the new channel manually. A warning is logged saying so.
+
+        The old bridge is then detached: its in-memory room mapping is removed
+        (so it stops syncing) and its client is kicked from the room.
+        The old external channel itself is **left in place** on its platform —
+        the adapter has no teardown primitive — so it lingers as an orphan that
+        is no longer synced. A warning is logged disclosing this; archive or
+        delete it manually on the old platform if you care.
+
+        Also serves to bridge a previously internal-only room (``bridge_id``
+        was None): the teardown step is simply skipped.
+        """
+        async with self._session_factory() as session:
+            room = await self._room_store.get(session, room_id)
+            if room is None:
+                raise ValueError(f"Room not found: {room_id}")
+            agent_ids = await self._room_store.get_agent_ids(session, room_id)
+
+        old_bridge_id = room.bridge_id
+        old_external_channel_id = room.external_channel_id
+        transport_room_id = room.transport_room_id
+
+        if old_bridge_id == bridge_id:
+            raise ValueError(f"Room {room_id} is already bound to bridge {bridge_id}")
+
+        await self._require_tenant_bridge(bridge_id)
+        new_bridge = self._collab_lifecycle.get(bridge_id)
+        if new_bridge is None:
+            raise ValueError(f"Bridge not running: {bridge_id}")
+
+        # Keep the room's existing privacy when not told otherwise; fall back to
+        # a public channel for a room that had no bridge.
+        resolved_channel_type: ChannelType = (
+            channel_type or room.channel_type or "channel_public"  # type: ignore[assignment]
+        )
+
+        if external_channel_id is None:
+            await self._require_channel_creation(bridge_id)
+            external_channel_id = await new_bridge.adapter.create_channel(
+                room.name,
+                room.description,
+                channel_type=resolved_channel_type,
+            )
+        else:
+            await new_bridge.adapter.require_bindable_channel(external_channel_id)
+
+        # One binding for everything from here on: the bridge-column update,
+        # and the invite/kick below, both write rows scoped to this room's
+        # tenant.
+        with tenant_scope(room.tenant_id):
+            # Guard the new channel until its mapping is registered, so the
+            # bot's auto-join does not spawn a duplicate room (CHOO-1660).
+            new_bridge.begin_provisioning(external_channel_id)
+            try:
+                async with self._session_factory() as session:
+                    await self._room_store.update_bridge(
+                        session,
+                        room_id,
+                        bridge_id=bridge_id,
+                        channel_type=resolved_channel_type,
+                        external_channel_id=external_channel_id,
+                    )
+                    await session.commit()
+
+                new_bridge.add_room_mapping(
+                    room_id, transport_room_id, external_channel_id, room.tenant_id
+                )
+                self._collab_lifecycle.rooms_changed(bridge_id)
+            finally:
+                new_bridge.end_provisioning(external_channel_id)
+
+            await self._ensure_channel_capture(
+                new_bridge, external_channel_id, resolved_channel_type
+            )
+            await self._provisioning.invite_to_room(
+                transport_room_id, new_bridge._workspace_consumer_transport_user_id
+            )
+
+            if resolved_channel_type not in ("direct", "group"):
+                agent_names = await self._resolve_ids_to_names(agent_ids)
+                await new_bridge.adapter.add_agents_to_channel(
+                    external_channel_id, agent_names
+                )
+                logger.warning(
+                    "Room %s moved to bridge %s: re-added %d agent(s) to channel "
+                    "%s, but human users were NOT carried over (identities are "
+                    "bridge-specific) — re-invite them to the new channel manually.",
+                    room_id,
+                    bridge_id,
+                    len(agent_names),
+                    external_channel_id,
+                )
+
+            if old_bridge_id:
+                self._collab_lifecycle.rooms_changed(old_bridge_id)
+                old_bridge = self._collab_lifecycle.get(old_bridge_id)
+                if old_bridge is not None:
+                    old_bridge.remove_room_mapping(room_id, transport_room_id)
+                    await self._provisioning.kick_user(
+                        transport_room_id,
+                        old_bridge._workspace_consumer_transport_user_id,
+                    )
+                logger.warning(
+                    "Room %s moved from bridge %s to %s; old external channel %s "
+                    "left in place on its platform (no adapter teardown) and is "
+                    "no longer synced — archive or delete it manually if "
+                    "desired.",
+                    room_id,
+                    old_bridge_id,
+                    bridge_id,
+                    old_external_channel_id,
+                )
+
+        logger.info(
+            "Changed bridge for room %s: %s -> %s (new channel %s)",
+            room_id,
+            old_bridge_id,
+            bridge_id,
+            external_channel_id,
+        )
+
+    def _resolve_agent_clients(self, agent_ids: list[str]) -> dict[str, str]:
+        """Returns {client_id: transport_user_id} for the given agent IDs."""
+        result: dict[str, str] = {}
+        for agent_id in agent_ids:
+            client = self._client_lifecycle.get_by_agent_id(agent_id)
+            if client is None:
+                raise ValueError(f"No running client for agent: {agent_id}")
+            result[client.client_id] = client.transport_user_id
+        return result
+
+    def _resolve_system_clients(self, tenant_id: str) -> dict[str, str]:
+        """`{client_id: transport_user_id}` for `tenant_id`'s system clients.
+
+        Per tenant, not per deployment. `clients` is scoped, so there is an
+        admin client per tenant rather than one for everyone, and the running
+        registry this reads holds all of them at once. Handing another
+        tenant's to a room is caught by `client_rooms`' composite foreign key
+        on `(tenant_id, client_id)` — as an exception, not as a wrong row —
+        so it is the room's own tenant that has to be asked for here.
+        """
+        result: dict[str, str] = {}
+        for client_type in SYSTEM_CLIENT_TYPES:
+            for client in self._client_lifecycle.get_by_type(client_type, tenant_id):
+                result[client.client_id] = client.transport_user_id
+        return result
+
+    async def _invite_clients(
+        self, transport_room_id: str, client_ids: dict[str, str]
+    ) -> None:
+        """Invites all clients to the room; each client auto-accepts."""
+        for transport_user_id in client_ids.values():
+            await self._provisioning.invite_to_room(
+                transport_room_id, transport_user_id
+            )
+
+    async def reconcile_room_clients(self) -> None:
+        """Ensure every room's clients are actually in it.
+
+        Two sources of drift. Rooms created before a system-client type existed
+        (e.g. the admin client) have no membership for it. And a membership
+        change writes the `room_agents` row, invites, then records
+        `room_clients` — so a crash in that window leaves a member the invite
+        may never have reached, with the absent `room_clients` row as the
+        marker.
+
+        Run once at startup. The clients are starting concurrently, so agent
+        clients are resolved from the database rather than from the running
+        registry; a pending invite is accepted on the client's first sync.
+        Idempotent: `invite_to_room` is a no-op for an already-joined user, and
+        DB membership is only recorded where it is missing.
+
+        Every tenant's rooms in one pass, and one room's failure is contained
+        to that room. This runs inline in `main.run()` before the server is
+        listening, so an exception escaping here is not a failed
+        reconciliation — it is a deployment that does not start, for every
+        tenant, because of one room belonging to one of them. The failures are
+        counted and reported at `error`, so a contained one is still an
+        operator's problem rather than a silent one.
+
+        The memberships are read for `RECONCILE_BATCH_SIZE` rooms at a time,
+        and only a room missing a client is written to. This runs under the
+        boot lock, so every process that starts waits for it: read room by
+        room, a deployment with tens of thousands of rooms took longer than
+        the liveness probe allows, and processes starting together were
+        restarted while they waited.
+        """
+        # Which tenants exist is the one read that spans them (the exemption,
+        # `db/tenant_lookup.py`); each tenant's rooms are then an ordinary
+        # scoped read, and each room's own tenant is bound again around
+        # repairing that one room.
+        missing_by_room: list[tuple[Room, dict[str, str]]] = []
+        room_count = 0
+        for tenant_id in await all_tenant_ids(self._session_factory):
+            system_clients = self._resolve_system_clients(tenant_id)
+            async with tenant_session(self._session_factory, tenant_id) as session:
+                # Filtered on the row's own tenant, not left to the policy: on an
+                # owner connection no policy narrows this read, and the fan-out
+                # would act on every tenant's rows once per tenant. See
+                # `db/tenant_lookup.py`, "a fan-out ... filters what it reads back".
+                rooms = [
+                    room
+                    for room in await self._room_store.get_all(
+                        session, include_archived=True
+                    )
+                    if room.tenant_id == tenant_id
+                ]
+                room_count += len(rooms)
+                for start in range(0, len(rooms), RECONCILE_BATCH_SIZE):
+                    batch = rooms[start : start + RECONCILE_BATCH_SIZE]
+                    room_ids = [room.id for room in batch]
+                    existing = await self._room_store.client_ids_by_room(
+                        session, room_ids
+                    )
+                    agents = await self._room_store.member_agent_clients_by_room(
+                        session, room_ids
+                    )
+                    for room in batch:
+                        missing = _missing_clients(
+                            existing.get(room.id, []),
+                            {**agents.get(room.id, {}), **system_clients},
+                        )
+                        if missing:
+                            missing_by_room.append((room, missing))
+
+        failures: list[str] = []
+        for room, missing in missing_by_room:
+            try:
+                await self._add_missing_clients(room, missing)
+            except Exception:
+                logger.exception("Failed to reconcile clients into room %s", room.id)
+                failures.append(room.id)
+        if failures:
+            logger.error(
+                "Could not reconcile clients into %d of %d room(s): %s. Those "
+                "rooms are missing system or agent clients until this is fixed "
+                "and the service restarted.",
+                len(failures),
+                room_count,
+                ", ".join(failures),
+            )
+
+    async def reconcile_room(self, room: Room, user_names: list[str] | None) -> None:
+        """Put the room's agent and system clients in it where they are missing.
+
+        For a caller repairing one room whose creation may have stopped after
+        the room row committed and before its clients joined. A room on a
+        bridge also gets the bridge client and the actors of `user_names`,
+        ahead of the agents as in `create_room`.
+        """
+        if room.bridge_id is not None and room.external_channel_id is not None:
+            collaboration_core = self._collab_lifecycle.get(room.bridge_id)
+            if collaboration_core is None:
+                raise ValueError(f"Bridge not running: {room.bridge_id}")
+            await self._provisioning.invite_to_room(
+                room.transport_room_id,
+                collaboration_core._workspace_consumer_transport_user_id,
+            )
+            if user_names:
+                await collaboration_core.ensure_users_in_room(
+                    room.id, room.transport_room_id, user_names
+                )
+        await self._reconcile_one_room(room)
+
+    async def _reconcile_one_room(self, room: Room) -> None:
+        with tenant_scope(room.tenant_id):
+            async with self._session_factory() as session:
+                existing = await self._room_store.get_client_ids(session, room.id)
+                agents = await self._room_store.get_member_agent_clients(
+                    session, room.id
+                )
+        # Resolved per room rather than once for the fan-out: the system
+        # clients belong to a tenant, and which ones are this room's depends
+        # on the room.
+        missing = _missing_clients(
+            existing, {**agents, **self._resolve_system_clients(room.tenant_id)}
+        )
+        if missing:
+            await self._add_missing_clients(room, missing)
+
+    async def _add_missing_clients(self, room: Room, missing: dict[str, str]) -> None:
+        """Invite `missing` (`{client_id: transport_user_id}`) into the room and
+        record their memberships, as the room's own tenant."""
+        with tenant_scope(room.tenant_id):
+            await self._invite_clients(room.transport_room_id, missing)
+            async with self._session_factory() as session:
+                for client_id in missing:
+                    await self._room_store.add_client(session, client_id, room.id)
+                await session.commit()
+        logger.info("Reconciled %d client(s) into room %s", len(missing), room.id)
+
+    async def resolve_bridge_users(
+        self, bridge_id: str, names: list[str]
+    ) -> dict[str, str]:
+        """Which of ``names`` are people on the bridge, as name to external id.
+
+        The same resolution room creation applies to a template's ``users:``
+        (known users first, then an exact directory match), exposed so a
+        ``user``-typed template param can be checked before the room exists.
+        Raises when the bridge is not running, since nothing can be looked up
+        on it then.
+        """
+        await self._require_tenant_bridge(bridge_id)
+        collaboration_core = self._collab_lifecycle.get(bridge_id)
+        if collaboration_core is None:
+            raise ValueError("the room's messaging app is not running")
+        return await collaboration_core.resolve_external_user_id_map(names)
+
+    async def ensure_client_in_room(self, room_id: str, client_id: str) -> None:
+        """Invite a single running client to the room (it auto-joins) and record
+        its membership. Idempotent — safe to call repeatedly, e.g. on every
+        bridged message from an external user's human actor."""
+        room = await self._load_room(room_id)
+        async with tenant_session(self._session_factory, room.tenant_id) as session:
+            already_member = client_id in await self._room_store.get_client_ids(
+                session, room_id
+            )
+
+        client = self._client_lifecycle.get(client_id)
+        if client is None:
+            raise ValueError(f"No running client: {client_id}")
+
+        # The invite itself writes a membership row and an arrival message
+        # scoped to this room's tenant (PostgresProvisioning.invite_to_room),
+        # so it is bound here alongside the membership record below rather
+        # than left to whatever tenant happened to already be ambient.
+        with tenant_scope(room.tenant_id):
+            await self._provisioning.invite_to_room(
+                room.transport_room_id, client.transport_user_id
+            )
+
+            if not already_member:
+                async with self._session_factory() as session:
+                    await self._room_store.add_client(session, client_id, room_id)
+                    await session.commit()
+
+
+def _missing_clients(
+    existing: Collection[str], expected: dict[str, str]
+) -> dict[str, str]:
+    """The entries of `expected` (`{client_id: transport_user_id}`) whose
+    client is not among the room's `existing` client ids."""
+    present = set(existing)
+    return {cid: uid for cid, uid in expected.items() if cid not in present}

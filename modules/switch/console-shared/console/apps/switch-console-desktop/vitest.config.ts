@@ -1,0 +1,135 @@
+import { resolve } from 'node:path';
+import tailwindcss from '@tailwindcss/vite';
+import { playwright } from '@vitest/browser-playwright';
+import { defineConfig } from 'vitest/config';
+
+const alias = {
+  '@': resolve(__dirname, 'src'),
+  '@root': resolve(__dirname, '.'),
+  '@shared': resolve(__dirname, 'src/shared'),
+  '@renderer': resolve(__dirname, 'src/renderer'),
+  '@main': resolve(__dirname, 'src/main'),
+  '@tooling': resolve(__dirname, 'tooling'),
+};
+
+// For fixture and migration Vitest projects, redirect better-sqlite3 to an
+// isolated copy installed under tooling/node-deps/ (compiled for system Node).
+// The root node_modules/better-sqlite3 stays Electron-compiled at all times,
+// so no rebuild dance is needed when switching between app dev and DB tests.
+// Every project that runs app code gets the real agent provider catalogue,
+// built in Node by the global setup and installed before each test file.
+const agentProviderCatalogue = {
+  globalSetup: ['./tooling/agent-provider-catalogue/global-setup.ts'],
+  setupFiles: ['./tooling/agent-provider-catalogue/install.ts'],
+};
+
+const toolingAlias = {
+  ...alias,
+  'better-sqlite3': resolve(__dirname, 'tooling/node-deps/node_modules/better-sqlite3'),
+};
+
+export default defineConfig({
+  resolve: { alias },
+  test: {
+    projects: [
+      {
+        // All existing tests that run in a Node.js environment.
+        // Migration tests are excluded — run them via `pnpm run test:migrations`.
+        // DB integration tests (*.db.test.ts) are excluded — run under the main-db project.
+        extends: true,
+        test: {
+          name: 'node',
+          environment: 'node',
+          ...agentProviderCatalogue,
+          include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
+          exclude: [
+            '**/_*/**',
+            'src/renderer/tests/browser/**',
+            'src/main/db/tests/migrations/**',
+            'src/main/db/legacy-port/**/*.test.ts',
+            'src/main/core/**/*.db.test.ts',
+            'src/main/db/**/*.db.test.ts',
+          ],
+        },
+      },
+      {
+        // Main-process integration tests that need a real SQLite connection.
+        // Uses toolingAlias so better-sqlite3 resolves to the system-Node build.
+        extends: true,
+        resolve: { alias: toolingAlias },
+        test: {
+          name: 'main-db',
+          environment: 'node',
+          ...agentProviderCatalogue,
+          include: [
+            'src/main/core/**/*.db.test.ts',
+            'src/main/db/legacy-port/**/*.test.ts',
+            'src/main/db/**/*.db.test.ts',
+          ],
+        },
+      },
+      {
+        // Fixture generator — run explicitly via `pnpm run db:fixtures`.
+        // Uses toolingAlias to load the system-Node build of better-sqlite3.
+        extends: true,
+        resolve: { alias: toolingAlias },
+        test: {
+          name: 'fixtures',
+          environment: 'node',
+          include: ['tooling/generate-fixtures.ts'],
+        },
+      },
+      {
+        // Migration tests — run explicitly via `pnpm run test:migrations`.
+        // Uses toolingAlias to load the system-Node build of better-sqlite3.
+        extends: true,
+        resolve: { alias: toolingAlias },
+        test: {
+          name: 'migrations',
+          environment: 'node',
+          include: ['src/main/db/tests/migrations/**/*.test.ts'],
+        },
+      },
+      {
+        // Renderer tests that need a real browser environment (real CSS
+        // layout, ResizeObserver, requestAnimationFrame, WebGL).
+        extends: true,
+        // Crawl the browser tests when deps are first optimized. Without this
+        // their imports are only discovered once the page loads them, so Vite
+        // re-optimizes and reloads mid-run — which vitest reports as flaky and
+        // which, before the tests imported statically, split React in two.
+        // A glob rather than a dependency list: a new import is picked up here,
+        // an inventory would go stale.
+        // `react/jsx-dev-runtime` is named explicitly because the JSX transform
+        // injects it rather than any file importing it, so crawling cannot find it.
+        optimizeDeps: {
+          entries: ['src/renderer/tests/browser/**/*.test.{ts,tsx}'],
+          include: ['react/jsx-dev-runtime'],
+        },
+        // Layout assertions need the real utility classes, not just the class
+        // strings. Only the renderer build carries this plugin, so a browser
+        // test importing index.css would otherwise get no Tailwind output —
+        // `electron.vite.config.ts` is the app's build and does not apply here.
+        plugins: [tailwindcss()],
+        test: {
+          name: 'browser',
+          browser: {
+            enabled: true,
+            provider: playwright(),
+            headless: true,
+            instances: [{ browser: 'chromium' }],
+          },
+          include: ['src/renderer/tests/browser/**/*.test.{ts,tsx}'],
+          // Supplies the preload bridge before a test module is evaluated, so
+          // renderer imports can be static. See the file's docblock for why a
+          // dynamic import of app code breaks React here.
+          globalSetup: agentProviderCatalogue.globalSetup,
+          setupFiles: [
+            './src/renderer/tests/browser/setup-electron-bridge.ts',
+            ...agentProviderCatalogue.setupFiles,
+          ],
+        },
+      },
+    ],
+  },
+});

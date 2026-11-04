@@ -1,0 +1,229 @@
+import type { AgentRuntimeProvider } from '@main/core/agent-runtime/types';
+import { LocalExecutionContext } from '@main/core/execution-context/local-execution-context';
+import { SshExecutionContext } from '@main/core/execution-context/ssh-execution-context';
+import type { IExecutionContext } from '@main/core/execution-context/types';
+import { LocalFileSystem } from '@main/core/fs/impl/local-fs';
+import { SshFileSystem } from '@main/core/fs/impl/ssh-fs';
+import type { FileSystemProvider } from '@main/core/fs/types';
+import { LifecycleScriptService } from '@main/core/locations/lifecycle-service';
+import type { LocationRuntime } from '@main/core/locations/location-runtime';
+import { type LocationRuntimeFactoryResult } from '@main/core/locations/location-runtime-registry';
+import { SharedAgentRuntime } from '@main/core/sdk-host/shared-agent-runtime';
+import { ensureSshConnected } from '@main/core/ssh/connect/connect-agent-ssh';
+import type { SshClientProxy } from '@main/core/ssh/lifecycle/ssh-client-proxy';
+import { runLifecycleScriptWithPolicy } from '@main/core/terminals/lifecycle-script-coordinator';
+import type { Session } from '@shared/core/sessions/sessions';
+import { getEffectiveSessionSettings } from '../locations/settings/effective-session-settings';
+import type { LocationSettingsProvider } from '../locations/settings/provider';
+import { TEARDOWN_SCRIPT_WAIT_MS } from '../sessions/provision-session-error';
+import type { LocationTransport } from './location-transport';
+import { getSessionEnvVars } from './session-env';
+
+type SshTransport = Extract<LocationTransport, { kind: 'ssh' }>;
+
+function connectSshTransport(transport: SshTransport): Promise<SshClientProxy> {
+  return ensureSshConnected(transport.connectionId, transport.host);
+}
+
+type LocationRuntimeFactoryContext = {
+  session: Pick<Session, 'id' | 'title'>;
+  workDir: string;
+  settings: LocationSettingsProvider;
+  logPrefix: string;
+  extraHooks?: {
+    onCreate?: (runtime: LocationRuntime) => Promise<void>;
+    onDestroy?: (runtime: LocationRuntime) => Promise<void>;
+    onDetach?: (runtime: LocationRuntime) => Promise<void>;
+  };
+};
+
+/**
+ * Returns a factory function suitable for passing to `LocationRuntimeRegistry.acquire`.
+ * Handles all transport-specific construction (local vs SSH) and wires lifecycle
+ * script hooks. Provider-specific hooks are passed via `extraHooks`.
+ */
+export function createLocationRuntimeFactory(
+  locationId: string,
+  transport: LocationTransport,
+  context: LocationRuntimeFactoryContext
+): () => Promise<LocationRuntimeFactoryResult> {
+  return async () => {
+    const workDir = context.workDir;
+
+    // Transport: local runs on this machine; ssh runs on the agent's host. The
+    // SSH connection is established here (and reused by the session providers).
+    let ctx: IExecutionContext;
+    let runtimeFs: FileSystemProvider;
+    if (transport.kind === 'ssh') {
+      const proxy = await connectSshTransport(transport);
+      ctx = new SshExecutionContext(proxy, { root: transport.dir });
+      runtimeFs = new SshFileSystem(proxy, transport.dir);
+    } else {
+      ctx = new LocalExecutionContext({ root: workDir });
+      runtimeFs = new LocalFileSystem(workDir);
+    }
+
+    // Settings (shared)
+    const locationSettings = await context.settings.get();
+    const bootstrapSessionEnvVars = getSessionEnvVars({
+      sessionId: context.session.id,
+      sessionName: context.session.title,
+      sessionPath: workDir,
+      rootPath: workDir,
+      portSeed: workDir,
+    });
+    const sessionLevelSettings = await getEffectiveSessionSettings({
+      locationSettings: context.settings,
+      sessionFs: runtimeFs,
+    });
+    const shellSetup = sessionLevelSettings.shellSetup ?? locationSettings.shellSetup;
+    const scripts = sessionLevelSettings.scripts;
+
+    const lifecycleService = new LifecycleScriptService({
+      ctx,
+      sessionEnvVars: bootstrapSessionEnvVars,
+      windows: transport.kind === 'local' && process.platform === 'win32',
+    });
+
+    const runtime: LocationRuntime = {
+      id: locationId,
+      path: workDir,
+      fs: runtimeFs,
+      settings: context.settings,
+      lifecycleService,
+    };
+
+    const { logPrefix } = context;
+
+    return {
+      runtime,
+
+      onCreateSideEffect: (rt) => {
+        void (async () => {
+          if (scripts?.setup && (locationSettings.autoRunSetupScriptOnSessionCreation ?? true)) {
+            const setupResult = await runLifecycleScriptWithPolicy({
+              runtime: rt,
+              sessionId: context.session.id,
+              locationId,
+              type: 'setup',
+              script: scripts.setup,
+              shellSetup,
+              origin: 'auto-setup',
+              policy: {
+                logFailure: true,
+                surfaceFailure: true,
+                continueOnFailure: true,
+              },
+              logPrefix,
+            });
+            if (setupResult.kind !== 'succeeded') return;
+          }
+
+          if (scripts?.run && (locationSettings.autoRunRunScriptOnSessionCreation ?? false)) {
+            await runLifecycleScriptWithPolicy({
+              runtime: rt,
+              sessionId: context.session.id,
+              locationId,
+              type: 'run',
+              script: scripts.run,
+              shellSetup,
+              origin: 'auto-run',
+              policy: {
+                logFailure: true,
+                surfaceFailure: true,
+                continueOnFailure: true,
+              },
+              logPrefix,
+            });
+          }
+        })();
+      },
+
+      onCreate: context.extraHooks?.onCreate,
+
+      onDestroy: async (rt) => {
+        const latestSessionSettings = await getEffectiveSessionSettings({
+          locationSettings: context.settings,
+          sessionFs: rt.fs,
+        });
+        const latestLocationSettings = await context.settings.get();
+        const latestShellSetup =
+          latestSessionSettings.shellSetup ?? latestLocationSettings.shellSetup;
+        const teardownScript = latestSessionSettings.scripts?.teardown;
+
+        if (teardownScript) {
+          await runLifecycleScriptWithPolicy({
+            runtime: rt,
+            sessionId: context.session.id,
+            locationId,
+            type: 'teardown',
+            script: teardownScript,
+            shellSetup: latestShellSetup,
+            origin: 'location-destroy',
+            policy: {
+              timeoutMs: TEARDOWN_SCRIPT_WAIT_MS,
+              logFailure: true,
+              surfaceFailure: false,
+              continueOnFailure: true,
+            },
+            logPrefix,
+          });
+        }
+        await context.extraHooks?.onDestroy?.(rt);
+      },
+
+      onDetach: async (rt) => {
+        await context.extraHooks?.onDetach?.(rt);
+      },
+    };
+  };
+}
+
+type AgentRuntimeOpts = {
+  locationId: string;
+  sessionId: string;
+  sessionPath: string;
+  shellSetup?: string;
+  sessionEnvVars: Record<string, string>;
+};
+
+/**
+ * Creates the session's agent runtime for the given transport. The exec
+ * function is derived internally from the LocationTransport.
+ */
+export async function buildAgentRuntime(
+  transport: LocationTransport,
+  opts: AgentRuntimeOpts
+): Promise<AgentRuntimeProvider> {
+  return new SharedAgentRuntime(transport, opts);
+}
+
+/**
+ * Resolves the session-level environment variables and settings from an
+ * already-acquired location runtime. Used by providers after
+ * `locationRuntimeRegistry.acquire` to avoid duplicating settings reads.
+ */
+export async function resolveSessionEnv(
+  session: Pick<Session, 'id' | 'title'>,
+  runtime: Pick<LocationRuntime, 'path' | 'fs'>,
+  settings: LocationSettingsProvider
+): Promise<{
+  sessionEnvVars: Record<string, string>;
+  shellSetup?: string;
+}> {
+  const locationSettings = await settings.get();
+  const sessionLevelSettings = await getEffectiveSessionSettings({
+    locationSettings: settings,
+    sessionFs: runtime.fs,
+  });
+  return {
+    sessionEnvVars: getSessionEnvVars({
+      sessionId: session.id,
+      sessionName: session.title,
+      sessionPath: runtime.path,
+      rootPath: runtime.path,
+      portSeed: runtime.path,
+    }),
+    shellSetup: sessionLevelSettings.shellSetup ?? locationSettings.shellSetup,
+  };
+}

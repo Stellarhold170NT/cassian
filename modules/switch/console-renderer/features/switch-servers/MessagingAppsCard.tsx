@@ -1,0 +1,998 @@
+import { useQueries, useQueryClient, useQuery } from '@tanstack/react-query';
+import {
+  CircleAlert,
+  Clock,
+  Copy,
+  ExternalLink,
+  Info,
+  Key,
+  KeyRound,
+  Link2,
+  MessageSquare,
+  MoreVertical,
+  Plus,
+  PlusCircle,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+  TriangleAlert,
+  Unlink,
+  Users,
+  X,
+} from 'lucide-react';
+import { observer } from 'mobx-react-lite';
+import { Fragment, useEffect, useMemo, useState } from 'react';
+import { workspacesStore } from '@renderer/features/workspaces/workspaces-store';
+import { BridgeIcon, hasBridgeIcon } from '@renderer/lib/components/bridge-icon';
+import { bridgePlatformLabel } from '@renderer/lib/components/bridge-platform';
+import { failureText } from '@renderer/lib/errors/describe-failure';
+import { toast as showToast } from '@renderer/lib/hooks/use-toast';
+import { useFeatureFlags } from '@renderer/lib/hooks/useFeatureFlags';
+import { rpc } from '@renderer/lib/ipc';
+import { useShowModal } from '@renderer/lib/modal/modal-provider';
+import { openExternalUrl } from '@renderer/lib/open-external';
+import { Alert, AlertAction, AlertDescription } from '@renderer/lib/ui/alert';
+import { Badge } from '@renderer/lib/ui/badge';
+import { Button } from '@renderer/lib/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuCheckboxItem,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@renderer/lib/ui/dropdown-menu';
+import { Spinner } from '@renderer/lib/ui/spinner';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@renderer/lib/ui/tooltip';
+import { log } from '@renderer/utils/logger';
+import type {
+  LinkedIdentity,
+  PendingIdentity,
+  RemoteBridge,
+} from '@shared/core/switch-servers/switch-servers';
+import { bridgeTypesQueryKey, fetchBridgeTypes } from './bridge-platforms-loader';
+import { ConnectedChatsList } from './ConnectedChatsList';
+import { LinkAccountPrompts } from './link-account-prompts';
+import { accountHandle, linkRequestFailureText } from './link-accounts-prose';
+import { orderBridges } from './messaging-apps-order';
+import {
+  hasUnlinkedMessagingApp,
+  identityLinkOrderingNote,
+  linkedIdentityOn,
+  unrecognisedMessagingApps,
+  unrecognisedMessagingAppsMessage,
+} from './messaging-apps-warning';
+import { mayReplaceToken, offersTokenReplacement, tokenFields } from './replace-token';
+import { switchRoomsStore } from './switch-rooms-store';
+import { switchServersStore } from './switch-servers-store';
+import { unconfirmedLinksQuery } from './unconfirmed-links';
+import { useMyIdentities, useMyPendingIdentities } from './use-my-identities';
+import { administersWorkspaceInScope } from './workspace-admin';
+
+/**
+ * The messaging apps bridged to a server, which account in each one is the
+ * signed-in user, and — for a workspace owner or admin — the way to connect another
+ * (CHOO-1784, CHOO-2137).
+ *
+ * One row per app: its name with the account you have claimed on it underneath,
+ * a Link button while you have not, and a menu holding everything else. Read
+ * far more often than changed, so it is a list rather than a table of controls
+ * — the settings that used to be columns are in the menu, where they cost
+ * nothing to ignore.
+ *
+ * Listing is offered on every server type, not just managed ones: a bridge is
+ * registered through the server's own admin API, so there is nothing
+ * Switch Console has to own locally for this to work. Attaching is gated on the
+ * signed-in user administering the workspace, because the endpoint is; linking an account is
+ * not, because claiming an identity is something every user does for themselves.
+ */
+/** Why a server has messaging apps at all: the agents registered here become
+ * reachable in them. Linking is deliberately not explained here — it has its
+ * own hover on the rows and the warning that are actually about it, and saying
+ * both on the heading made the section's purpose the smaller half of a wall of
+ * text. */
+const MESSAGING_APPS_PURPOSE =
+  'Connecting a messaging app puts this server’s agents in it, so you can talk to them where you already work.';
+
+/** Shown beside a row that has no linked account, and beside the card-level
+ * warning, so the consequence is one hover away from the thing warning about
+ * it rather than only in the section heading. */
+const NO_ACCOUNT_EXPLANATION =
+  'Switch cannot tell which account in this app is you. Agents set to answer only their owner will not recognise you here, and messages from you read as if from a stranger.';
+
+/** Beside a link made before links had to be confirmed. */
+const NOT_CONFIRMED_EXPLANATION =
+  'This link was made before Switch asked accounts to confirm them. It still works. Confirm it by posting a one-time code from the account.';
+
+/** Beside a link waiting for its code, which is not a link yet. */
+const WAITING_EXPLANATION =
+  'This account is not linked until a one-time code is posted from it. Until then your agents do not recognise you here.';
+
+export const MessagingAppsCard = observer(function MessagingAppsCard({
+  serverId,
+  className,
+}: {
+  serverId: string;
+  className?: string;
+}) {
+  const queryClient = useQueryClient();
+  const showConnectMessagingApp = useShowModal('connectMessagingAppModal');
+  const showDisconnectMessagingApp = useShowModal('disconnectMessagingAppModal');
+  const showReplaceToken = useShowModal('replaceTokenModal');
+  const showConnectChat = useShowModal('connectChatModal');
+  const showRequireLinkConfirmation = useShowModal('requireLinkConfirmationModal');
+  const workspaceId = workspacesStore.idOnServerInScope(serverId);
+  const isAdmin = administersWorkspaceInScope(serverId);
+  const flags = useFeatureFlags(serverId);
+  // With chats on, Switch Console's own chats and rooms need no messaging app.
+  const chatsWithoutApp = flags.agent_chats || flags.group_chats;
+  // Only a stack Switch Console runs has a chat whose credentials it generated and
+  // can therefore show; anyone else's Mattermost is their own to hand out.
+  const isManaged = !!switchServersStore.servers.find((s) => s.id === serverId)?.managed;
+
+  const bridgesQuery = useQuery({
+    queryKey: ['remote-bridges', workspaceId],
+    queryFn: () => rpc.workspaces.listBridges(workspaceId as string),
+    enabled: workspaceId !== null,
+  });
+
+  const bridges = useMemo(() => orderBridges(bridgesQuery.data ?? []), [bridgesQuery.data]);
+
+  // Which platforms the signed-in user may connect another chat on. Asked only
+  // once there is a connection whose chats arrive that way, which also keeps
+  // the question off servers that predate it.
+  const hasClaimedChats = bridges.some((b) => b.channelIdsRefused !== null);
+  const messagingAppsQuery = useQuery({
+    queryKey: ['messaging-apps', workspaceId],
+    queryFn: () => rpc.workspaces.listMessagingApps(workspaceId as string),
+    enabled: workspaceId !== null && hasClaimedChats,
+  });
+  const chatPlatforms = new Set(
+    (messagingAppsQuery.data?.claimable ?? []).filter((c) => c.canAddChat).map((c) => c.platform)
+  );
+
+  const {
+    identities,
+    error: identitiesError,
+    refresh: refreshIdentities,
+  } = useMyIdentities(workspaceId);
+  const { pending, error: pendingError } = useMyPendingIdentities(workspaceId);
+  // Whose claim to drop when unlinking. Every account here is one the signed-in
+  // user claimed, and other people may hold the same one — so name the user
+  // rather than let the server infer it. Null until the session is read back,
+  // where the server falls back to the caller, which is the same person.
+  const currentUserId = switchServersStore.statusFor(serverId)?.user?.id ?? null;
+
+  // Whether an unlinked app actually costs this user anything. Asked only once
+  // the cheap half of the condition holds — there is an app they have not
+  // linked — because a user who has linked everywhere has nothing to be warned
+  // about, so the answer would go nowhere. The probe itself is one agent-list
+  // read, so it is not cached beyond that: linking an account or changing an
+  // agent's policy should stop the warning on the next look, not a minute later.
+  const anyUnlinked = hasUnlinkedMessagingApp(bridges, identities);
+  const ownerAgentsQuery = useQuery({
+    queryKey: ['owns-owner-addressed-agent', workspaceId],
+    queryFn: () => rpc.workspaces.ownsOwnerAddressedAgent(workspaceId as string),
+    enabled: workspaceId !== null && anyUnlinked,
+  });
+  // The probe failing costs no data on screen, only the warning — so it is
+  // logged rather than shown, and the card does not warn on a guess.
+  const ownerAgentsError = ownerAgentsQuery.error;
+  useEffect(() => {
+    if (ownerAgentsError) {
+      log.warn('Could not check for owner-addressed agents', {
+        workspaceId,
+        error: ownerAgentsError,
+      });
+    }
+  }, [ownerAgentsError, workspaceId]);
+
+  // Which connections can take a new token: each platform's secret fields come
+  // from its schema, and a connection is asked about its install only once it
+  // has some, since an install is what marks one on Switch's own app.
+  const typesQuery = useQuery({
+    queryKey: bridgeTypesQueryKey(workspaceId),
+    queryFn: () => fetchBridgeTypes(workspaceId as string),
+    enabled: workspaceId !== null && isAdmin,
+  });
+  const tokenFieldsOf = (bridge: RemoteBridge) =>
+    tokenFields(typesQuery.data?.find((t) => t.key === bridge.type)?.fields ?? []);
+  const tokenCandidates = isAdmin
+    ? bridges.filter((bridge) => mayReplaceToken(bridge, tokenFieldsOf(bridge)))
+    : [];
+  const installStates = useQueries({
+    queries: tokenCandidates.map((bridge) => ({
+      queryKey: ['bridge-install-state', workspaceId, bridge.id],
+      queryFn: () =>
+        rpc.workspaces.bridgeInstallState({
+          workspaceId: workspaceId as string,
+          bridgeId: bridge.id,
+        }),
+      enabled: workspaceId !== null,
+    })),
+  });
+  const installStateOf = (bridge: RemoteBridge) =>
+    installStates[tokenCandidates.findIndex((b) => b.id === bridge.id)]?.data;
+
+  // Links made before links had to be confirmed, per app, which an admin can
+  // stop trusting. Never asked for anyone else: the route is admin-only.
+  const olderLinkQueries = useQueries({
+    queries: bridges.map((bridge) => ({
+      ...unconfirmedLinksQuery(workspaceId, bridge.id),
+      enabled: isAdmin && workspaceId !== null,
+    })),
+  });
+  const olderLinkCountOf = (bridge: RemoteBridge): number =>
+    isAdmin ? (olderLinkQueries[bridges.indexOf(bridge)]?.data?.length ?? 0) : 0;
+  // Like the probe above, a failure here costs only a menu item, so it is
+  // logged rather than shown.
+  const olderLinksError = olderLinkQueries.find((q) => q.error !== null)?.error ?? null;
+  useEffect(() => {
+    if (olderLinksError) {
+      log.warn('Could not read the older links on a messaging app', {
+        workspaceId,
+        error: olderLinksError,
+      });
+    }
+  }, [olderLinksError, workspaceId]);
+
+  const unrecognisedIn = unrecognisedMessagingApps({
+    bridges,
+    identities,
+    ownsOwnerAddressedAgent: ownerAgentsQuery.isSuccess ? ownerAgentsQuery.data : null,
+  });
+
+  // Which bridge's channel-creation switch is mid-flight, so only that row
+  // disables rather than the whole list, and the surfaced error names the one
+  // connection that failed.
+  const [savingBridgeId, setSavingBridgeId] = useState<string | null>(null);
+  const [toggleError, setToggleError] = useState<string | null>(null);
+
+  // A chat connected from either dialog lands in the chat, on no signal
+  // Switch Console receives, so the sidebar and the chat list are looked at
+  // again when the dialog goes away rather than waited on.
+  const refreshChats = () => {
+    void switchRoomsStore.refreshRoomState();
+    void queryClient.invalidateQueries({ queryKey: ['connected-chats', workspaceId] });
+  };
+
+  const handleToggleChannelCreation = async (bridge: RemoteBridge, enabled: boolean) => {
+    if (workspaceId === null) return;
+    setSavingBridgeId(bridge.id);
+    setToggleError(null);
+    try {
+      const result = await rpc.workspaces.updateBridge({
+        workspaceId,
+        bridgeId: bridge.id,
+        channelCreationEnabled: enabled,
+      });
+      if (result.kind !== 'updated') {
+        setToggleError(`Could not update ${bridge.displayName}: ${messageForUpdate(result)}`);
+        return;
+      }
+      await queryClient.invalidateQueries({ queryKey: ['remote-bridges', workspaceId] });
+    } catch (cause) {
+      setToggleError(failureText(cause, `Could not update ${bridge.displayName}.`));
+    } finally {
+      setSavingBridgeId(null);
+    }
+  };
+
+  return (
+    <div className={className}>
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-medium text-foreground">Messaging apps</h3>
+          {/* What the section is for, in the order the two facts matter:
+              connecting puts the agents somewhere people already are, and
+              linking is what lets those agents tell who is talking to them.
+              It used to be the "Your account" column's header tooltip; with
+              the columns gone it belongs to the heading. */}
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <span
+                  tabIndex={0}
+                  aria-label={MESSAGING_APPS_PURPOSE}
+                  className="inline-flex text-foreground-muted"
+                >
+                  <Info className="size-3.5" />
+                </span>
+              }
+            />
+            <TooltipContent className="max-w-xs">{MESSAGING_APPS_PURPOSE}</TooltipContent>
+          </Tooltip>
+          {bridgesQuery.isLoading && <Spinner className="size-3.5" />}
+        </div>
+        {isAdmin && (
+          <Button
+            size="sm"
+            onClick={() =>
+              showConnectMessagingApp({
+                serverId,
+                // The dialog re-reads the bridge list and offers to link
+                // your account on the new app itself, wherever it is opened.
+                onClosed: refreshChats,
+              })
+            }
+          >
+            <Plus className="size-4" />
+            Connect
+          </Button>
+        )}
+      </div>
+
+      <LinkAccountPrompts
+        workspaceId={workspaceId}
+        bridges={bridges}
+        identities={identities}
+        pending={pending}
+      />
+
+      {/* Same shape as the addressing editor's owner warning, so the two
+        readings of one problem look like one problem.
+
+        The warning states the consequence itself, and each unlinked row below
+        carries the longer explanation — a third hover here was one more thing
+        to hover for something already said. */}
+      {unrecognisedIn.length > 0 && (
+        <div className="mt-2 flex items-start gap-2 rounded-md border border-border bg-background-1 px-2 py-1.5 text-xs">
+          <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
+          <span>{unrecognisedMessagingAppsMessage(unrecognisedIn)}</span>
+        </div>
+      )}
+
+      {identitiesError !== null && (
+        <p className="mt-2 text-xs text-destructive">
+          {failureText(
+            identitiesError,
+            'Could not load which messaging accounts are linked to you, so this list may be incomplete.'
+          )}
+        </p>
+      )}
+
+      {pendingError !== null && (
+        <p className="mt-2 text-xs text-destructive">
+          {failureText(
+            pendingError,
+            'Could not load which links are waiting for a code, so this list may be incomplete.'
+          )}
+        </p>
+      )}
+
+      {bridgesQuery.isError ? (
+        <p className="mt-3 text-xs text-destructive">
+          {failureText(
+            bridgesQuery.error,
+            'Could not load this server’s messaging apps. Re-check the server, or reload the page.'
+          )}
+        </p>
+      ) : bridges.length === 0 && !bridgesQuery.isLoading ? (
+        <p className="mt-3 text-xs text-foreground-muted">
+          {chatsWithoutApp
+            ? `No messaging app is connected. They are optional: chats and rooms in Switch Console work without one. ${isAdmin ? 'Connect one to also reach your agents from Slack, Discord and others.' : 'An owner or admin of this workspace can connect one to reach your agents from Slack, Discord and others.'}`
+            : isAdmin
+              ? 'No messaging app is connected, so rooms created here would be unreachable. Connect one to get started.'
+              : 'No messaging app is connected. An owner or admin of this workspace can connect one.'}
+        </p>
+      ) : (
+        <div className="mt-2 flex flex-col">
+          {bridges.map((bridge) => (
+            <Fragment key={bridge.id}>
+              <MessagingAppRow
+                workspaceId={workspaceId}
+                serverId={serverId}
+                bridge={bridge}
+                /* Nothing is drawn in the identity column until the list
+                    arrives: "not linked" and "not known yet" look identical,
+                    and offering to link an account the user already has is the
+                    more confusing of the two. */
+                identities={identities}
+                pending={pending}
+                currentUserId={currentUserId}
+                onReleased={refreshIdentities}
+                olderLinks={
+                  workspaceId !== null && olderLinkCountOf(bridge) > 0
+                    ? {
+                        count: olderLinkCountOf(bridge),
+                        onRequireConfirmation: () =>
+                          showRequireLinkConfirmation({
+                            workspaceId,
+                            bridgeId: bridge.id,
+                            bridgeDisplayName: bridge.displayName,
+                          }),
+                      }
+                    : null
+                }
+                showBundledSignIn={isManaged && bridge.type === 'mattermost'}
+                isAdmin={isAdmin}
+                savingChannelCreation={savingBridgeId === bridge.id}
+                onToggleChannelCreation={(enabled) =>
+                  void handleToggleChannelCreation(bridge, enabled)
+                }
+                onConnectChat={
+                  bridge.channelIdsRefused !== null &&
+                  chatPlatforms.has(bridge.type) &&
+                  workspaceId !== null
+                    ? () =>
+                        showConnectChat({
+                          workspaceId,
+                          platform: bridge.type,
+                          onClosed: refreshChats,
+                        })
+                    : null
+                }
+                onReplaceToken={
+                  workspaceId !== null &&
+                  offersTokenReplacement(bridge, tokenFieldsOf(bridge), installStateOf(bridge))
+                    ? () =>
+                        showReplaceToken({
+                          workspaceId,
+                          bridgeId: bridge.id,
+                          bridgeDisplayName: bridge.displayName,
+                          bridgeType: bridge.type,
+                          fields: tokenFieldsOf(bridge),
+                          onSuccess: () =>
+                            void queryClient.invalidateQueries({
+                              queryKey: ['remote-bridges', workspaceId],
+                            }),
+                        })
+                    : null
+                }
+                onDisconnect={() => {
+                  if (workspaceId === null) return;
+                  showDisconnectMessagingApp({
+                    workspaceId,
+                    bridgeId: bridge.id,
+                    bridgeDisplayName: bridge.displayName,
+                    bridgeType: bridge.type,
+                    onSuccess: () => {
+                      void queryClient.invalidateQueries({
+                        queryKey: ['remote-bridges', workspaceId],
+                      });
+                      // The rooms on that bridge went with it, so the sidebar
+                      // is stale in a way the bridge list alone does not
+                      // repair.
+                      void switchRoomsStore.refreshRoomState();
+                    },
+                  });
+                }}
+              />
+              {bridge.channelIdsRefused !== null && workspaceId !== null && (
+                <ConnectedChatsList
+                  workspaceId={workspaceId}
+                  bridgeId={bridge.id}
+                  platformLabel={bridgePlatformLabel(bridge.type)}
+                  // The chat's room stays but is bridged to nothing now.
+                  onDisconnected={() => void switchRoomsStore.refreshRoomState()}
+                />
+              )}
+            </Fragment>
+          ))}
+        </div>
+      )}
+      {messagingAppsQuery.isError && (
+        <p className="mt-2 text-xs text-destructive">
+          {failureText(
+            messagingAppsQuery.error,
+            'Could not check whether you can add chats here, so adding one is not offered.'
+          )}
+        </p>
+      )}
+      {toggleError && <p className="mt-2 text-xs text-destructive">{toggleError}</p>}
+    </div>
+  );
+});
+
+/**
+ * One app: its name, which account on it is the signed-in user, whether Switch
+ * may open channels on it, and a menu of everything else.
+ *
+ * Only Link stays outside the menu: an app you have not claimed an account on
+ * has exactly one thing worth doing to it, and burying that is what would make
+ * the row's warning unactionable. Everything else — changing or dropping the
+ * account, requiring older links be confirmed, channel creation, the bundled
+ * chat's credentials, opening the app, replacing its token, disconnecting it —
+ * is in the menu.
+ */
+export function MessagingAppRow({
+  workspaceId,
+  serverId,
+  bridge,
+  identities,
+  pending,
+  currentUserId,
+  onReleased,
+  olderLinks,
+  showBundledSignIn,
+  isAdmin,
+  savingChannelCreation,
+  onToggleChannelCreation,
+  onConnectChat,
+  onReplaceToken,
+  onDisconnect,
+}: {
+  /** Null while this install has not resolved the server's workspace; the
+   *  identity actions are the only thing that needs it, and they wait. */
+  workspaceId: string | null;
+  /** Only for the bundled chat's sign-in, which is about the gateway. */
+  serverId: string;
+  bridge: RemoteBridge;
+  /** Accounts linked to the user in this workspace, or null while unknown. */
+  identities: LinkedIdentity[] | null;
+  /** The user's links still waiting for a code, or null while unknown. */
+  pending: PendingIdentity[] | null;
+  currentUserId: string | null;
+  onReleased: () => void;
+  /** Set for an admin when the app has links made before links had to be
+   *  confirmed: how many, and how to stop trusting them. */
+  olderLinks: { count: number; onRequireConfirmation: () => void } | null;
+  showBundledSignIn: boolean;
+  isAdmin: boolean;
+  savingChannelCreation: boolean;
+  onToggleChannelCreation: (enabled: boolean) => void;
+  /** Set on a connection whose chats are connected one at a time, for a user
+   *  the server lets add one — members too, unlike every other change here. */
+  onConnectChat: (() => void) | null;
+  /** Set on a connection to the workspace's own bot, for an admin. */
+  onReplaceToken: (() => void) | null;
+  onDisconnect: () => void;
+}) {
+  const showClaimIdentity = useShowModal('claimIdentityModal');
+  const showBundledChatSignIn = useShowModal('bundledChatSignInModal');
+  const showTeamsPlacement = useShowModal('teamsPlacementModal');
+  const [releasing, setReleasing] = useState(false);
+  const [releaseError, setReleaseError] = useState<string | null>(null);
+
+  const identity = identities === null ? null : linkedIdentityOn(bridge.id, identities);
+  // Only while nothing is linked here: a link that counts says more about the
+  // app than one still waiting for its code.
+  const waiting =
+    identity === null ? (pending?.find((p) => p.bridgeId === bridge.id) ?? null) : null;
+  const platform = bridgePlatformLabel(bridge.type);
+  const claim = () => {
+    if (workspaceId === null) return;
+    showClaimIdentity({ workspaceId, bridgeId: bridge.id });
+  };
+  const confirmLink = (
+    target: { id: string; externalUsername: string },
+    kind: 'pending' | 'unverified'
+  ) => {
+    if (workspaceId === null) return;
+    showClaimIdentity({
+      workspaceId,
+      bridgeId: bridge.id,
+      confirm: { identityId: target.id, externalUsername: target.externalUsername, kind },
+    });
+  };
+
+  // Offered only for the distributed Teams app: re-approving is exactly the
+  // "Add to Microsoft Teams" install flow run again, which only makes sense
+  // for a connection that came from that flow in the first place. A Teams
+  // bridge registered with pasted-in credentials would get a fresh, unrelated
+  // install out of this button rather than a fix. An attention note only ever
+  // comes from a running bridge, so `teamPlacementSupported` is known for it.
+  const offerReapprove = isAdmin && bridge.teamPlacementSupported && bridge.attention !== null;
+  const [reapprovePhase, setReapprovePhase] = useState<'idle' | 'starting' | 'opened'>('idle');
+  const [reapproveError, setReapproveError] = useState<string | null>(null);
+  // A different (or cleared) attention note is a new problem: what was done
+  // about the last one says nothing about it.
+  const [reapprovalFor, setReapprovalFor] = useState(bridge.attention);
+  if (bridge.attention !== reapprovalFor) {
+    setReapprovalFor(bridge.attention);
+    setReapprovePhase('idle');
+    setReapproveError(null);
+  }
+  const reapprove = async () => {
+    if (workspaceId === null) return;
+    setReapprovePhase('starting');
+    setReapproveError(null);
+    try {
+      const url = await rpc.workspaces.beginMessagingAppInstall({
+        workspaceId,
+        platform: bridge.type,
+      });
+      const opened = await openExternalUrl(url, `Could not open ${platform}`);
+      setReapprovePhase(opened ? 'opened' : 'idle');
+    } catch (cause) {
+      setReapprovePhase('idle');
+      setReapproveError(failureText(cause, `Could not start re-approving ${platform}.`));
+    }
+  };
+
+  const release = async (identityId: string) => {
+    if (workspaceId === null) return;
+    setReleasing(true);
+    setReleaseError(null);
+    try {
+      await rpc.workspaces.releaseBridgeIdentity({
+        workspaceId,
+        bridgeId: bridge.id,
+        identityId,
+        userId: currentUserId,
+      });
+      onReleased();
+    } catch (cause) {
+      setReleaseError(failureText(cause, 'Could not unlink this account.'));
+    } finally {
+      setReleasing(false);
+    }
+  };
+
+  // Withdraws only the waiting confirmation. Unlinking is `release`, and is
+  // never what Cancel means.
+  const cancelRequest = async (identityId: string) => {
+    if (workspaceId === null) return;
+    setReleasing(true);
+    setReleaseError(null);
+    try {
+      const result = await rpc.workspaces.cancelIdentityLinkRequest({
+        workspaceId,
+        bridgeId: bridge.id,
+        identityId,
+      });
+      // Re-read either way: a refusal means it was confirmed or cancelled
+      // meanwhile, and the row should say which.
+      onReleased();
+      if (result.kind !== 'cancelled') setReleaseError(linkRequestFailureText(result));
+    } catch (cause) {
+      setReleaseError(failureText(cause, 'Could not cancel this link.'));
+    } finally {
+      setReleasing(false);
+    }
+  };
+
+  // What it costs not to be linked, and — where the app has no directory to
+  // search — how to become linkable at all. The second half is not obvious and
+  // is the reason nothing offered to link on the way in.
+  const orderingNote = identityLinkOrderingNote({
+    displayName: bridge.displayName,
+    directorySearchSupported: bridge.directorySearchSupported,
+  });
+  const noAccountHelp =
+    orderingNote === null ? NO_ACCOUNT_EXPLANATION : `${NO_ACCOUNT_EXPLANATION} ${orderingNote}`;
+
+  // Why the switch cannot be moved, when it cannot. Said in a tooltip rather
+  // than left to a greyed control, because "off" and "this platform cannot do
+  // it at all" are different claims and look identical otherwise.
+  const channelsLockedReason = !bridge.channelCreationSupported
+    ? `${platform} cannot create channels from Switch. Make the chat in the app and add the bot to it.`
+    : !isAdmin
+      ? 'Only an owner or admin of this workspace can change this.'
+      : null;
+
+  return (
+    <div className="flex flex-col gap-1.5 py-2">
+      <div className="flex items-center gap-3 text-sm">
+        <span className="flex size-5 shrink-0 items-center justify-center">
+          {hasBridgeIcon(bridge.type) ? (
+            <BridgeIcon bridgeType={bridge.type} size={16} />
+          ) : (
+            <MessageSquare className="size-4 text-foreground-muted" />
+          )}
+        </span>
+
+        {/* Name over account: the account is a property of the app, so it reads
+          under its name rather than in a column of its own. */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-foreground">{bridge.displayName}</span>
+            {bridge.isDefault && <Badge variant="secondary">Default</Badge>}
+            {/* Only when it is NOT active, and never otherwise. A bridge that is
+              down cannot back a new room and the room-creation picker omits it
+              silently, so without this the app simply is not in the list and
+              nothing anywhere says why. */}
+            {bridge.status !== 'active' && (
+              <span className="shrink-0 text-xs text-destructive">{bridge.status}</span>
+            )}
+          </div>
+          {identities === null ? null : identity !== null ? (
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className="truncate font-mono text-xs text-foreground-muted">
+                {accountHandle(identity.externalUsername)}
+              </span>
+              {!identity.verified && (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <span tabIndex={0} aria-label={NOT_CONFIRMED_EXPLANATION}>
+                        <Badge variant="secondary">Not confirmed</Badge>
+                      </span>
+                    }
+                  />
+                  <TooltipContent className="max-w-xs">{NOT_CONFIRMED_EXPLANATION}</TooltipContent>
+                </Tooltip>
+              )}
+            </span>
+          ) : waiting !== null ? (
+            <span className="flex min-w-0 items-center gap-1 text-xs text-foreground-muted">
+              <Clock className="size-3 shrink-0" />
+              <span className="truncate">
+                <span className="font-mono">{accountHandle(waiting.externalUsername)}</span> ·
+                Waiting for confirmation
+              </span>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <span
+                      tabIndex={0}
+                      aria-label={WAITING_EXPLANATION}
+                      className="inline-flex text-foreground-muted"
+                    >
+                      <Info className="size-3" />
+                    </span>
+                  }
+                />
+                <TooltipContent className="max-w-xs">{WAITING_EXPLANATION}</TooltipContent>
+              </Tooltip>
+            </span>
+          ) : (
+            <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+              <TriangleAlert className="size-3 shrink-0" />
+              No account linked
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <span
+                      tabIndex={0}
+                      aria-label={noAccountHelp}
+                      className="inline-flex text-foreground-muted"
+                    >
+                      <Info className="size-3" />
+                    </span>
+                  }
+                />
+                <TooltipContent className="max-w-xs">{noAccountHelp}</TooltipContent>
+              </Tooltip>
+            </span>
+          )}
+          {releaseError !== null && (
+            <p className="mt-0.5 text-xs text-destructive">{releaseError}</p>
+          )}
+        </div>
+
+        {/* Linking is the one thing an unlinked app needs, so it stays a button
+          rather than going into the menu with the rest — as do the code that
+          finishes a waiting link and the one that confirms an old one. A
+          confirmed link shows no button at all: the only thing left to do to it
+          is destructive, and a control next to the handle would sit one
+          mis-click from the action that *changes* the account (CHOO-2137). */}
+        {identities !== null &&
+          (identity !== null ? (
+            !identity.verified && (
+              <Button
+                variant="outline"
+                size="xs"
+                className="shrink-0"
+                onClick={() => confirmLink(identity, 'unverified')}
+              >
+                <ShieldCheck className="size-3" />
+                Confirm
+              </Button>
+            )
+          ) : waiting !== null ? (
+            <Button
+              variant="outline"
+              size="xs"
+              className="shrink-0"
+              onClick={() => confirmLink(waiting, 'pending')}
+            >
+              <KeyRound className="size-3" />
+              Show code
+            </Button>
+          ) : (
+            <Button variant="outline" size="xs" className="shrink-0" onClick={claim}>
+              <Link2 className="size-3" />
+              Link
+            </Button>
+          ))}
+
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="shrink-0"
+                aria-label={`${bridge.displayName} actions`}
+                disabled={releasing}
+              >
+                <MoreVertical className="size-3" />
+              </Button>
+            }
+          />
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={claim}>
+              <Link2 className="size-4" />
+              {identity === null ? 'Link my account…' : 'Change my account…'}
+            </DropdownMenuItem>
+            {identity !== null && (
+              <DropdownMenuItem onClick={() => void release(identity.id)}>
+                <Unlink className="size-4" />
+                Unlink {accountHandle(identity.externalUsername)}
+              </DropdownMenuItem>
+            )}
+            {waiting !== null && (
+              <DropdownMenuItem onClick={() => void cancelRequest(waiting.id)}>
+                <X className="size-4" />
+                Cancel link to {accountHandle(waiting.externalUsername)}
+              </DropdownMenuItem>
+            )}
+            {olderLinks !== null && (
+              <DropdownMenuItem onClick={olderLinks.onRequireConfirmation}>
+                <ShieldAlert className="size-4" />
+                Require confirmation for older links ({olderLinks.count})…
+              </DropdownMenuItem>
+            )}
+
+            {onConnectChat !== null && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={onConnectChat}>
+                  <PlusCircle className="size-4" />
+                  Add to {platform}…
+                </DropdownMenuItem>
+              </>
+            )}
+
+            <DropdownMenuSeparator />
+            {/* "Off" and "this platform has no such thing" are different claims,
+              and an unticked box makes them look the same (CHOO-2137). A
+              platform that cannot do it at all gets a plain disabled line
+              saying so, never an unchecked box. */}
+            {bridge.channelCreationSupported ? (
+              <DropdownMenuCheckboxItem
+                checked={bridge.canCreateChannels}
+                disabled={!isAdmin || savingChannelCreation}
+                onCheckedChange={(next) => onToggleChannelCreation(next)}
+              >
+                Create channels on {platform}
+              </DropdownMenuCheckboxItem>
+            ) : (
+              <DropdownMenuItem disabled>Channels not supported on {platform}</DropdownMenuItem>
+            )}
+            {channelsLockedReason !== null && (
+              <p className="px-2 py-1 text-xs text-foreground-muted">{channelsLockedReason}</p>
+            )}
+
+            {bridge.receivesWebhooks && (
+              <>
+                <DropdownMenuSeparator />
+                {/* The address the platform delivers this connection's events
+                  to. Nothing arrives until someone pastes it into the
+                  platform's settings, so it is offered right here. */}
+                {bridge.webhookUrl ? (
+                  <DropdownMenuItem onClick={() => void copyWebhookAddress(bridge.webhookUrl!)}>
+                    <Copy className="size-4" />
+                    Copy webhook address
+                  </DropdownMenuItem>
+                ) : (
+                  <p className="max-w-xs px-2 py-1 text-xs text-destructive">
+                    {platform} delivers events to a public address, and this server has none
+                    configured. Set MESSAGING_PUBLIC_URL on the server.
+                  </p>
+                )}
+              </>
+            )}
+
+            {(showBundledSignIn || bridge.homeUrl) && <DropdownMenuSeparator />}
+            {showBundledSignIn && (
+              <DropdownMenuItem
+                onClick={() =>
+                  showBundledChatSignIn({ serverId, bridgeDisplayName: bridge.displayName })
+                }
+              >
+                <KeyRound className="size-4" />
+                Sign-in details…
+              </DropdownMenuItem>
+            )}
+            {/* Offered only when the link resolves — an older server, or a bridge
+              that is down, reports none. */}
+            {bridge.homeUrl && (
+              <DropdownMenuItem
+                onClick={() =>
+                  void openExternalUrl(bridge.homeUrl as string, `Could not open ${platform}`)
+                }
+              >
+                <ExternalLink className="size-4" />
+                Open in {platform}
+              </DropdownMenuItem>
+            )}
+
+            {bridge.teamPlacementSupported && isAdmin && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => {
+                    if (workspaceId === null) return;
+                    showTeamsPlacement({
+                      workspaceId,
+                      bridgeId: bridge.id,
+                      bridgeDisplayName: bridge.displayName,
+                    });
+                  }}
+                >
+                  <Users className="size-4" />
+                  Manage Microsoft Teams…
+                </DropdownMenuItem>
+              </>
+            )}
+
+            {isAdmin && (
+              <>
+                <DropdownMenuSeparator />
+                {onReplaceToken !== null && (
+                  <DropdownMenuItem onClick={onReplaceToken}>
+                    <Key className="size-4" />
+                    Replace token…
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem variant="destructive" onClick={onDisconnect}>
+                  <Trash2 className="size-4" />
+                  Disconnect app…
+                </DropdownMenuItem>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+
+      {/* Generic across every bridge type: something only the platform's side
+          can fix, worded by the server (approval withdrawn, the app blocked by
+          the organisation's admin). "Approve again" is offered only for the
+          distributed Teams app, whose attention notes are the ones a re-run of
+          the install flow can actually resolve. */}
+      {bridge.attention !== null && (
+        <Alert variant="warning" className="ml-8">
+          <TriangleAlert className="size-4" />
+          <AlertDescription>
+            <p>{bridge.attention}</p>
+            {offerReapprove && reapprovePhase === 'opened' && (
+              <p>
+                Approve again in the browser window that opened. This warning clears once Switch
+                sees the renewed approval.
+              </p>
+            )}
+            {reapproveError !== null && <p className="text-destructive">{reapproveError}</p>}
+          </AlertDescription>
+          {offerReapprove && (
+            <AlertAction>
+              <Button
+                size="sm"
+                disabled={reapprovePhase === 'starting' || workspaceId === null}
+                onClick={() => void reapprove()}
+              >
+                {reapprovePhase === 'starting' ? 'Opening…' : 'Approve again'}
+              </Button>
+            </AlertAction>
+          )}
+        </Alert>
+      )}
+    </div>
+  );
+}
+
+async function copyWebhookAddress(url: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(url);
+    showToast({ title: 'Webhook address copied', description: url });
+  } catch {
+    showToast({
+      title: 'Copy failed',
+      description: 'The webhook address could not be copied to the clipboard.',
+      variant: 'destructive',
+    });
+  }
+}
+
+/** Turn a failed channel-creation toggle into something the user can act on. */
+function messageForUpdate(result: { kind: string; message?: string }): string {
+  switch (result.kind) {
+    case 'unauthenticated':
+      return 'Your session for this server expired. Sign in again, then retry.';
+    case 'forbidden':
+      return 'This requires an owner or admin of this workspace.';
+    default:
+      return result.message ?? 'The server rejected the change.';
+  }
+}

@@ -1,0 +1,29 @@
+{{- include "switch.validateTeamsBridge" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "switch.switchCoreHost" . }}
+  labels:
+    {{- include "switch.labels" . | nindent 4 }}
+    {{- include "switch.selectorLabels" (dict "Release" .Release "component" "switch-core") | nindent 4 }}
+spec:
+  type: {{ .Values.switchCore.service.type }}
+  ports:
+    - port: {{ .Values.switchCore.service.port }}
+      targetPort: 8000
+      protocol: TCP
+      name: http
+    {{- if .Values.switchCore.teamsBridge.enabled }}
+    - port: {{ .Values.switchCore.teamsBridge.port }}
+      targetPort: {{ .Values.switchCore.teamsBridge.port }}
+      protocol: TCP
+      name: teams
+    {{- end }}
+    {{- if .Values.switchCore.collaborationCallback.enabled }}
+    - port: {{ .Values.switchCore.collaborationCallback.port }}
+      targetPort: {{ .Values.switchCore.collaborationCallback.port }}
+      protocol: TCP
+      name: callbacks
+    {{- end }}
+  selector:
+    {{- include "switch.selectorLabels" (dict "Release" .Release "component" "switch-core") | nindent 4 }}

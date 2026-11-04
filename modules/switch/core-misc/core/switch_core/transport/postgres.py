@@ -1,0 +1,1584 @@
+"""Postgres implementation of `MessageTransport`, and Switch's message bus.
+
+A transport carries an event from the client that sent it to the clients that
+should see it, and remembers it in between. Here the `messages` table does all
+of that. **The write is the send.** A send is an INSERT, numbered per room
+under an advisory lock (`MessageStore.create`), made by the router
+(`delivery/router.py`), which decides in the same transaction which agents in
+the room the row is for and stores their own events with it. The
+`messages_notify` trigger announces the row on commit (`db/notify_ddl.py`);
+one `MessageListener` wakes the transports watching that room
+(`messages/notify.py`); and each transport reads the rows after its own
+cursor, `DELIVERY_PAGE` at a time. Agents have no transport watching for them:
+what is for them was decided as it was written. There is no second store to
+agree with. Switch used to run on a Matrix homeserver; the `matrix_*` column
+names are what is left of it, kept as stable ids.
+
+Three consequences worth stating up front:
+
+- **A send fails when the database does.** The row *is* the delivery: a write
+  that fails is a message that was not sent, and the caller must hear about
+  it.
+- **Every durable event gets a row, not only the conversation.** Commands and
+  reports travel the same way, and they have to reach their handlers.
+  `recorded_types` therefore means "what a reader is shown", not "what is
+  written": a projection applied on the way out. The one
+  category with no row is the genuinely ephemeral: presence-like state whose
+  next value replaces it, which is announced and never stored.
+- **Ids are opaque, and these are not `$event` ids.** Nothing in Switch parses
+  one; the columns holding them are already named `transport_event_id`.
+
+History is the one method left unimplemented, and deliberately: the read path
+queries these rows directly.
+
+**Where reading starts is the consumer's.** `receive_forever` is handed a
+`DeliveryProgress` (`transport/cursors.py`) that says where to start each room
+and hears how far the client has got: a consumer, which one process owns,
+reads from its stored cursors and resumes where the last owner stopped.
+Writing needs nothing of the kind: any process may write as any client.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import uuid
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, cast
+
+from switch_core.attachments import parse_attachment_group
+from switch_core.db.models import (
+    ClientRoom,
+    MediaBlob,
+    Message,
+    UsageMetric,
+)
+from switch_core.db.session_scope import tenant_session
+from switch_core.logging_context import log_context
+from switch_core.messages.recorded_types import EPHEMERAL
+from switch_core.messages.row import (
+    attachments_in,
+    message_row,
+    new_event_id,
+    thread_root_of,
+)
+from switch_core.observability.catalogue import (
+    DELIVERY_FAILURES,
+    DELIVERY_LAG,
+    MESSAGES_DELIVERED,
+    MESSAGES_SENT,
+    OBSERVER_FAILURES,
+    SEND_FAILURES,
+)
+from switch_core.observability.metrics import metrics
+from switch_core.observability.throttle import WarningThrottle
+from switch_core.tenant_context import no_tenant, tenant_scope
+from switch_core.transport.content import media_content, message_content
+from switch_core.transport.derived_ids import derived_writes, writes_derived_from
+from switch_core.transport.ephemeral import EphemeralBus
+from switch_core.transport.invites import InviteBus
+from switch_core.transport.observer import (
+    ParticipantMessage,
+    ParticipantMessageObserver,
+)
+from switch_core.transport.port import Handler, TransportHandlers
+from switch_core.transport.room_cache import DELIVERY_PAGE
+from switch_core.transport.stored import to_inbound
+from switch_core.transport.types import (
+    DownloadResult,
+    HistoryPage,
+    InboundCustomEvent,
+    InboundEvent,
+    InboundMedia,
+    InboundMembership,
+    MessageFormat,
+    RoomRef,
+    SendResult,
+    TransportError,
+    UploadResult,
+)
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from switch_core.db.stores.media_store import MediaStore
+    from switch_core.db.stores.message_store import MessageStore
+    from switch_core.db.stores.room_store import RoomStore
+    from switch_core.db.stores.usage_store import UsageStore
+    from switch_core.delivery.router import MessageRouter
+    from switch_core.messages.notify import MessageListener
+    from switch_core.transport.cursors import DeliveryProgress
+    from switch_core.transport.room_cache import RoomDeliveryCache
+    from switch_core.transport.stored import DeliveryAttachments, DeliveryRow
+
+    DeliveryPage = tuple[list[tuple[DeliveryRow, DeliveryAttachments]], bool]
+
+logger = logging.getLogger(__name__)
+
+# What makes an `m.room.message` a file rather than text.
+_MEDIA_MSGTYPES = frozenset({"m.image", "m.file", "m.video", "m.audio"})
+
+
+# What a tenant is metered for: something a participant said. Custom events
+# are the platform's own bookkeeping — reports, state, receipts — and charging
+# a tenant for them would bill it for how Switch works.
+_METERED_KINDS = frozenset({"message", "media"})
+
+# One for the process rather than one per transport: every client has a
+# transport, and an observer that breaks breaks for all of them.
+_observer_failures = WarningThrottle(60.0)
+
+
+def _sent_kind(event_type: str, content: dict[str, object]) -> str:
+    """A bounded label for what was sent.
+
+    `send_event` takes whatever event type its caller passes, so four values
+    rather than the field itself: an attribute a caller chooses is a series a
+    caller can mint.
+    """
+    if event_type in EPHEMERAL:
+        return "ephemeral"
+    if event_type != "m.room.message":
+        return "event"
+    return "media" if content.get("msgtype") in _MEDIA_MSGTYPES else "message"
+
+
+def _delivered_kind(event: InboundEvent) -> str:
+    if isinstance(event, InboundMedia):
+        return "media"
+    if isinstance(event, InboundMembership):
+        return "membership"
+    if isinstance(event, InboundCustomEvent):
+        return "custom"
+    return "message"
+
+
+def _age_ms(sent_at: object) -> float | None:
+    """How long ago a row was written, in milliseconds.
+
+    None rather than a guess when the value cannot be subtracted: this is the
+    number an alert fires on. Clamped at zero because the timestamp is the
+    database's clock and the subtraction is against this process's, so a small
+    negative is skew rather than a delivery before its send.
+    """
+    if not isinstance(sent_at, datetime):
+        return None
+    when = sent_at if sent_at.tzinfo is not None else sent_at.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - when).total_seconds() * 1000.0)
+
+
+MEMBERSHIP_EVENT_TYPE = "m.room.member"
+
+# How long a consumer that is told to stop may take to finish the row in hand,
+# before what is left of it is cancelled.
+STOP_GRACE_SECONDS = 5.0
+
+# How often a reader asks which of its rooms have a row past where it read
+# (`PostgresTransport._recheck_forever`).
+RECHECK_SECONDS = 30.0
+
+
+class RoomIds:
+    """The room id behind each transport room id a process's transports
+    have resolved, by tenant, shared between them.
+
+    Every client looks up a room before its first write there, and with
+    each client keeping its own answers, a deployment of thousands of agents
+    behind a load balancer read a room for nearly every message: an agent
+    writes to a room rarely, and seldom twice through the same process. A
+    room's transport id never changes, so this only grows and never goes
+    stale. Keyed by tenant as well, since `rooms.matrix_room_id` is unique per
+    tenant, not globally.
+
+    The first time a transport of a tenant misses, every open room of the
+    tenant is read at once (`TenantRoomIds.read_all_once`), so a process does
+    not read thousands of rooms one at a time as its clients first write to
+    them. A room created after that is read on its own, once.
+    """
+
+    def __init__(self) -> None:
+        self._ids: dict[tuple[str, str], str] = {}
+        # The tenants whose open rooms were read in full, or are being read,
+        # set once the read has ended.
+        self._read: dict[str, asyncio.Event] = {}
+
+    def of_tenant(self, tenant_id: str) -> TenantRoomIds:
+        return TenantRoomIds(self._ids, self._read, tenant_id)
+
+
+class TenantRoomIds:
+    """`RoomIds` as the transports of one tenant read and write it."""
+
+    __slots__ = ("_ids", "_read", "_tenant_id")
+
+    def __init__(
+        self,
+        ids: dict[tuple[str, str], str],
+        read: dict[str, asyncio.Event],
+        tenant_id: str,
+    ) -> None:
+        self._ids = ids
+        self._read = read
+        self._tenant_id = tenant_id
+
+    def get(self, transport_room_id: str) -> str | None:
+        return self._ids.get((self._tenant_id, transport_room_id))
+
+    def __setitem__(self, transport_room_id: str, room_id: str) -> None:
+        self._ids[(self._tenant_id, transport_room_id)] = room_id
+
+    async def read_all_once(
+        self, read: Callable[[], Awaitable[list[tuple[str, str]]]]
+    ) -> None:
+        """Read every open room of the tenant with `read`, the first time
+        this is asked in the process. A caller asking while that read is under
+        way waits for it, holding nothing; one asking after it returns at
+        once. A read that fails is tried again by the next caller."""
+        done = self._read.get(self._tenant_id)
+        if done is not None:
+            await done.wait()
+            return
+        done = self._read[self._tenant_id] = asyncio.Event()
+        try:
+            for transport_room_id, room_id in await read():
+                self._ids[(self._tenant_id, transport_room_id)] = room_id
+        except BaseException:
+            del self._read[self._tenant_id]
+            raise
+        finally:
+            done.set()
+
+
+class PostgresTransport:
+    """Carries a room's events in the `messages` table.
+
+    One instance per client: it sends as that client and, once it is
+    receiving, delivers to that client's handlers.
+    """
+
+    def __init__(
+        self,
+        *,
+        user_id: str,
+        client_id: str,
+        tenant_id: str,
+        display_name: str,
+        actor_role: str,
+        session_factory: async_sessionmaker[AsyncSession],
+        room_store: RoomStore,
+        message_store: MessageStore,
+        usage_store: UsageStore,
+        media_store: MediaStore,
+        listener: MessageListener,
+        invites: InviteBus,
+        ephemeral: EphemeralBus,
+        room_cache: RoomDeliveryCache,
+        message_observer: ParticipantMessageObserver,
+        router: MessageRouter,
+        room_ids: RoomIds | None = None,
+    ) -> None:
+        self.user_id = user_id
+        self.client_id = client_id
+        # Who this client is in message metrics: the writer of what it sends
+        # and the reader of what it is handed. Bounded, never an id.
+        self._actor_role = actor_role
+        # The tenant everything this transport reads and writes is scoped to,
+        # handed in with the client id rather than looked up from it. Neither
+        # this transport's context nor its caller's is the right answer — the
+        # client's task binds nothing and its handlers bind some room's tenant
+        # — but the client row that named this `client_id` also named its
+        # tenant, so whoever built the transport already had it.
+        #
+        # It is the whole answer, not a starting point: `client_rooms` carries
+        # composite foreign keys to both `clients` and `rooms`, so every room
+        # this client can be a member of is in this tenant, and a room lookup
+        # scoped to it cannot return a subset. That is what makes
+        # `joined_rooms` safe to scope — see its docstring for the failure
+        # this replaces.
+        self.tenant_id = tenant_id
+        self.display_name = display_name
+        self._session_factory = session_factory
+        self._room_store = room_store
+        self._message_store = message_store
+        self._usage_store = usage_store
+        self._media_store = media_store
+        self._listener = listener
+        self._invites = invites
+        self._ephemeral = ephemeral
+        # Shared with every other transport in the process.
+        self._room_cache = room_cache
+        # When this client was last woken for each room, on the cache's clock.
+        # A shared read only counts for this client if it started after this.
+        self._woken: dict[str, int] = {}
+        self._message_observer = message_observer
+        # Writes every row, deciding as it does which agents the row is for.
+        self._router = router
+        self._handlers = TransportHandlers()
+        # Per-room delivery position, and the transport-side id to hand back
+        # to a handler. Both are keyed by the Switch room id, which is what
+        # the listener announces.
+        self._cursors: dict[str, int] = {}
+        self._watching: dict[str, str] = {}
+        # When the client joined each room it reads, as the membership row the
+        # room was read under says. `client_rooms.joined_at` is the time of
+        # the transaction that wrote the row, so a client taken out of a room
+        # and put back has a new one, which is how a re-read tells it from a
+        # client that never left (`_compare_membership`).
+        self._joined_at: dict[str, datetime] = {}
+        # Rooms this client is joining itself right now, between writing its
+        # membership row and watching the room from its own arrival. A
+        # reconcile that reads the row in that window must leave the room to
+        # the join, or it would watch from the head and the client would miss
+        # its own arrival.
+        self._joining: set[str] = set()
+        # Rooms a re-check has handed to `on_invite` because it read this
+        # client's membership row, until the join that follows runs. That
+        # join only takes up a row the read saw. Finding the row gone means a
+        # removal committed after the read, and writing it again would undo
+        # the removal.
+        self._adopting: set[str] = set()
+        # Held while this client reads its rooms and compares them with the
+        # ones it watches: on its first read at start, and on every re-read
+        # after (`_reconcile_membership`). A re-read during the first read
+        # would find every room the client is already in unwatched, and hand
+        # each to `on_invite` as if someone had just added the client to it.
+        self._reading_rooms = asyncio.Lock()
+        self._receiving = False
+        self._receiving_event = asyncio.Event()
+        # Set to end the current `receive_forever`. Replaced at the start of
+        # each, so a consumer stopped here and started again later reads again.
+        self._closed = asyncio.Event()
+        # Set while the current receive is ending: the delivery loop finishes
+        # the row in hand, records how far it got, and stops.
+        self._stopping = False
+        # Where the current receive starts each room and records how far it
+        # got, None while not receiving, and how far each room's progress has
+        # been recorded through it.
+        self._progress: DeliveryProgress | None = None
+        self._recorded: dict[str, int] = {}
+        # The row types the current receive is for, or None for every row
+        # (`receive_forever`).
+        self._row_types: frozenset[str] | None = None
+        # Rooms this client has been told moved but has not read yet, and the
+        # signal its delivery loop waits on. A set because a room that moved
+        # twice while the loop was busy is still one read.
+        self._pending: set[str] = set()
+        self._wake = asyncio.Event()
+        self._delivering = False
+        # A room's transport id never changes, so this only grows and never
+        # goes stale. Shared with every other transport of the tenant in the
+        # process, so a room one client found costs the next client no read.
+        self._room_ids = (room_ids if room_ids is not None else RoomIds()).of_tenant(
+            tenant_id
+        )
+
+    # ── Session ───────────────────────────────────────────────────────────────
+
+    async def connect(self) -> None:
+        """Nothing to authenticate: the caller already knows who it is."""
+
+    async def close(self) -> None:
+        """Stop receiving, after the row in hand. Sessions are borrowed per
+        operation, so that is all there is to release, and writing goes on
+        working: a client that stops reading here may still be written as."""
+        self._closed.set()
+
+    def register_handlers(self, handlers: TransportHandlers) -> None:
+        self._handlers = handlers
+
+    async def receive_forever(
+        self,
+        progress: DeliveryProgress,
+        *,
+        row_types: frozenset[str] | None = None,
+    ) -> None:
+        """Deliver the rows written to this client's rooms, until closed.
+
+        Each room is read from where `progress` says, and progress is recorded
+        through it as rows are handled. Ending finishes the row in hand first
+        and records it, so a reader that resumes from the record neither
+        repeats nor skips it.
+
+        With `row_types`, only rows of those types: the client is woken only
+        when one is written and reads past the rest, so a reader that acts on
+        one kind of row costs nothing for every other row of every room.
+        """
+        self._closed = asyncio.Event()
+        self._stopping = False
+        self._progress = progress
+        self._row_types = row_types
+        # Before the rooms are read, not after they are subscribed: reading
+        # them and watching each is several round trips, and a removal rung
+        # during those has no membership row for the caller to fall back to.
+        self._invites.register(
+            self.client_id,
+            self._on_invited,
+            self._on_removed,
+            self._reconcile_membership,
+        )
+        self._receiving = True
+        self._receiving_event.set()
+        try:
+            delivery = asyncio.create_task(self._deliver_forever())
+            recheck = asyncio.create_task(self._recheck_forever())
+            try:
+                async with self._reading_rooms:
+                    rooms = await self.joined_rooms()
+                    # Normal for a new workspace's admin client and for an
+                    # agent not placed in a room yet: an invite starts its
+                    # first room. Kept as a pointer for a client that stays
+                    # silent: membership is the client_rooms table.
+                    if not rooms:
+                        logger.info(
+                            "Client %s is receiving in no room yet; it hears "
+                            "nothing until it is added to one (client_rooms)",
+                            self.user_id,
+                        )
+                    await self._watch_joined(rooms)
+                await self._closed.wait()
+            finally:
+                recheck.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await recheck
+                await self._finish(delivery)
+        finally:
+            self._receiving = False
+            self._receiving_event.clear()
+            self._invites.unregister(
+                self.client_id,
+                self._on_invited,
+                self._on_removed,
+                self._reconcile_membership,
+            )
+            self._unwatch_all()
+            self._progress = None
+            self._recorded.clear()
+
+    async def _recheck_forever(self) -> None:
+        """Every `RECHECK_SECONDS`, wake the rooms with a row past where this
+        client read, found in one query.
+
+        The process that writes a room's row announces it after its commit
+        (`announcer.py`), and one that died between the two announced
+        nothing: without this, the row would wait for the room's next one.
+        A wake costs a read from the cursor, so a room woken for a row its
+        announcement was about to bring reads it a moment early.
+        """
+        with no_tenant():
+            while not self._stopping:
+                await asyncio.sleep(RECHECK_SECONDS)
+                cursors = {
+                    room_id: cursor
+                    for room_id, cursor in self._cursors.items()
+                    if room_id in self._watching
+                }
+                if not cursors:
+                    continue
+                try:
+                    async with tenant_session(
+                        self._session_factory, self.tenant_id
+                    ) as session:
+                        moved = await self._message_store.rooms_past(
+                            session, cursors, types=self._row_types
+                        )
+                except Exception:
+                    logger.warning(
+                        "Client %s could not check its rooms for rows it was "
+                        "not told of; trying again in %.0fs",
+                        self.user_id,
+                        RECHECK_SECONDS,
+                        exc_info=True,
+                    )
+                    continue
+                for room_id in moved:
+                    if room_id in self._watching:
+                        self._mark_pending(room_id)
+
+    async def _finish(self, delivery: asyncio.Task[None]) -> None:
+        """End the delivery loop after the row in hand, or cancel it once
+        `STOP_GRACE_SECONDS` have passed. A row cut short by the cancel is not
+        recorded as handled, so the next reader handles it again."""
+        self._stopping = True
+        self._wake.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(delivery), STOP_GRACE_SECONDS)
+        except TimeoutError:
+            logger.warning(
+                "Client %s did not finish its row within %.0fs of being told to "
+                "stop; cancelling it",
+                self.user_id,
+                STOP_GRACE_SECONDS,
+            )
+        except Exception:
+            logger.error(
+                "Client %s's delivery loop ended on an error",
+                self.user_id,
+                exc_info=True,
+            )
+        finally:
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+
+    async def wait_receiving(self, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(self._receiving_event.wait(), timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    async def _deliver_forever(self) -> None:
+        """This client's own delivery loop: its rooms, one at a time.
+
+        The listener fans out to every subscriber from a single task, so
+        anything a waker awaits is awaited by every other client's delivery
+        too — and a waker awaits its handler, which for a bridge is an HTTP
+        call to Slack that can sit in a rate limit for seconds. Doing the work
+        here instead means a stalled bridge stalls itself.
+
+        Serial within the client, deliberately. Two concurrent runs for one
+        room would both read the same cursor and deliver the same rows twice,
+        and a redelivered message is indistinguishable to a reader from a new
+        one. Overlapping wake-ups collapse into one more pass instead, which
+        also bounds this client to one outstanding read.
+
+        `no_tenant` because this is a task and a task keeps its creator's
+        context. `receive_forever` is itself reached from a task that unbound
+        already, so this changes nothing today — it means the loop stays
+        ambient-free if it is ever created from somewhere else.
+        """
+        with no_tenant():
+            await self._deliver_forever_unbound()
+
+    async def _deliver_forever_unbound(self) -> None:
+        while not self._stopping:
+            await self._wake.wait()
+            self._wake.clear()
+            if self._stopping:
+                return
+            rooms = list(self._pending)
+            self._pending.clear()
+            self._delivering = True
+            try:
+                for room_id in rooms:
+                    if self._stopping:
+                        return
+                    # Bound around the drain rather than named in the message
+                    # below, so every line this room's delivery produces —
+                    # including the handlers' own — can be filtered to it.
+                    with log_context(room_id=room_id):
+                        try:
+                            await self._drain_room(room_id)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            # One room's failure is not the other rooms'
+                            # problem, and this loop is the only delivery this
+                            # client has. Counted as well as logged: swallowing
+                            # it is what makes a stalled room invisible.
+                            metrics().increment(
+                                DELIVERY_FAILURES, {"actor": self._actor_role}
+                            )
+                            logger.error(
+                                "Delivery failed for client %s in room %s",
+                                self.user_id,
+                                room_id,
+                                exc_info=True,
+                            )
+            finally:
+                self._delivering = False
+
+    async def _on_invited(self, transport_room_id: str) -> None:
+        """Someone added this client to a room while it was running.
+
+        Handed to `on_invite` rather than joined here, because auto-accepting
+        is the client's decision and it already has one — the same one it made
+        when the invitation arrived over sync.
+        """
+        await self._invite_self(transport_room_id, _now_ms())
+
+    async def _invite_self(self, transport_room_id: str, joined_at_ms: int) -> None:
+        """Hand `on_invite` the room, stamped with when the client joined it."""
+        handler = self._handlers.on_invite
+        if handler is None:
+            return
+        await handler(
+            RoomRef(room_id=transport_room_id),
+            InboundMembership(
+                room_id=transport_room_id,
+                event_id=new_event_id(),
+                sender=self.user_id,
+                timestamp=joined_at_ms,
+                state_key=self.user_id,
+                membership="invite",
+                display_name=self.display_name,
+            ),
+        )
+
+    async def _reconcile_membership(self) -> None:
+        """Start or stop reading the rooms whose membership changed underneath.
+
+        A membership written by another switch-core process reaches the
+        process reading for the client only as a `membership.changed` signal,
+        and a signal can be missed, so this also runs periodically. It
+        re-reads the client's rows and compares them with what it reads now. A
+        room it is no longer in goes through `_on_removed`, the path a removal
+        rung in this process takes. A room it is in but does not read goes
+        through `on_invite`, as an invitation would, and is read from where
+        the receive's progress starts it: for a consumer one process owns,
+        the cursor the membership was written with, just before the arrival,
+        so that one process hears the arrival and greets; for one every
+        process runs, the room's head, since the process that wrote the row
+        has already heard the arrival and greeted. The join time handed on is
+        the row's, the database's clock.
+
+        Only rooms already read before the rows were fetched can be dropped. A
+        room joined since was joined after its row committed, so the read
+        cannot have missed it; one joined during the read would otherwise look
+        like a removal.
+
+        A client taken out of a room and put back before the re-read still has
+        a row for it, but a new one with its own `joined_at`. Such a room goes
+        through `_on_removed` and then `on_invite`, as the removal and the
+        addition would have on their own, instead of being read on from where
+        the old membership had got to, which would hand over what was said
+        while the client was out. The `joined_at` compared is the one recorded
+        before the rows were fetched, for the reason above: a room joined
+        again during the read would otherwise look put back.
+        """
+        async with self._reading_rooms:
+            if self._receiving:
+                await self._compare_membership()
+
+    async def _compare_membership(self) -> None:
+        """`_reconcile_membership`'s read and comparison, under its lock."""
+        read_before = dict(self._watching)
+        joined_before = dict(self._joined_at)
+        async with tenant_session(self._session_factory, self.tenant_id) as session:
+            memberships = await self._room_store.memberships_of(session, self.client_id)
+        current = {membership.room_id: membership for membership in memberships}
+        for room_id, transport_room_id in read_before.items():
+            joined_at = joined_before.get(room_id)
+            # Dropped, or watched again, while the rows were being read.
+            if (
+                self._watching.get(room_id) != transport_room_id
+                or self._joined_at.get(room_id) != joined_at
+            ):
+                continue
+            membership = current.get(room_id)
+            if membership is None:
+                logger.info(
+                    "Client %s is no longer in %s; it stops reading the room",
+                    self.user_id,
+                    transport_room_id,
+                )
+            elif joined_at is not None and membership.joined_at != joined_at:
+                logger.info(
+                    "Client %s was taken out of %s and put back; it reads the "
+                    "room again as a new member",
+                    self.user_id,
+                    transport_room_id,
+                )
+            else:
+                # Still the membership the room was read under, or a room
+                # whose `_watch` has not read the row yet and will take the
+                # one it finds.
+                continue
+            await self._on_removed(transport_room_id)
+        for membership in memberships:
+            self._room_ids[membership.transport_room_id] = membership.room_id
+            if (
+                membership.room_id in self._watching
+                or membership.room_id in self._joining
+            ):
+                continue
+            logger.info(
+                "Client %s was added to %s elsewhere; it starts reading the room",
+                self.user_id,
+                membership.transport_room_id,
+            )
+            self._adopting.add(membership.room_id)
+            try:
+                await self._invite_self(
+                    membership.transport_room_id,
+                    int(membership.joined_at.timestamp() * 1000),
+                )
+            finally:
+                self._adopting.discard(membership.room_id)
+
+    async def _on_removed(self, transport_room_id: str) -> None:
+        """This client was taken out of a room while it was running.
+
+        The subscription is dropped here rather than left to the next restart.
+        Under Matrix a kick ended the room's delivery at the homeserver, so
+        nothing downstream had to check membership again; here the
+        subscription is this client's own and outlives the row unless it is
+        taken back.
+
+        The client is told as well, because dropping the subscription only
+        stops what has not been read yet. Anything already handed over is the
+        client's now — an agent's event buffer holds it for fifteen minutes and
+        will serve it to a poll or a resumed stream — so a removal has to reach
+        whoever is holding it, not just the reader that would have fetched
+        more.
+        """
+        self._unwatch(transport_room_id)
+        handler = self._handlers.on_removed
+        if handler is None:
+            return
+        await handler(
+            RoomRef(room_id=transport_room_id),
+            InboundMembership(
+                room_id=transport_room_id,
+                event_id=new_event_id(),
+                sender=self.user_id,
+                timestamp=_now_ms(),
+                state_key=self.user_id,
+                membership="leave",
+                display_name=self.display_name,
+            ),
+        )
+
+    async def _watch(self, transport_room_id: str, *, arrival_seq: int | None) -> None:
+        """Start delivering a room, from where the receive's progress says.
+
+        `arrival_seq` is the client's own arrival, when it has just joined the
+        room itself: reading starts before it, so the client hears its own
+        arrival. Over Matrix a join came back down the joining client's own
+        connection: the homeserver turned it into an event and delivered it
+        to everyone, including the person it was about, and code downstream
+        learned it had joined by being told. Writing the row and then
+        watching from the head would step over the client's own footprint:
+        the room hears the arrival and the arriving client does not.
+
+        Restoring the loop-back rather than dispatching the one handler that
+        noticed keeps every guard downstream in play, and covers whatever else
+        depended on hearing its own join.
+
+        The slot in `_watching` is claimed before the start is read, so a
+        removal landing on that await has something to take back; finding the
+        claim gone afterwards is the signal to subscribe to nothing.
+        """
+        room_id, tenant_id = await self._resolve_room_and_tenant(transport_room_id)
+        if room_id in self._watching:
+            return
+        progress = self._progress
+        if progress is None:
+            return
+        self._watching[room_id] = transport_room_id
+        try:
+            async with tenant_session(self._session_factory, tenant_id) as session:
+                # Read even when the caller wrote the row a moment ago: its
+                # `joined_at` is what a later re-read compares the membership
+                # by (`_compare_membership`).
+                member = await session.get(
+                    ClientRoom,
+                    {"client_id": self.client_id, "room_id": room_id},
+                )
+                if member is None:
+                    # Removed between the room list this came from and
+                    # here. The wake-up for it found nothing to unwatch, so
+                    # the row is the only thing that still says so.
+                    self._release_claim(room_id, transport_room_id)
+                    return
+                if arrival_seq is not None:
+                    seq: int | None = await progress.resume_joined(
+                        session, room_id, arrival_seq
+                    )
+                else:
+                    seq = (await progress.resume(session, [room_id])).get(room_id)
+                head = await self._message_store.head_seq(
+                    session, room_id, types=self._row_types
+                )
+        except Exception:
+            # A claim left behind would make every later `_watch` return
+            # early on a room nothing is subscribed to.
+            self._release_claim(room_id, transport_room_id)
+            raise
+        if self._watching.get(room_id) != transport_room_id:
+            # Removed while the row and start were being read. `_unwatch` has
+            # already undone the claim and there is nothing subscribed to undo.
+            return
+        if seq is None:
+            self._release_claim(room_id, transport_room_id)
+            return
+        self._subscribe_room(
+            room_id, transport_room_id, seq, cast(datetime, member.joined_at)
+        )
+        if seq < head:
+            # Anything already written past the start was announced before
+            # this subscription existed, so nothing else will wake the loop
+            # for it.
+            self._mark_pending(room_id)
+
+    def _subscribe_room(
+        self, room_id: str, transport_room_id: str, seq: int, joined_at: datetime
+    ) -> None:
+        """Deliver a claimed room from `seq` on, for the membership whose row
+        says the client joined at `joined_at`."""
+        self._cursors[room_id] = seq
+        self._recorded[room_id] = seq
+        if self._row_types is None:
+            # A reader of some types reads its own rows (`_drain_room`).
+            self._room_cache.attach(self.tenant_id, room_id, self)
+        self._listener.subscribe(room_id, self._on_room_advanced, types=self._row_types)
+        self._ephemeral.subscribe(transport_room_id, self._on_ephemeral)
+        self._joined_at[room_id] = joined_at
+
+    async def _watch_joined(self, transport_room_ids: list[str]) -> None:
+        """`_watch` every room the client is in, from where the progress
+        starts each, reading membership, starts and heads for all of them at
+        once.
+
+        At boot every client does this at the same moment, and one session
+        per room per check was over a thousand sessions in a few seconds,
+        enough to drain the pool. The guard is `_watch`'s, applied to the whole
+        set: every room is claimed before anything is read, so a removal that
+        lands on the read finds a claim to take back, and a room whose
+        membership row is gone by the time it is read is released. Only a room
+        whose start is behind its head is read at once: at boot that is the
+        few that moved while nobody read for the client, not all of them.
+
+        A room `joined_rooms` did not resolve (it always does, but the cache is
+        the only thing this relies on) goes through `_watch` on its own.
+        """
+        progress = self._progress
+        if progress is None:
+            return
+        claimed: dict[str, str] = {}
+        for transport_room_id in transport_room_ids:
+            room_id = self._room_ids.get(transport_room_id)
+            if room_id is None:
+                await self._watch(transport_room_id, arrival_seq=None)
+                continue
+            if room_id in self._watching:
+                continue
+            self._watching[room_id] = transport_room_id
+            claimed[room_id] = transport_room_id
+        if not claimed:
+            return
+        try:
+            async with tenant_session(self._session_factory, self.tenant_id) as session:
+                members = await self._room_store.member_room_ids(
+                    session, self.client_id, list(claimed)
+                )
+                places = await progress.resume(session, members)
+                heads = await self._message_store.head_seqs(
+                    session, list(members), types=self._row_types
+                )
+        except Exception:
+            for room_id, transport_room_id in claimed.items():
+                self._release_claim(room_id, transport_room_id)
+            raise
+        for room_id, transport_room_id in claimed.items():
+            if room_id not in members or room_id not in places:
+                # Removed between the room list and here; see `_watch`.
+                self._release_claim(room_id, transport_room_id)
+                continue
+            if self._watching.get(room_id) != transport_room_id:
+                continue
+            self._subscribe_room(
+                room_id, transport_room_id, places[room_id], members[room_id]
+            )
+            if places[room_id] < heads[room_id]:
+                self._mark_pending(room_id)
+
+    def _unwatch(self, transport_room_id: str) -> None:
+        """Stop delivering one room. Not watching it is success.
+
+        The cursor goes with the subscription. Keeping it would mean a client
+        added back to the room resumed from where it left off and was handed
+        everything said while it was out.
+        """
+        room_id = self._room_ids.get(transport_room_id)
+        if room_id is None or room_id not in self._watching:
+            return
+        self._release_claim(room_id, transport_room_id)
+
+    def _release_claim(self, room_id: str, transport_room_id: str) -> None:
+        """Undo everything `_watch` records for a room, subscribed or not.
+
+        Safe on a room `_watch` has claimed but not yet subscribed: both buses
+        treat unsubscribing something that never subscribed as success, which
+        is what lets `_watch` claim its slot before it awaits.
+        """
+        self._listener.unsubscribe(room_id, self._on_room_advanced)
+        self._ephemeral.unsubscribe(transport_room_id, self._on_ephemeral)
+        self._watching.pop(room_id, None)
+        self._joined_at.pop(room_id, None)
+        self._cursors.pop(room_id, None)
+        self._recorded.pop(room_id, None)
+        # A wake-up already queued for this room would otherwise be drained
+        # after the subscription was dropped.
+        self._pending.discard(room_id)
+        self._woken.pop(room_id, None)
+        # The last member out takes the room's cached rows with it.
+        self._room_cache.detach(self.tenant_id, room_id, self)
+
+    def _unwatch_all(self) -> None:
+        """Drop every room, through the same path a single removal takes."""
+        for transport_room_id in list(self._watching.values()):
+            self._unwatch(transport_room_id)
+
+    async def _on_ephemeral(self, event: InboundCustomEvent) -> None:
+        """An unstored event in a room this client watches.
+
+        It arrives already assembled, unlike a row: there is nothing to read
+        back, which is the whole difference between announcing a position and
+        announcing a value.
+        """
+        handler = self._handlers.on_custom_event
+        if handler is None:
+            return
+        await handler(RoomRef(room_id=event.room_id), event)
+
+    async def _on_room_advanced(self, room_id: str) -> None:
+        """The listener's waker: note the room and return.
+
+        It must not deliver. The listener fans out from one task, so time
+        spent here is time no other client in the process is being delivered
+        to.
+        """
+        if room_id not in self._watching:
+            return
+        self._mark_pending(room_id)
+
+    def _mark_pending(self, room_id: str) -> None:
+        """Queue a room for this client's loop, remembering when.
+
+        The tick is taken here, after the commit that caused the wake, so a
+        shared read that started later is known to have seen it.
+        """
+        self._woken[room_id] = self._room_cache.tick()
+        self._pending.add(room_id)
+        self._wake.set()
+
+    def held_back_released(self, transport_room_id: str) -> None:
+        """The client acted on rows it was holding back in a room: have the
+        delivery loop record the progress that was waiting on them."""
+        room_id = self._room_ids.get(transport_room_id)
+        if room_id is not None and room_id in self._watching:
+            self._mark_pending(room_id)
+
+    def _record_progress(self, room_id: str) -> None:
+        """Record the room's progress through the last row handled, or up to
+        the first row the client is still holding back, if that is further
+        than what was recorded last."""
+        progress = self._progress
+        transport_room_id = self._watching.get(room_id)
+        cursor = self._cursors.get(room_id)
+        if progress is None or transport_room_id is None or cursor is None:
+            return
+        held_from = self._handlers.held_from
+        held = held_from(transport_room_id) if held_from is not None else None
+        through = cursor if held is None else min(cursor, held - 1)
+        recorded = self._recorded.get(room_id)
+        if recorded is not None and through <= recorded:
+            return
+        self._recorded[room_id] = through
+        progress.advance(room_id, through)
+
+    async def _drain_room(self, room_id: str) -> None:
+        """Read what this client has not seen in one room, and hand it over.
+
+        Driven by this client's own loop, which promises only that the room
+        moved — and never that it moved once. The
+        cursor is this transport's own, so a coalesced announcement, a
+        duplicate, or a wake-up after a reconnect all reduce to the same
+        thing: read from where I was, and advance.
+
+        The cursor advances per row rather than at the end, so a handler that
+        raises does not cost the rows already delivered — the failure belongs
+        to one event, and redelivering its neighbours would be worse than
+        dropping it.
+
+        Every delivery is a suspension point, so the subscription is re-read
+        per row. A removal landing mid-page has to stop the rows it has not
+        reached, and must not be undone by a cursor write after it.
+
+        A page comes from the room's one shared read when the cache can vouch
+        for it from this cursor, and from this client's own read when it
+        cannot. Only the read is shared: the rows are still handed over here,
+        one at a time, under the same checks.
+        """
+        transport_room_id = self._watching.get(room_id)
+        if transport_room_id is None:
+            return
+        # Every room this client can be in is in this client's own tenant --
+        # `client_rooms` and `messages` both key to `rooms` and to `clients`
+        # through `tenant_id` -- so there is one answer here rather than one
+        # per room. This used to be a per-room map filled from each room's own
+        # row; the map only ever held this value, and two sources for one fact
+        # is how they come to disagree.
+        tenant_id = self.tenant_id
+        # Taken once per pass: a wake landing during it queues another pass,
+        # which takes the newer one. A room queued without a wake time (no
+        # path does that today) gets "now", which only ever costs a read.
+        woken_at = self._woken.get(room_id) or self._room_cache.tick()
+        # Bound for the read *and* the delivery below: a handler (posting to a
+        # bridge, gating a command) opens its own sessions rather than reusing
+        # this one, and those still need the room's tenant. The contextvar
+        # covers them because they run in this same task, not because they
+        # share a session with the read.
+        with tenant_scope(tenant_id):
+            while True:
+                cursor = self._cursors.get(room_id)
+                if cursor is None or room_id not in self._watching:
+                    return
+                if self._row_types is None:
+                    rows, done = await self._read_shared_page(
+                        room_id, tenant_id, cursor, woken_at
+                    )
+                else:
+                    rows, done = await self._read_page(room_id, tenant_id, cursor)
+                if self._cursors.get(room_id) != cursor:
+                    # Removed and put back while waiting on the room's
+                    # shared read: these rows are from the old
+                    # subscription's position, not the new one's.
+                    continue
+                for row, attachments in rows:
+                    if room_id not in self._watching or self._stopping:
+                        break
+                    self._cursors[room_id] = row.seq
+                    await self._deliver(transport_room_id, row, attachments)
+                # After the page's rows are handled, never before: a reader
+                # resuming from it would otherwise skip a row whose effects
+                # were cut short.
+                self._record_progress(room_id)
+                if done or not rows or self._stopping:
+                    return
+
+    async def _read_page(
+        self, room_id: str, tenant_id: str, cursor: int
+    ) -> DeliveryPage:
+        """This client's own read of the next page, for when the room's
+        shared read cannot serve it. `done` when the page came back short."""
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            rows = await self._message_store.list_for_room(
+                session,
+                room_id,
+                after_seq=cursor,
+                limit=DELIVERY_PAGE,
+                types=self._row_types,
+            )
+            attachments = await self._message_store.attachments_for(
+                session, [row.id for row in rows]
+            )
+        page: list[tuple[DeliveryRow, DeliveryAttachments]] = [
+            (row, attachments.get(row.id, [])) for row in rows
+        ]
+        return page, len(rows) < DELIVERY_PAGE
+
+    async def _read_shared_page(
+        self, room_id: str, tenant_id: str, cursor: int, woken_at: int
+    ) -> DeliveryPage:
+        """The next page from the room's shared read, or this client's own
+        when the cache cannot vouch for it (cursor behind what it holds,
+        entry dropped while waiting).
+
+        The key is this client's tenant and a room it resolved under that
+        tenant, which is what makes a hit as good as the read it replaces.
+        """
+        page = await self._room_cache.read(
+            tenant_id,
+            room_id,
+            after_seq=cursor,
+            woken_at=woken_at,
+            limit=DELIVERY_PAGE,
+        )
+        if page is None:
+            if room_id not in self._watching:
+                return [], True
+            return await self._read_page(room_id, tenant_id, cursor)
+        return [(row, row.attachments) for row in page.rows], page.done
+
+    async def _deliver(
+        self,
+        transport_room_id: str,
+        row: DeliveryRow,
+        attachments: DeliveryAttachments,
+    ) -> None:
+        room = RoomRef(room_id=transport_room_id)
+        event = to_inbound(row, attachments, transport_room_id=transport_room_id)
+        handler = self._handler_for(event)
+        if handler is None:
+            return
+        kind = _delivered_kind(event)
+        metrics().increment(
+            MESSAGES_DELIVERED, {"kind": kind, "actor": self._actor_role}
+        )
+        lag_ms = _age_ms(row.sent_at)
+        if lag_ms is not None:
+            metrics().observe(
+                DELIVERY_LAG, {"kind": kind, "actor": self._actor_role}, lag_ms
+            )
+        # What the client writes while handling the row is numbered from it,
+        # so handling it a second time writes nothing new.
+        with writes_derived_from(self.client_id, row.transport_event_id):
+            await handler(room, event)
+
+    def _handler_for(self, event: InboundEvent) -> Handler | None:
+        if isinstance(event, InboundMedia):
+            return self._handlers.on_media
+        if isinstance(event, InboundMembership):
+            return self._handlers.on_member_event
+        if isinstance(event, InboundCustomEvent):
+            return self._handlers.on_custom_event
+        return self._handlers.on_message
+
+    # ── Outbound ──────────────────────────────────────────────────────────────
+
+    async def send_message(
+        self,
+        room_id: str,
+        body: str,
+        *,
+        sender_name: str,
+        metered: bool,
+        format: MessageFormat = "text",
+        mentions: list[str] | None = None,
+        thread_root_id: str | None = None,
+        extra_content: dict[str, object] | None = None,
+    ) -> SendResult:
+        content = message_content(
+            body,
+            sender_name=sender_name,
+            format=format,
+            mentions=mentions,
+            thread_root_id=thread_root_id,
+            extra_content=extra_content,
+        )
+        return await self._send(
+            room_id, "m.room.message", content, sender_name, metered=metered
+        )
+
+    async def send_event(
+        self,
+        room_id: str,
+        event_type: str,
+        content: dict[str, object],
+    ) -> SendResult:
+        return await self._send(
+            room_id, event_type, content, self.display_name, metered=False
+        )
+
+    async def send_media(
+        self,
+        room_id: str,
+        uri: str,
+        filename: str,
+        mimetype: str,
+        size: int,
+        *,
+        sender_name: str,
+        metered: bool,
+        msgtype: str,
+        caption: str | None = None,
+        thread_root_id: str | None = None,
+        group: dict[str, object] | None = None,
+    ) -> SendResult:
+        content = media_content(
+            uri,
+            filename,
+            mimetype,
+            size,
+            sender_name=sender_name,
+            msgtype=msgtype,
+            caption=caption,
+            thread_root_id=thread_root_id,
+            group=group,
+        )
+        return await self._send(
+            room_id, "m.room.message", content, sender_name, metered=metered
+        )
+
+    async def _send(
+        self,
+        transport_room_id: str,
+        event_type: str,
+        content: dict[str, object],
+        sender_name: str,
+        *,
+        metered: bool,
+    ) -> SendResult:
+        """Write the event, which is what sending it means here.
+
+        The commit is the acceptance: the trigger on `messages` announces the
+        row as part of it, so no subscriber can be woken for a row that a later
+        rollback removes. The agents the row is for have their own events in
+        the same commit, and anything the row leaves an agent to say is posted
+        only after it.
+        """
+        # A row this client writes while handling one it was handed, or on
+        # behalf of a platform post, gets an id derived from what it acts on
+        # (`derived_ids.py`), so acting on it again writes nothing new.
+        derived = None if event_type in EPHEMERAL else derived_writes(self.client_id)
+        event_id = new_event_id() if derived is None else derived.next_event_id()
+        result = SendResult(event_id=event_id, event_type=event_type, content=content)
+        kind = _sent_kind(event_type, content)
+        if event_type in EPHEMERAL:
+            # Presence-like state, replaced by its own next value. Storing it
+            # would put a row in the room's order for something no reader is
+            # ever shown, so it is delivered live instead of written: the
+            # announcement carries the value, because there is nowhere for a
+            # reader to go and fetch it.
+            await self._ephemeral.publish(
+                transport_room_id,
+                InboundCustomEvent(
+                    room_id=transport_room_id,
+                    event_id=result.event_id,
+                    sender=self.user_id,
+                    timestamp=_now_ms(),
+                    content=content,
+                    event_type=event_type,
+                ),
+            )
+            metrics().increment(
+                MESSAGES_SENT, {"kind": kind, "actor": self._actor_role}
+            )
+            return result
+
+        try:
+            room_id, tenant_id = await self._resolve_room_and_tenant(transport_room_id)
+            async with tenant_session(self._session_factory, tenant_id) as session:
+                message = message_row(
+                    room_id=room_id,
+                    event_id=result.event_id,
+                    sender_id=self.user_id,
+                    sender_client_id=self.client_id,
+                    sender_name=sender_name,
+                    event_type=event_type,
+                    content=content,
+                    client_txn_id=None,
+                )
+                routed = await self._router.store(
+                    session,
+                    tenant_id=tenant_id,
+                    room_id=room_id,
+                    transport_room_id=transport_room_id,
+                    message=message,
+                    attachments=attachments_in(content),
+                    unless_stored=derived is not None,
+                )
+                if routed is None:
+                    logger.info(
+                        "Client %s already wrote %s for what it is acting on; "
+                        "not writing it again",
+                        self.user_id,
+                        result.event_id,
+                    )
+                    return result
+                if metered and kind in _METERED_KINDS:
+                    await self._usage_store.record(
+                        session,
+                        tenant_id=tenant_id,
+                        metric=UsageMetric.MESSAGES,
+                        client_id=self.client_id,
+                        model="",
+                        amount=1,
+                    )
+                await session.commit()
+        except Exception:
+            # `MESSAGES_SENT` is recorded only after the commit, so without
+            # this a database outage reads as silence — and so does a quiet
+            # room.
+            metrics().increment(
+                SEND_FAILURES, {"kind": kind, "actor": self._actor_role}
+            )
+            raise
+        routed.committed()
+        metrics().increment(MESSAGES_SENT, {"kind": kind, "actor": self._actor_role})
+        if metered and kind in _METERED_KINDS:
+            self._observe(tenant_id, room_id, kind, content)
+        return result
+
+    def _observe(
+        self, tenant_id: str, room_id: str, kind: str, content: dict[str, object]
+    ) -> None:
+        """Tell the observer a participant said something.
+
+        After the commit, so it never hears of a message that was rolled back.
+        Guarded because the row is already committed: an exception leaving
+        `_send` now would tell the sender that a message in the room was not
+        sent, and its retry would post it twice. Counted, because a guard that
+        only logs leaves nothing to alert on.
+        """
+        group = parse_attachment_group(content)
+        if group is not None and group[1] != 0:
+            # One post with several files is one message; its first part
+            # stands for it.
+            return
+        try:
+            self._message_observer.observe(
+                ParticipantMessage(
+                    tenant_id=tenant_id,
+                    room_id=room_id,
+                    sender_client_id=self.client_id,
+                    sender_role=self._actor_role,
+                    has_attachment=kind == "media",
+                    in_thread=thread_root_of(content) is not None,
+                )
+            )
+        except Exception:
+            metrics().increment(OBSERVER_FAILURES, {"actor": self._actor_role})
+            if (failures := _observer_failures.note()) is not None:
+                logger.error(
+                    "Message observer failed; the message itself was sent. %d "
+                    "failure(s) since the last error.",
+                    failures,
+                    exc_info=True,
+                )
+
+    async def set_typing(self, room_id: str, is_typing: bool) -> None:
+        """Not carried. Composing state is presence, and nothing consumes it."""
+
+    async def upload_media(
+        self, data: bytes, content_type: str, filename: str
+    ) -> UploadResult:
+        """Store the bytes and return the handle the message will carry.
+
+        The handle is a key and nothing more. Callers already treat it as
+        opaque — it crosses the agent protocol as `mxc` and comes back as a
+        query parameter — so what is behind it can become object storage later
+        without the protocol noticing.
+        """
+        uri = f"switch-media://{uuid.uuid4().hex}"
+        # This client's tenant, not whatever a caller happens to have bound.
+        # `media_blobs` is scoped, and the uri is opaque,
+        # so an unguessable identifier is not an isolation boundary and the
+        # row has to name a tenant that means something. It is the same answer
+        # a room's tenant would give — a client is only in rooms of its own —
+        # and it does not depend on there being a room in hand.
+        async with tenant_session(self._session_factory, self.tenant_id) as session:
+            await self._media_store.put(
+                session,
+                MediaBlob(
+                    uri=uri,
+                    content_type=content_type,
+                    filename=filename,
+                    size=len(data),
+                    data=data,
+                ),
+            )
+            await session.commit()
+        return UploadResult(uri=uri)
+
+    async def download_media(self, uri: str) -> DownloadResult:
+        """The bytes for a handle.
+
+        A handle with nothing behind it raises rather than returning empty
+        bytes: an attachment the sender was told had been stored and a reader
+        gets back as a zero-byte file is the worst of the available answers.
+        """
+        async with tenant_session(self._session_factory, self.tenant_id) as session:
+            blob = await self._media_store.get(session, uri)
+        if blob is None:
+            raise TransportError(f"No media stored under {uri}")
+        return DownloadResult(
+            body=blob.data,
+            content_type=blob.content_type,
+            filename=blob.filename,
+        )
+
+    # ── History ───────────────────────────────────────────────────────────────
+
+    async def get_event(self, room_id: str, event_id: str) -> Any | None:
+        """One event by id, or None.
+
+        Scoped to the room, so an id from elsewhere cannot be read through it —
+        the caller is resolving a thread root supplied by an agent.
+        """
+        switch_room_id, tenant_id = await self._resolve_room_and_tenant(room_id)
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            rows = await self._message_store.list_by_transport_event_ids(
+                session, switch_room_id, [event_id]
+            )
+        return rows[0] if rows else None
+
+    async def read_history(
+        self, room_id: str, *, start: str | None, limit: int
+    ) -> HistoryPage:
+        raise NotImplementedError(
+            "PostgresTransport does not serve history: the read path already "
+            "queries `messages` directly, and the history walkers that use "
+            "this method exist to compare the bus against those same rows."
+        )
+
+    # ── Rooms ─────────────────────────────────────────────────────────────────
+
+    async def join_room(self, room_id: str) -> bool:
+        """Membership is a row, and so is the arrival that announces it.
+
+        Over Matrix these were one thing: the homeserver turned a join into an
+        `m.room.member` event every other member saw, and Switch recorded that
+        event separately so history could explain who appeared. Here the write
+        does both jobs at once, which removes the case the recorder had to
+        guard against — an arrival that happened but was never written.
+
+        Returns True for an existing membership as well as a new one: the
+        caller asked to be in the room, and it is.
+
+        Watching is decided separately from the row, and that split is the
+        point. Membership and subscription used to be one fact — the
+        homeserver's join *was* what a sync loop delivered — but a row can now
+        be written by something other than this client, and a client that
+        returned early on finding one would be a member of a room it never
+        reads, with no later join able to repair it. So the row is written
+        once and the subscription is taken whenever it is missing.
+        """
+        switch_room_id, tenant_id = await self._resolve_room_and_tenant(room_id)
+        adopting = switch_room_id in self._adopting
+        self._adopting.discard(switch_room_id)
+        self._joining.add(switch_room_id)
+        try:
+            return await self._join_room(
+                room_id, switch_room_id, tenant_id, adopting=adopting
+            )
+        finally:
+            self._joining.discard(switch_room_id)
+
+    async def _join_room(
+        self, room_id: str, switch_room_id: str, tenant_id: str, *, adopting: bool
+    ) -> bool:
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            existing = await session.get(
+                ClientRoom, {"client_id": self.client_id, "room_id": switch_room_id}
+            )
+            if existing is None and adopting:
+                logger.info(
+                    "Client %s was removed from %s while it re-read its rooms; "
+                    "it does not join",
+                    self.user_id,
+                    room_id,
+                )
+                return False
+            joined = existing is None and await self._room_store.add_client(
+                session, self.client_id, switch_room_id
+            )
+            if not joined:
+                # A member already, or made one a moment ago by another
+                # writer, which wrote the arrival too: one arrival per
+                # membership, so the room is greeted once.
+                if self._receiving:
+                    await self._watch(room_id, arrival_seq=None)
+                return True
+            arrival = Message(
+                room_id=switch_room_id,
+                transport_event_id=new_event_id(),
+                sender_id=self.user_id,
+                sender_client_id=self.client_id,
+                sender_name=self.display_name,
+                event_type=MEMBERSHIP_EVENT_TYPE,
+                msgtype=None,
+                body=None,
+                formatted_body=None,
+                thread_root_event_id=None,
+                # No rendered sentence: how an arrival reads is the reader's to
+                # phrase, and freezing today's wording into every row is not
+                # something a later change can take back.
+                content={"membership": "join", "displayname": self.display_name},
+            )
+            routed = await self._router.store(
+                session,
+                tenant_id=tenant_id,
+                room_id=switch_room_id,
+                transport_room_id=room_id,
+                message=arrival,
+                attachments=[],
+            )
+            await session.commit()
+        routed.committed()
+        arrival_seq = routed.seq
+        if self._receiving:
+            # From just before the arrival, so this client reads its own join
+            # the way every other member does.
+            await self._watch(room_id, arrival_seq=arrival_seq)
+        return True
+
+    async def joined_rooms(self) -> list[str]:
+        """The transport-side ids of this client's rooms.
+
+        Scoped to this client's own tenant, which is *carried* rather than
+        inherited — the distinction the earlier version of this method was
+        right to insist on. It runs once, at the top of `receive_forever`, in
+        a task that binds nothing, so a tenant taken from whatever created the
+        task would return a subset with no error to say so, and the client
+        would be silently deaf in every room it did not see, forever. The
+        tenant this reads under comes from the client row the transport was
+        built from, which is the same answer the read itself would have given
+        and one nobody has to be in the right context to have.
+
+        The subset it cannot be is guaranteed by the schema rather than
+        assumed: `client_rooms` carries composite foreign keys to both
+        `clients` and `rooms`, so a client is only ever a member of rooms in
+        its own tenant. `tests/switch_core/transport/test_postgres_transport.py`
+        pins that, because the shape of this list rests on it.
+        """
+        async with tenant_session(self._session_factory, self.tenant_id) as session:
+            rooms = await self._room_store.get_for_client(session, self.client_id)
+        # The rows carry both ids, so watching them needs no lookup per room.
+        for room in rooms:
+            if room.transport_room_id:
+                self._room_ids[room.transport_room_id] = room.id
+        return [room.transport_room_id for room in rooms if room.transport_room_id]
+
+    async def set_display_name(self, display_name: str) -> None:
+        """Held on the client row, which is where every reader already looks."""
+        self.display_name = display_name
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    async def _resolve_room(self, session: AsyncSession, transport_room_id: str) -> str:
+        """The Switch room id for `transport_room_id`, resolved and cached.
+
+        Takes the caller's session, for callers that are going on to use it.
+        The read itself is tenant-agnostic in the only sense that matters:
+        `rooms.matrix_room_id` is unique per tenant, not globally, so a caller
+        that hands in a session bound to the wrong tenant gets "not a Switch
+        room" rather than another tenant's row. `_resolve_room_and_tenant` is
+        the entry point for a caller that does not yet know which tenant to
+        bind, and it is the one used everywhere the answer is in doubt.
+        """
+        cached = self._room_ids.get(transport_room_id)
+        if cached is not None:
+            return cached
+        room = await self._room_store.get_by_transport_room_id(
+            session, transport_room_id
+        )
+        if room is None:
+            raise TransportError(f"{transport_room_id} is not a Switch room")
+        self._room_ids[transport_room_id] = room.id
+        return room.id
+
+    async def _resolve_room_and_tenant(self, transport_room_id: str) -> tuple[str, str]:
+        """The Switch room id and tenant for a transport-side id.
+
+        On a miss, scoped to this client's own tenant rather than unscoped.
+        `rooms.matrix_room_id` is unique *per tenant*, so an unscoped read of
+        it is the one lookup here that could legitimately match two rows; this
+        client can only be in rooms of its own tenant, so scoping the read is
+        both narrower and exact. Once cached, resolving costs nothing: no
+        session, no query, no round trip.
+        """
+        tenant_id = self.tenant_id
+        cached = self._room_ids.get(transport_room_id)
+        if cached is not None:
+            return cached, tenant_id
+        await self._room_ids.read_all_once(self._open_rooms)
+        cached = self._room_ids.get(transport_room_id)
+        if cached is not None:
+            return cached, tenant_id
+        async with tenant_session(self._session_factory, tenant_id) as session:
+            room_id = await self._resolve_room(session, transport_room_id)
+        return room_id, tenant_id
+
+    async def _open_rooms(self) -> list[tuple[str, str]]:
+        async with tenant_session(self._session_factory, self.tenant_id) as session:
+            return await self._room_store.transport_ids_of_open_rooms(
+                session, self.tenant_id
+            )
+
+
+def _now_ms() -> int:
+    return int(datetime.now(UTC).timestamp() * 1000)

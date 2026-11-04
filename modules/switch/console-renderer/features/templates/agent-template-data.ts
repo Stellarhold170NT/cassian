@@ -1,0 +1,223 @@
+import type { ParsedAgentTemplate } from '@main/core/agent-templates/agent-template-format';
+import type { ParsedAgentEntry, TemplateKind } from '@main/core/agent-templates/template-document';
+import type { TemplateSummary } from '@main/core/agent-templates/template-summary';
+import type { AgentTemplateOrigin } from '@main/core/agents/agent-config-file';
+import type { ParsedTemplate } from '@main/core/room-templates/controller';
+import type { StoredTemplateSummary } from '@main/core/switch-servers/gateway-client';
+import { workspacesStore } from '@renderer/features/workspaces/workspaces-store';
+import { failureText } from '@renderer/lib/errors/describe-failure';
+import { rpc } from '@renderer/lib/ipc';
+import { bundledYamlFor, findBundledTemplate } from './bundled-templates';
+
+/**
+ * One agent as a template describes it, plus its room part already converted
+ * to a room template. A caller can create the room as soon as the agent
+ * exists, without parsing YAML itself.
+ */
+export type AgentTemplate = {
+  /** The template's own name, for a heading. */
+  name: string;
+  /** Where the template came from. Recorded on the agent so its settings
+   * page can load the template again and offer its current instructions.
+   * Null for a pasted document, which cannot be loaded again. */
+  origin: AgentTemplateOrigin | null;
+  /** The agent name from the template's `name` field. The deployer can change it before creating. */
+  agentName: string | null;
+  description: string;
+  instructions: string;
+  repoUrl: string | null;
+  sources: ParsedAgentTemplate['sources'];
+  addressing: ParsedAgentTemplate['addressing'];
+  /** The template's room as a room template document, or null when it declares no room. */
+  roomYaml: string | null;
+  roomName: string | null;
+  warnings: string[];
+};
+
+/** Parse a document into the agent it describes. */
+export async function agentTemplateFromContent(
+  templateName: string,
+  content: string,
+  instructions: string | null,
+  origin: AgentTemplateOrigin | null
+): Promise<AgentTemplate> {
+  const parsed = await rpc.agentTemplates.parse({ yamlText: content, instructions });
+  const roomYaml = parsed.room
+    ? await rpc.agentTemplates.serverDocument({ yamlText: content })
+    : null;
+  return {
+    name: templateName,
+    origin,
+    agentName: parsed.name,
+    description: parsed.description,
+    instructions: parsed.instructions,
+    repoUrl: parsed.repoUrl,
+    sources: parsed.sources,
+    addressing: parsed.addressing,
+    roomYaml,
+    roomName: parsed.room?.name ?? null,
+    warnings: parsed.warnings,
+  };
+}
+
+/** Whether the template recorded on an agent's config can still be loaded.
+ * An agent made before templates came from the server records a template
+ * bundled with the Console, which a later Console can drop. */
+export function templateOriginExists(origin: AgentTemplateOrigin): boolean {
+  return origin.source !== 'bundled' || findBundledTemplate(origin.id) !== undefined;
+}
+
+/** Load the template recorded on an agent's config. */
+export async function loadAgentTemplateByOrigin(
+  origin: AgentTemplateOrigin
+): Promise<AgentTemplate> {
+  if (origin.source === 'bundled') {
+    const bundled = findBundledTemplate(origin.id);
+    if (!bundled) throw new Error(`This Console no longer bundles "${origin.name}".`);
+    return agentTemplateFromContent(
+      origin.name,
+      await bundledYamlFor(bundled, origin.serverId ?? null),
+      bundled.instructions,
+      origin
+    );
+  }
+  const detail = await rpc.workspaces.getTemplateDetail({
+    workspaceId: templateWorkspaceId(origin),
+    templateId: origin.id,
+  });
+  return agentTemplateFromContent(origin.name, detail.definition, null, origin);
+}
+
+/**
+ * The workspace to ask for a server template, from what the origin recorded.
+ *
+ * A registry belongs to a workspace, so an origin naming only a server is
+ * answerable exactly while that server holds one. Where it holds several the
+ * window's own workspace is not an answer: it would load a different template
+ * of the same id, or none, and offer it as this agent's.
+ */
+function templateWorkspaceId(origin: AgentTemplateOrigin): string {
+  if (origin.workspaceId) return origin.workspaceId;
+  if (!origin.serverId)
+    throw new Error(`"${origin.name}" came from a server this Console does not know.`);
+  const onServer = workspacesStore.onServer(origin.serverId);
+  if (onServer.length === 1) return onServer[0]!.id;
+  if (onServer.length === 0)
+    throw new Error(`The workspace "${origin.name}" came from is not known yet.`);
+  throw new Error(
+    `"${origin.name}" was recorded before this Console kept which workspace a template came from, and its Switch server now has ${onServer.length}. Open it from that workspace's template list instead.`
+  );
+}
+
+/** Resolve a listing entry into the agent it describes. */
+export async function loadAgentTemplate(
+  workspaceId: string,
+  template: StoredTemplateSummary
+): Promise<AgentTemplate> {
+  const detail = await rpc.workspaces.getTemplateDetail({ workspaceId, templateId: template.id });
+  const serverId = workspacesStore.serverIdFor(workspaceId);
+  return agentTemplateFromContent(detail.name, detail.definition, null, {
+    id: detail.id,
+    name: detail.name,
+    source: 'server',
+    workspaceId,
+    ...(serverId ? { serverId } : {}),
+  });
+}
+
+/** A template loaded for its page: its record, what it creates, and its document. */
+export type LoadedTemplate = {
+  name: string;
+  description: string;
+  kind: TemplateKind;
+  /** The workspace's record of it. */
+  server: StoredTemplateSummary;
+  /** The agents the template creates, in document order. Empty for a room template. */
+  agents: ParsedAgentEntry[];
+  /** The room part, parsed: the rooms and the params. Null when the document has no rooms. */
+  room: ParsedTemplate | null;
+  /** The rooms and agents it creates, with counts for the listing card. */
+  summary: TemplateSummary;
+  /** The full document with agent instructions inlined, as stored or as it would be stored. */
+  document: string;
+  /** Why the document cannot be read, when it cannot. The page still opens, so it can be edited or deleted. */
+  problem: string | null;
+};
+
+/** Load one template by the id the listing gave it. */
+export async function loadTemplateById(
+  workspaceId: string,
+  templateId: string
+): Promise<LoadedTemplate> {
+  const detail = await rpc.workspaces.getTemplateDetail({ workspaceId, templateId });
+  const { definition: document, ...server } = detail;
+  const { name, description } = detail;
+  const summary = await rpc.agentTemplates.summarize({ yamlText: document });
+  try {
+    const kind = await rpc.agentTemplates.kind({ yamlText: document });
+    const { agents } = await rpc.agentTemplates.parseAgents({ yamlText: document });
+    // Every param, the Console's own types included, so the Inputs table lists
+    // what the Use page asks for and what the card counts.
+    const coreYaml = await rpc.agentTemplates.serverDocument({
+      yamlText: document,
+      keepConsoleParams: true,
+    });
+    const room = coreYaml ? await rpc.roomTemplates.parse({ yamlText: coreYaml }) : null;
+    return { name, description, kind, server, agents, room, summary, document, problem: null };
+  } catch (e) {
+    const kind: TemplateKind =
+      server.kind === 'agent' || server.kind === 'group' ? server.kind : 'room';
+    return {
+      name,
+      description,
+      kind,
+      server,
+      agents: [],
+      room: null,
+      summary: { ...summary, creates: [] },
+      document,
+      problem: failureText(e, 'Its document could not be read.'),
+    };
+  }
+}
+
+/** A readable listing name from a file name: no extension, no `.template`, words not dashes. */
+export function templateNameFromFile(fileName: string): string {
+  const stem = fileName
+    .replace(/(\.template)?\.ya?ml$/i, '')
+    .replace(/[-_]+/g, ' ')
+    .trim();
+  return stem.length === 0 ? stem : stem[0].toUpperCase() + stem.slice(1);
+}
+
+/** What the save dialog should offer for a document: its kind, a name and a description. */
+export async function prefillForSave(
+  content: string,
+  sourceName: string | null
+): Promise<{ kind: TemplateKind; name: string; description: string }> {
+  const fromFile = sourceName ? templateNameFromFile(sourceName) : '';
+  const kind = await rpc.agentTemplates.kind({ yamlText: content });
+  if (kind === 'agent') {
+    const t = await agentTemplateFromContent(fromFile || 'Agent template', content, null, null);
+    return {
+      kind,
+      name: fromFile || t.agentName || 'Agent template',
+      description: t.description,
+    };
+  }
+  const coreYaml = await rpc.agentTemplates.serverDocument({ yamlText: content });
+  const t = coreYaml ? await rpc.roomTemplates.parse({ yamlText: coreYaml }) : null;
+  const literal = (s: string | null) => (s && !/\{[^}]+\}/.test(s) ? s : null);
+  return {
+    kind,
+    name:
+      fromFile ||
+      literal(t?.groupName ?? null) ||
+      literal(t?.roomName ?? null) ||
+      (kind === 'group' ? 'Group template' : 'Room template'),
+    // A room's description often contains a placeholder ("Workroom for
+    // {task}"), which reads badly on a listing card. Leave the description
+    // empty and let the user write one in the dialog.
+    description: literal(t?.roomDescription ?? null) ?? '',
+  };
+}

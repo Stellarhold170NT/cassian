@@ -1,0 +1,129 @@
+import { Cloud, CloudOff, Server, ServerOff } from 'lucide-react';
+import { observer } from 'mobx-react-lite';
+import { byLatestDirectChat } from '@renderer/features/chats/agent-conversations';
+import { chatsStore } from '@renderer/features/chats/stores/chats';
+import { isFrozenServer } from '@renderer/features/switch-servers/managed-server-state';
+import { switchServersStore } from '@renderer/features/switch-servers/switch-servers-store';
+import { failureText } from '@renderer/lib/errors/describe-failure';
+import { useNavigate, useParams } from '@renderer/lib/layout/navigation-provider';
+import { useWorkspaceSlots } from '@renderer/lib/layout/workspace-slots';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@renderer/lib/ui/tooltip';
+import { isCloudMachine, type ManagedAgentView } from '@shared/core/managed-agents/managed-agents';
+import { getProvider, isValidProviderId } from '@shared/core/providers/agent-provider-registry';
+import { type AgentPresence, SidebarAgentRow } from '../sidebar/agent-row';
+import {
+  type ManagedAgentState,
+  managedAgentLabel,
+  managedAgentState,
+} from './managed-agent-state';
+import { useManagedAgents, useRunsOnThisComputer } from './use-managed-agents';
+
+/**
+ * The active server's managed agents: every one the server lists, whatever
+ * machine it runs on and wherever it was created, in the same rows as the
+ * agents this Console runs.
+ */
+export const ManagedAgentList = observer(function ManagedAgentList() {
+  const serverId = switchServersStore.activeServerId;
+  const agents = useManagedAgents(serverId);
+  if (serverId === null) return null;
+  // A frozen workspace's banner already says why nothing can be listed.
+  const server = switchServersStore.serverById(serverId);
+  if (agents.error && !(server && isFrozenServer(server)))
+    return (
+      <div role="alert" className="px-3 py-2 text-xs text-foreground-destructive">
+        {failureText(agents.error, 'Managed agents could not be listed.')}
+      </div>
+    );
+  if (!agents.data?.length) return null;
+  // The chats store follows one server, and only while agent_chats is on there.
+  const chats =
+    chatsStore.serverId === serverId && chatsStore.userId !== null
+      ? chatsStore.chats.values()
+      : null;
+  return (
+    <div className="flex flex-col gap-[2px]" aria-label="Managed agents">
+      {disconnectedLast(byLatestDirectChat(agents.data, chats)).map((agent) => (
+        <ManagedAgentRow key={agent.agentId} agent={agent} />
+      ))}
+    </div>
+  );
+});
+
+/**
+ * The agents in the order the server listed them, with the ones that cannot
+ * run right now — no machine, or a machine that is offline or removed — at the
+ * bottom, where they stay out of the way of the agents that can.
+ */
+export function disconnectedLast(agents: ManagedAgentView[]): ManagedAgentView[] {
+  const disconnected = (agent: ManagedAgentView) =>
+    agent.machine === null || agent.machine.state !== 'online';
+  return [...agents.filter((agent) => !disconnected(agent)), ...agents.filter(disconnected)];
+}
+
+const ManagedAgentRow = observer(function ManagedAgentRow({ agent }: { agent: ManagedAgentView }) {
+  const { navigate } = useNavigate();
+  const { currentView } = useWorkspaceSlots();
+  const { params } = useParams('managedAgent');
+  const label = managedAgentLabel(agent);
+  const provider = agent.definition.provider;
+  const state = managedAgentState(agent);
+  const thisComputer = useRunsOnThisComputer(agent);
+  const machineDown = agent.machine !== null && agent.machine.state !== 'online';
+  const providerName = isValidProviderId(provider) ? getProvider(provider)?.name : null;
+  return (
+    <SidebarAgentRow
+      label={label}
+      iconUrl={agent.iconUrl}
+      serverId={agent.serverId}
+      providerId={isValidProviderId(provider) ? provider : null}
+      isActive={currentView === 'managedAgent' && params.agentId === agent.agentId}
+      depth={0}
+      onOpen={() =>
+        navigate('managedAgent', { serverId: agent.serverId, agentId: agent.agentId, name: label })
+      }
+      presence={{
+        tone: PRESENCE_TONE[state.tone],
+        label: state.detail ? `${state.label}: ${state.detail}` : state.label,
+      }}
+      dimmed={machineDown || state.tone === 'idle'}
+      showProviderMark={false}
+      title={providerName ? `${label} · ${providerName}` : label}
+      marks={
+        !thisComputer && (
+          <Tooltip>
+            <TooltipTrigger>
+              {agent.machine && isCloudMachine(agent.machine) ? (
+                machineDown ? (
+                  <CloudOff className="h-3.5 w-3.5 shrink-0 text-foreground-destructive" />
+                ) : (
+                  <Cloud className="h-3.5 w-3.5 shrink-0 text-foreground-muted" />
+                )
+              ) : machineDown || !agent.machine ? (
+                <ServerOff className="h-3.5 w-3.5 shrink-0 text-foreground-destructive" />
+              ) : (
+                <Server className="h-3.5 w-3.5 shrink-0 text-foreground-muted" />
+              )}
+            </TooltipTrigger>
+            <TooltipContent>
+              {agent.machine
+                ? machineDown
+                  ? `${agent.machine.name} is ${agent.machine.state}. The agent resumes when it reconnects.`
+                  : `Runs on ${agent.machine.name}${agent.definition.directory ? ` · ${agent.definition.directory}` : ''}`
+                : 'It has no machine to run on.'}
+            </TooltipContent>
+          </Tooltip>
+        )
+      }
+      status={null}
+      actions={null}
+    />
+  );
+});
+
+const PRESENCE_TONE: Record<ManagedAgentState['tone'], AgentPresence['tone']> = {
+  ok: 'running',
+  idle: 'stopped',
+  problem: 'problem',
+  busy: 'pending',
+};

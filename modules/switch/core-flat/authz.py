@@ -1,0 +1,201 @@
+"""Central authorization for owned Switch entities.
+
+Single chokepoint for "may this principal perform this action on this
+resource". Consolidates the access rules that were previously scattered as
+ad-hoc `owner == user or public or admin` checks.
+
+Model:
+  - The subject of every decision is a **user** (`Principal`). Agent-initiated
+    requests resolve to the agent's owner (see the protocol service's
+    `_resolve_acting_identity`); an agent inherits exactly its owner's
+    permissions in the tenant the request is bound to — never more than the
+    owner holds there.
+  - `Principal.is_admin` means "may administer the tenant bound to this
+    request" — the deployment operator bypass (`User.role == "admin"`, global,
+    never granted by anything self-service) OR an `owner`/`admin` membership
+    row for this user in the bound tenant (`tenant_members.role`, granted per
+    tenant, e.g. by creating it) OR `org_admin` of the organization the bound
+    tenant belongs to (`organization_members.role`), which administers every
+    workspace in it. `administers_tenant` below computes it; a
+    caller with a database session should use that rather than re-deriving it.
+  - Owned entities carry a nullable owner plus independent `read_visibility`
+    and `write_visibility` ("public" | "private").
+
+The rule is uniform across References, ReferenceTypes, Documents, Packages, and
+Rooms — the only difference between them lives in their *default* visibility,
+not here.
+
+This module is deliberately pure (no DB, no I/O) so it is trivially testable
+and so a future relationship-based backend can replace `can` without touching
+any call site.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
+
+Action = Literal["read", "write", "delete"]
+
+VISIBILITIES = ("public", "private")
+
+
+@dataclass(frozen=True)
+class Principal:
+    """The subject of an authorization decision — always a user identity.
+
+    `id` may be ``None`` for an agent with no owner; such a principal owns
+    nothing and is limited to public access.
+
+    `is_admin` is tenant-scoped, not global — see `administers_tenant`.
+    """
+
+    id: str | None
+    is_admin: bool
+
+
+# `tenant_members.role` is a checked string, not an enum type (`db/models.py`).
+TENANT_ADMIN_ROLES = ("owner", "admin")
+
+
+ORGANIZATION_ADMIN_ROLE = "org_admin"
+
+# The workspace role an organization's `org_admin` is reported as holding in
+# each of its workspaces, membership row or not.
+ORGANIZATION_ADMIN_TENANT_ROLE = "admin"
+
+
+def administers_tenant(
+    *, is_operator: bool, tenant_role: str | None, organization_role: str | None
+) -> bool:
+    """Whether a caller may administer the tenant they hold `tenant_role` in,
+    and `organization_role` in the organization it belongs to.
+
+    True for a deployment operator (the global bypass), regardless of
+    membership — an operator administers every tenant. True for the
+    organization's `org_admin`, with or without a membership row in the tenant.
+    Otherwise true only if the membership role itself is `owner` or `admin`; a
+    plain `member`, or no membership row at all, is false. This is the one
+    function that should ever turn a role into an admin bit — see
+    `Principal.is_admin`.
+    """
+    return (
+        is_operator
+        or organization_role == ORGANIZATION_ADMIN_ROLE
+        or tenant_role in TENANT_ADMIN_ROLES
+    )
+
+
+def effective_tenant_role(
+    *, tenant_role: str | None, organization_role: str | None
+) -> str | None:
+    """The role someone acts with in a workspace: their membership role, or
+    `ORGANIZATION_ADMIN_TENANT_ROLE` when they are its organization's
+    `org_admin` and hold no higher role there. None when they hold neither."""
+    if tenant_role in TENANT_ADMIN_ROLES:
+        return tenant_role
+    if organization_role == ORGANIZATION_ADMIN_ROLE:
+        return ORGANIZATION_ADMIN_TENANT_ROLE
+    return tenant_role
+
+
+def owns_tenant(*, is_operator: bool, tenant_role: str | None) -> bool:
+    """Whether a caller may dispose of the tenant they hold `tenant_role` in.
+
+    Narrower than `administers_tenant` on purpose. An `admin` runs a workspace;
+    an `owner` decides who else gets to. The two collapse into one bit for
+    everything inside a workspace — rooms, agents, references — but not for the
+    ownership set itself: if an admin may grant `owner`, demote an owner, or
+    remove one, then an admin may take the workspace, and each of those steps
+    passes a last-owner guard on its own. Gate those three on this.
+
+    An organization's `org_admin` administers its workspaces but does not own
+    them: the organization's role is `admin`-level in each workspace.
+    """
+    return is_operator or tenant_role == "owner"
+
+
+@runtime_checkable
+class Authorizable(Protocol):
+    """Structural interface for any entity `can` arbitrates over.
+
+    Satisfied by the Reference, ReferenceType, Document, Package, and Room ORM
+    models — no base class required. Declared as read-only properties so a model
+    with a non-nullable ``owner_id: str`` still satisfies ``str | None``
+    (mutable Protocol attributes would be invariant).
+    """
+
+    @property
+    def owner_id(self) -> str | None: ...
+
+    @property
+    def read_visibility(self) -> str: ...
+
+    @property
+    def write_visibility(self) -> str: ...
+
+
+def can(principal: Principal, action: Action, resource: Authorizable) -> bool:
+    """Return whether `principal` may perform `action` on `resource`.
+
+    read   = owner OR admin OR read_visibility  == "public"
+    write  = owner OR admin OR write_visibility == "public"
+    delete = owner OR admin
+    """
+    if principal.is_admin:
+        return True
+    # Owner. The None-guard is load-bearing: a null-owner resource must not be
+    # treated as "owned" by a principal whose id is also None.
+    if resource.owner_id is not None and resource.owner_id == principal.id:
+        return True
+    if action == "read":
+        return resource.read_visibility == "public"
+    if action == "write":
+        return resource.write_visibility == "public"
+    return False  # delete — owner/admin only, never via visibility
+
+
+def require(principal: Principal, action: Action, resource: Authorizable) -> None:
+    """Raise ``PermissionError`` unless `principal` may `action` `resource`.
+
+    ``PermissionError`` is mapped to HTTP 403 by the gateway and surfaced as an
+    error by the MCP server.
+    """
+    if not can(principal, action, resource):
+        raise PermissionError(f"Not authorized to {action} this resource")
+
+
+def can_manage(principal: Principal, owner_id: str | None) -> bool:
+    """Owner-or-admin check for entities that have no visibility model.
+
+    Some owned entities (e.g. Agents) are listable by everyone but have no
+    public read/write dimension — only the owner or an admin may modify or
+    delete them. This is equivalent to write/delete on an always-private
+    resource.
+    """
+    return principal.is_admin or (owner_id is not None and owner_id == principal.id)
+
+
+def require_manage(principal: Principal, owner_id: str | None) -> None:
+    """Raise ``PermissionError`` unless `principal` owns the entity or is admin."""
+    if not can_manage(principal, owner_id):
+        raise PermissionError("Not authorized to manage this resource")
+
+
+def validate_visibility_pair(read_visibility: str, write_visibility: str) -> None:
+    """Validate a (read, write) visibility pair, raising ``ValueError`` if bad.
+
+    Enforces the enum and the write⊇read invariant: a publicly writable
+    resource must also be publicly readable (writable-but-unreadable is
+    nonsensical).
+    """
+    for label, value in (("read", read_visibility), ("write", write_visibility)):
+        if value not in VISIBILITIES:
+            raise ValueError(
+                f"Invalid {label}_visibility '{value}' (expected public|private)"
+            )
+    if write_visibility == "public" and read_visibility != "public":
+        raise ValueError(
+            "write_visibility=public requires read_visibility=public "
+            "(a writable resource must be readable)"
+        )

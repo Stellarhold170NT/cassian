@@ -1,0 +1,320 @@
+import { beforeEach, afterEach, expect, it, vi } from 'vitest';
+import {
+  HostUnreachableError,
+  unknownHostReachability,
+} from '@shared/core/remote-hosts/reachability';
+import {
+  DISCOVERY_MAX_BACKOFF_MS,
+  DISCOVERY_MS,
+  remoteSessionReconciler,
+} from './remote-session-reconciler';
+
+const mocks = vi.hoisted(() => ({
+  list: vi.fn(),
+  snapshot: vi.fn(),
+  room: vi.fn(),
+  create: vi.fn(async () => ({ success: true })),
+  provision: vi.fn(async () => ({ success: true })),
+  error: vi.fn(),
+  mirror: vi.fn(),
+  clear: vi.fn(),
+  updateStatus: vi.fn(),
+  syncActivity: vi.fn(),
+  emit: vi.fn(),
+  rows: [] as { id: string }[],
+}));
+vi.mock('./getAgentById', () => ({
+  getAgentById: async () => ({
+    id: 'local',
+    switchAgentId: 'agent',
+    serverId: 'server',
+    workspaceId: 'workspace',
+    providerId: 'codex',
+    autoApprove: false,
+    autoMode: false,
+  }),
+}));
+vi.mock('@main/core/workspaces/workspace-session', () => ({
+  withWorkspaceSession: (_workspaceId: string, fn: (server: { id: string }) => Promise<unknown>) =>
+    fn({ id: 'server' }),
+}));
+vi.mock('@main/core/switch-servers/gateway-client', () => ({
+  fetchRoomDetail: mocks.room,
+}));
+vi.mock('@main/core/sdk-host/host-sessions', () => ({ listHostSessions: mocks.list }));
+vi.mock('@main/core/sdk-host/session-activity', () => ({
+  syncSdkSessionActivity: vi.fn(async () => {}),
+}));
+vi.mock('@main/core/sdk-host/session-activity', () => ({
+  syncSdkSessionActivity: mocks.syncActivity,
+}));
+vi.mock('@main/core/sessions/session-service', () => ({
+  sessionService: {
+    createSession: mocks.create,
+    provisionSession: mocks.provision,
+    updateSessionStatus: mocks.updateStatus,
+  },
+}));
+vi.mock('@main/core/switch-rooms/switch-room-service', () => ({
+  switchRoomService: { mirrorRemoteSessionRoom: mocks.mirror, clearSession: mocks.clear },
+}));
+vi.mock('@main/db/client', () => ({
+  db: { select: () => ({ from: () => ({ where: async () => mocks.rows }) }) },
+}));
+vi.mock('@main/db/schema', () => ({ sessions: { id: 'id', agentId: 'agentId' } }));
+vi.mock('@main/lib/events', () => ({ events: { emit: mocks.emit } }));
+vi.mock('@main/lib/logger', () => ({ log: { error: mocks.error } }));
+
+const session = {
+  sessionId: 'shared',
+  agentId: 'agent',
+  hostId: 'host',
+  epoch: 'epoch',
+  provider: 'codex',
+  status: 'ready',
+  connectivity: 'online',
+  pendingRequestIds: [],
+  capabilities: {
+    input: 'queue',
+    approvals: true,
+    questions: true,
+    interrupt: true,
+    reset: false,
+    compact: false,
+    modelChange: false,
+    attachmentMimeTypes: [],
+  },
+};
+let now = 0;
+beforeEach(() => {
+  now = 0;
+  vi.spyOn(Date, 'now').mockImplementation(() => now);
+});
+async function tick() {
+  now += DISCOVERY_MS;
+  await (remoteSessionReconciler as unknown as { tick(id: string): Promise<void> }).tick('local');
+}
+afterEach(() => {
+  remoteSessionReconciler.dispose();
+  vi.clearAllMocks();
+  vi.restoreAllMocks();
+  mocks.rows = [];
+});
+it('adopts an authorized shared session without starting execution', async () => {
+  mocks.list.mockResolvedValue([session]);
+  mocks.snapshot.mockResolvedValue({
+    contractVersion: 1,
+    throughSequence: 0,
+    session,
+    turns: [],
+    items: [],
+    requests: [],
+    commandStatuses: [],
+    nextPageToken: null,
+  });
+  await tick();
+  expect(mocks.create).toHaveBeenCalledWith(
+    expect.objectContaining({ id: 'shared', attach: false, startSource: 'adopted' })
+  );
+  mocks.rows = [{ id: 'shared' }];
+  await tick();
+  expect(mocks.create).toHaveBeenCalledTimes(1);
+});
+it('retains sessions on connection loss and excludes other agents and stopped sessions', async () => {
+  mocks.list.mockRejectedValueOnce(new Error('Disconnected'));
+  await tick();
+  expect(mocks.error).toHaveBeenCalled();
+  expect(mocks.create).not.toHaveBeenCalled();
+  mocks.list.mockResolvedValue([
+    { ...session, agentId: 'other' },
+    { ...session, status: 'stopped' },
+  ]);
+  await tick();
+  expect(mocks.create).not.toHaveBeenCalled();
+});
+
+it('refreshes existing room associations from the list without fetching transcripts', async () => {
+  mocks.rows = [{ id: 'shared' }];
+  mocks.list.mockResolvedValue([{ ...session, roomIds: ['room'] }]);
+  await tick();
+  expect(mocks.create).not.toHaveBeenCalled();
+  expect(mocks.snapshot).not.toHaveBeenCalled();
+  expect(mocks.syncActivity).toHaveBeenCalledWith(
+    expect.objectContaining({ sessionId: 'shared', status: 'ready' })
+  );
+  expect(mocks.mirror).toHaveBeenCalledWith(
+    expect.objectContaining({ sessionId: 'shared' }),
+    'room',
+    'agent'
+  );
+  mocks.list.mockResolvedValue([{ ...session, roomIds: [] }]);
+  await tick();
+  expect(mocks.clear).toHaveBeenCalledWith('shared');
+});
+
+it('adopts healthy sessions despite additive fields and an invalid entry', async () => {
+  mocks.list.mockResolvedValue([
+    { ...session, status: 'invalid' },
+    {
+      ...session,
+      sessionId: 'healthy',
+      futureField: true,
+      capabilities: { ...session.capabilities, futureCapability: true },
+    },
+  ]);
+  await tick();
+  expect(mocks.create).toHaveBeenCalledTimes(1);
+  expect(mocks.create).toHaveBeenCalledWith(
+    expect.objectContaining({ id: 'healthy', startSource: 'adopted' })
+  );
+  expect(mocks.provision).not.toHaveBeenCalled();
+  expect(remoteSessionReconciler.errors()).toEqual([
+    { agentId: 'local', message: expect.stringContaining('1 SDK session(s)') },
+  ]);
+  mocks.list.mockResolvedValue([{ ...session, roomIds: [] }]);
+  await tick();
+  expect(remoteSessionReconciler.errors()).toEqual([]);
+});
+
+it('marks a stopped host cancelled without claiming its work completed', async () => {
+  mocks.rows = [{ id: 'shared' }];
+  mocks.list.mockResolvedValue([{ ...session, status: 'stopped', roomIds: ['room'] }]);
+  await tick();
+  expect(mocks.updateStatus).toHaveBeenCalledWith('shared', 'cancelled');
+  expect(mocks.emit).toHaveBeenCalledWith(expect.anything(), {
+    sessionId: 'shared',
+    status: 'cancelled',
+  });
+  expect(mocks.create).not.toHaveBeenCalled();
+});
+
+it('names a newly adopted room session after its room', async () => {
+  mocks.list.mockResolvedValue([{ ...session, roomIds: ['room'] }]);
+  mocks.room.mockResolvedValue({ id: 'room', name: 'Release planning' });
+  await tick();
+  expect(mocks.room).toHaveBeenCalledWith(expect.objectContaining({ id: 'server' }), 'room');
+  expect(mocks.create).toHaveBeenCalledWith(
+    expect.objectContaining({ id: 'shared', title: 'Session for Release planning' })
+  );
+  mocks.rows = [{ id: 'shared' }];
+  await tick();
+  expect(mocks.room).toHaveBeenCalledTimes(1);
+  expect(mocks.create).toHaveBeenCalledTimes(1);
+});
+
+it('reports incompatible rows once while discovering healthy sessions and ignoring other agents', async () => {
+  mocks.list.mockResolvedValue([
+    { sessionId: 'other-bad', agentId: 'other', discoveryError: 'Other agent error' },
+    { sessionId: 'broken', agentId: 'agent', discoveryError: 'Stored session needs repair.' },
+    { ...session, sessionId: 'healthy', roomIds: [] },
+  ]);
+  await tick();
+  expect(mocks.create).toHaveBeenCalledWith(expect.objectContaining({ id: 'healthy' }));
+  expect(remoteSessionReconciler.errors()[0].message).toContain('1 SDK session(s)');
+  expect(remoteSessionReconciler.errors()[0].message).toContain('Stored session needs repair.');
+  mocks.rows = [{ id: 'healthy' }];
+  await tick();
+  expect(mocks.error).toHaveBeenCalledTimes(1);
+  mocks.list.mockResolvedValue([{ ...session, sessionId: 'healthy', roomIds: [] }]);
+  await tick();
+  expect(remoteSessionReconciler.errors()).toEqual([]);
+});
+
+it.each(['gemini', 'future-provider'])(
+  'reports unsupported %s sessions without trying to launch or adopt them',
+  async (provider) => {
+    mocks.list.mockResolvedValue([{ ...session, provider, roomIds: [] }]);
+    await tick();
+    expect(mocks.create).not.toHaveBeenCalled();
+    expect(mocks.snapshot).not.toHaveBeenCalled();
+    expect(remoteSessionReconciler.errors()[0].message).toContain(
+      `unsupported provider "${provider}"`
+    );
+  }
+);
+
+it('does not re-adopt a session the user deleted', async () => {
+  const { tombstoneSession } = await import('@main/core/sessions/deleted-sessions');
+  mocks.list.mockResolvedValue([{ ...session, sessionId: 'deleted-session' }]);
+  tombstoneSession('deleted-session');
+  await tick();
+  expect(mocks.create).not.toHaveBeenCalled();
+});
+
+it('does not adopt a retired session, whose work will never resume', async () => {
+  mocks.list.mockResolvedValue([
+    { ...session, sessionId: 'retired-session', retired: true, roomIds: [] },
+  ]);
+  await tick();
+  expect(mocks.create).not.toHaveBeenCalled();
+});
+
+it('does not reuse a failed host read', async () => {
+  mocks.list.mockRejectedValueOnce(new Error('Temporarily unavailable'));
+  const reconciler = remoteSessionReconciler as unknown as { tick(id: string): Promise<void> };
+  await reconciler.tick('one');
+  expect(remoteSessionReconciler.errors()).toHaveLength(1);
+  mocks.list.mockResolvedValueOnce([]);
+  await reconciler.tick('one');
+  expect(mocks.list).toHaveBeenCalledTimes(2);
+  expect(remoteSessionReconciler.errors()).toEqual([]);
+});
+
+it('waits longer after each failed round and returns to its pace once one succeeds', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    mocks.list.mockRejectedValue(new Error('Temporarily unavailable'));
+    remoteSessionReconciler.start('local');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(DISCOVERY_MS * 2 - 1);
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mocks.list).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(DISCOVERY_MS * 4);
+    expect(mocks.list).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(DISCOVERY_MS * 8);
+    expect(mocks.list).toHaveBeenCalledTimes(4);
+
+    // Capped from here. The fifth round succeeds, and the ones after it come at the steady pace.
+    mocks.list.mockResolvedValue([]);
+    await vi.advanceTimersByTimeAsync(DISCOVERY_MAX_BACKOFF_MS);
+    expect(mocks.list).toHaveBeenCalledTimes(5);
+    await vi.advanceTimersByTimeAsync(DISCOVERY_MS);
+    expect(mocks.list).toHaveBeenCalledTimes(6);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+const downHost = new HostUnreachableError({
+  ...unknownHostReachability('hoot-agent-host'),
+  status: 'unreachable',
+  lastError: 'Connection lost before handshake',
+  lastCheckedAt: '2026-09-27T10:52:57.945Z',
+});
+
+it('does not report a host that is down, which its agents already show', async () => {
+  mocks.list.mockRejectedValueOnce(new Error('Temporarily unavailable'));
+  await tick();
+  expect(remoteSessionReconciler.errors()).toHaveLength(1);
+  mocks.list.mockRejectedValueOnce(downHost);
+  await tick();
+  expect(remoteSessionReconciler.errors()).toEqual([]);
+});
+
+it('does not report a room lookup that failed only because a host is down', async () => {
+  mocks.list.mockResolvedValue([{ ...session, roomIds: ['room'] }]);
+  mocks.room.mockRejectedValueOnce(downHost);
+  await tick();
+  expect(mocks.create).not.toHaveBeenCalled();
+  expect(remoteSessionReconciler.errors()).toEqual([]);
+});
+
+it('reports a failure in its own words, without the exception class', async () => {
+  mocks.list.mockRejectedValueOnce(new TypeError('Host listing was not valid JSON.'));
+  await tick();
+  expect(remoteSessionReconciler.errors()).toEqual([
+    { agentId: 'local', message: 'Host listing was not valid JSON.' },
+  ]);
+});

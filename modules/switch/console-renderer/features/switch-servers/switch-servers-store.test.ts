@@ -1,0 +1,755 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SwitchServer } from '@shared/core/switch-servers/switch-servers';
+
+const getAuthConfig = vi.hoisted(() => vi.fn());
+const getConnectionStatus = vi.hoisted(() => vi.fn());
+const listServers = vi.hoisted(() => vi.fn());
+const installIsEmpty = vi.hoisted(() => vi.fn());
+const setActiveServer = vi.hoisted(() => vi.fn());
+/** The workspace selection as the main process holds it, by the server it is on. */
+const selection = vi.hoisted(() => ({ serverId: null as string | null }));
+const removeServer = vi.hoisted(() => vi.fn());
+const addServer = vi.hoisted(() => vi.fn());
+const connectToSwitchCloud = vi.hoisted(() => vi.fn());
+const oidcLogin = vi.hoisted(() => vi.fn());
+/** SSH hosts the reachability manager currently considers down. */
+const blockedHosts = vi.hoisted(() => new Set<string>());
+
+vi.mock('@renderer/lib/ipc', () => ({
+  events: { on: vi.fn() },
+  rpc: {
+    switchServers: {
+      getAuthConfig,
+      getConnectionStatus,
+      listServers,
+      setActiveServer,
+      removeServer,
+      addServer,
+      connectToSwitchCloud,
+      oidcLogin,
+    },
+    onboarding: { installIsEmpty },
+  },
+}));
+/**
+ * Stands in for the workspace selection this store now reads its active server
+ * off, faithfully enough that the selection logic is still being tested rather
+ * than asserted against a constant.
+ *
+ * Each server gets one workspace, which is the state every install is in, so
+ * `listServers` and {@link selectServer} stay the knobs a test turns. A
+ * selection naming a server that is no longer listed resolves to no workspace —
+ * which is exactly what happens for real once the removed server takes its
+ * workspace row with it.
+ */
+vi.mock('@renderer/features/workspaces/workspaces-store', () => ({
+  workspacesStore: {
+    workspaces: [] as { id: string; serverId: string }[],
+    activeId: null as string | null,
+    get active(): { id: string; serverId: string } | null {
+      return this.workspaces.find((w) => w.id === this.activeId) ?? null;
+    },
+    get activeServerId(): string | null {
+      return this.active?.serverId ?? null;
+    },
+    async refresh(): Promise<void> {
+      const servers: SwitchServer[] = await listServers();
+      const activeServerId = selection.serverId;
+      this.workspaces = servers.map((s) => ({ id: `ws-${s.id}`, serverId: s.id }));
+      this.activeId = activeServerId === null ? null : `ws-${activeServerId}`;
+    },
+  },
+}));
+vi.mock('@renderer/features/remote-hosts/host-reachability-store', () => ({
+  hostReachabilityStore: { isBlocked: (sshHost: string) => blockedHosts.has(sshHost) },
+}));
+const revalidate = vi.hoisted(() => vi.fn());
+vi.mock('@renderer/lib/stores/app-state', () => ({
+  appState: { navigation: { revalidate } },
+}));
+
+const { SwitchServersStore } = await import('./switch-servers-store');
+
+/** Scope the window to a server, the way choosing one of its workspaces does. */
+function selectServer(serverId: string | null): void {
+  selection.serverId = serverId;
+}
+
+const authConfig = { passwordLoginEnabled: true, oidcEnabled: false, oidcProviderLabel: null };
+
+function server(id: string, overrides: Partial<SwitchServer> = {}): SwitchServer {
+  return {
+    id,
+    name: id,
+    url: `https://api.${id}.example.com`,
+    dashboardUrl: `https://${id}.example.com`,
+    managed: false,
+    managementKind: null,
+    sshHost: null,
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+    ...overrides,
+  };
+}
+
+function remoteServer(id: string, sshHost: string): SwitchServer {
+  return server(id, { managed: true, managementKind: 'remote', sshHost });
+}
+
+function newStore(servers: SwitchServer[]) {
+  const store = new SwitchServersStore();
+  store.servers = servers;
+  return store;
+}
+
+/** A promise the test settles by hand, to hold a fetch in flight and control
+ * exactly when — and in what order relative to another fetch — it lands. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** Flushes pending timers and microtasks so an in-flight fetch's `.then`
+ * chain (including its `runInAction` writes) has fully landed. */
+async function flush(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  blockedHosts.clear();
+  // The store logs the raw gateway error rather than showing it. Expected here.
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  getConnectionStatus.mockImplementation(async (serverId: string) => ({
+    serverId,
+    connected: false,
+    user: null,
+  }));
+  getAuthConfig.mockResolvedValue(authConfig);
+  listServers.mockResolvedValue([]);
+  installIsEmpty.mockResolvedValue(true);
+  selectServer(null);
+  setActiveServer.mockImplementation(async (serverId: string) => selectServer(serverId));
+});
+
+describe('fetching sign-in options', () => {
+  it('asks again after a failed fetch', async () => {
+    // The bug: one blip while the page mounted left the sign-in panel stuck on
+    // "Checking sign-in options…" for good, because nothing ever re-asked.
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('offline'));
+
+    await store.ensureAuthConfig('srv-a');
+    expect(store.authConfigFor('srv-a')).toBeNull();
+
+    await store.ensureAuthConfig('srv-a');
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+  });
+
+  it('does not ask again once it has an answer', async () => {
+    const store = newStore([server('srv-a')]);
+
+    await store.ensureAuthConfig('srv-a');
+    await store.ensureAuthConfig('srv-a');
+
+    expect(getAuthConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it('collapses overlapping asks into one request', async () => {
+    // Several recovery signals can land together — a window focus while the
+    // page is mounting, say. That must not become several identical fetches.
+    const store = newStore([server('srv-a')]);
+    const inFlight = deferred<typeof authConfig>();
+    getAuthConfig.mockReturnValueOnce(inFlight.promise);
+
+    const first = store.ensureAuthConfig('srv-a');
+    const second = store.ensureAuthConfig('srv-a');
+    inFlight.resolve(authConfig);
+    await Promise.all([first, second]);
+
+    expect(getAuthConfig).toHaveBeenCalledTimes(1);
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+  });
+
+  it('reports a retry as checking rather than still failed while it runs', async () => {
+    // The panel picks its message from configCheckFailed and configChecking
+    // together: without this signal, a retry after a failure would claim the
+    // check failed right up until the moment it actually succeeds or fails
+    // again, even while it is genuinely in flight.
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('fetch failed'));
+    await store.ensureAuthConfig('srv-a');
+    expect(store.authConfigCheckFailed('srv-a')).toBe(true);
+    expect(store.authConfigChecking('srv-a')).toBe(false);
+
+    const retryPending = deferred<typeof authConfig>();
+    getAuthConfig.mockReturnValueOnce(retryPending.promise);
+    const retrying = store.ensureAuthConfig('srv-a');
+    await flush();
+    expect(store.authConfigChecking('srv-a')).toBe(true);
+
+    retryPending.resolve(authConfig);
+    await retrying;
+
+    expect(store.authConfigChecking('srv-a')).toBe(false);
+    expect(store.authConfigCheckFailed('srv-a')).toBe(false);
+  });
+});
+
+describe('recovering when connectivity returns', () => {
+  it('re-drives a sign-in fetch that never landed', async () => {
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('offline'));
+    await store.ensureAuthConfig('srv-a');
+
+    await store.recoverStale();
+
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+  });
+
+  it('leaves servers no login panel has asked about alone', async () => {
+    // Recovery rides the status sweep, which covers every server. Fetching an
+    // auth config for all of them would be new traffic nobody asked for.
+    const store = newStore([server('srv-a'), server('srv-b')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('offline'));
+    await store.ensureAuthConfig('srv-a');
+    getAuthConfig.mockClear();
+
+    await store.recoverStale();
+
+    expect(getAuthConfig).toHaveBeenCalledTimes(1);
+    expect(getAuthConfig).toHaveBeenCalledWith('srv-a');
+  });
+
+  it('refreshes connection status as well', async () => {
+    const store = newStore([server('srv-a'), server('srv-b')]);
+
+    await store.recoverStale();
+
+    expect(getConnectionStatus).toHaveBeenCalledWith('srv-a');
+    expect(getConnectionStatus).toHaveBeenCalledWith('srv-b');
+  });
+
+  it('stops retrying a server that was removed', async () => {
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('offline'));
+    await store.ensureAuthConfig('srv-a');
+    listServers.mockResolvedValue([]);
+    selectServer(null);
+    removeServer.mockResolvedValue(undefined);
+
+    await store.removeServer('srv-a');
+    getAuthConfig.mockClear();
+    await store.recoverStale();
+
+    expect(getAuthConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('reading the server list', () => {
+  it('serves callers arriving together one read', async () => {
+    // The shell asks on the first frame and so does the sidebar. Two reads of
+    // the same list race each other into the same fields for no gain.
+    listServers.mockResolvedValue([server('srv-a')]);
+    selectServer('srv-a');
+    const store = new SwitchServersStore();
+
+    await Promise.all([store.init(), store.init(), store.init()]);
+
+    expect(revalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads again for a caller arriving after the last read settled', async () => {
+    // Sharing only the read in flight: the paths that change something and then
+    // ask for the list back must not be handed the answer from before it.
+    const store = new SwitchServersStore();
+    await store.init();
+    listServers.mockResolvedValue([server('srv-a')]);
+
+    await store.init();
+
+    expect(store.servers.map((s) => s.id)).toEqual(['srv-a']);
+  });
+
+  it('keeps the failure on screen for as long as the retry runs', async () => {
+    // The window draws its failure page — message, detail and the button that
+    // starts the retry — from `listError`. Clearing it as the retry begins
+    // unmounts the page and the button with it, leaving a blank window until
+    // the retry lands.
+    listServers.mockRejectedValueOnce(new Error('gateway unreachable'));
+    const store = new SwitchServersStore();
+    await store.init();
+    expect(store.listError).not.toBeNull();
+
+    const retryRead = deferred<SwitchServer[]>();
+    listServers.mockReturnValueOnce(retryRead.promise);
+    const retrying = store.init();
+    await flush();
+
+    expect(store.listError).not.toBeNull();
+    expect(store.loadingServers).toBe(true);
+
+    retryRead.resolve([server('srv-a')]);
+    await retrying;
+
+    expect(store.listError).toBeNull();
+    expect(store.listErrorDetail).toBeNull();
+  });
+
+  it('reads what the install holds rather than inferring it from the list', async () => {
+    // An install whose server was removed keeps its agents — the confirmation
+    // says so — and the sessions in them are still running. An empty list is
+    // therefore not the fresh-install answer, and the shell needs that answer
+    // to decide whether to replace the window with a first-run page.
+    listServers.mockResolvedValue([]);
+    installIsEmpty.mockResolvedValue(false);
+    const store = new SwitchServersStore();
+
+    await store.init();
+
+    expect(store.servers).toEqual([]);
+    expect(store.installIsEmpty).toBe(false);
+  });
+
+  it('says a read is not coming back rather than leaving the window blank', async () => {
+    // Nothing is drawn until the first read lands, so a handler that never
+    // settles is a blank, inert window with no message and no way to ask again.
+    vi.useFakeTimers();
+    try {
+      listServers.mockReturnValueOnce(deferred<SwitchServer[]>().promise);
+      const store = new SwitchServersStore();
+      void store.init();
+
+      // Well past any deadline worth having: what is asserted is that one
+      // exists, not the exact number of seconds.
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      expect(store.loaded).toBe(false);
+      expect(store.listError).not.toBeNull();
+      expect(store.loadingServers).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a given-up read that lands after the retry has answered', async () => {
+    // The read cannot be cancelled, only abandoned — so the stale one is still
+    // out there, and letting it write would replace a good list with the one
+    // the user already gave up on.
+    vi.useFakeTimers();
+    try {
+      const stuck = deferred<SwitchServer[]>();
+      listServers.mockReturnValueOnce(stuck.promise);
+      const store = new SwitchServersStore();
+      void store.init();
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      listServers.mockResolvedValue([server('srv-a')]);
+      await store.init();
+      stuck.resolve([server('srv-stale')]);
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(store.servers.map((s) => s.id)).toEqual(['srv-a']);
+      expect(store.listError).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps a failure from elsewhere out of the slot the window reads', async () => {
+    // `error` is the banner, written by every action here — a rename, a sign-out,
+    // adding a server. None of those is a reason to take the window away.
+    const store = newStore([server('srv-a')]);
+    removeServer.mockRejectedValue(new Error('still in use'));
+
+    await store.removeServer('srv-a');
+
+    expect(store.error).not.toBeNull();
+    expect(store.listError).toBeNull();
+  });
+});
+
+describe('adding the first server', () => {
+  // The shell draws the first-run page while the install is empty, and the
+  // flow hands the window back only by finishing. An answer read at startup
+  // and never again would send a finished flow straight back to its welcome.
+  it('stops calling the install empty once a server is added', async () => {
+    listServers.mockResolvedValue([]);
+    const store = new SwitchServersStore();
+    await store.init();
+    expect(store.installIsEmpty).toBe(true);
+
+    addServer.mockResolvedValue(server('a'));
+    listServers.mockResolvedValue([server('a')]);
+    installIsEmpty.mockResolvedValue(false);
+    await store.addServer('a', 'https://a.example.com');
+
+    expect(store.installIsEmpty).toBe(false);
+  });
+
+  it('stops calling the install empty once Switch Cloud is registered', async () => {
+    listServers.mockResolvedValue([]);
+    const store = new SwitchServersStore();
+    await store.init();
+    expect(store.installIsEmpty).toBe(true);
+
+    connectToSwitchCloud.mockResolvedValue(server('cloud'));
+    listServers.mockResolvedValue([server('cloud')]);
+    installIsEmpty.mockResolvedValue(false);
+    await store.connectToSwitchCloud();
+
+    expect(store.installIsEmpty).toBe(false);
+  });
+});
+
+describe('signing in through the browser', () => {
+  it('reads the list again, for a dashboard address the sign-in found', async () => {
+    const store = newStore([server('a', { dashboardUrl: null })]);
+    oidcLogin.mockResolvedValue({ success: true, data: true });
+    listServers.mockResolvedValue([server('a', { dashboardUrl: 'https://a.example.com' })]);
+
+    expect(await store.oidcLogin('a', null)).toBe(true);
+
+    expect(store.servers[0]?.dashboardUrl).toBe('https://a.example.com');
+  });
+});
+
+describe('a page left on a server that is gone', () => {
+  it('is revalidated when the server is removed', async () => {
+    const store = newStore([server('srv-a')]);
+    listServers.mockResolvedValue([]);
+    selectServer(null);
+    removeServer.mockResolvedValue(undefined);
+
+    await store.removeServer('srv-a');
+
+    expect(revalidate).toHaveBeenCalled();
+  });
+
+  it('is revalidated once the list is known, not before', async () => {
+    const store = new SwitchServersStore();
+    expect(store.loaded).toBe(false);
+
+    listServers.mockResolvedValue([server('srv-a')]);
+    selectServer('srv-a');
+    await store.init();
+
+    expect(store.loaded).toBe(true);
+    expect(revalidate).toHaveBeenCalled();
+  });
+});
+
+describe('a server on an unreachable host', () => {
+  it('skips the doomed fetch without raising the error banner', async () => {
+    blockedHosts.add('host-1');
+    const store = newStore([remoteServer('srv-a', 'host-1')]);
+
+    await store.ensureAuthConfig('srv-a');
+
+    expect(getAuthConfig).not.toHaveBeenCalled();
+    expect(store.error).toBeNull();
+  });
+
+  it('is asked again once the host comes back', async () => {
+    // The host un-blocking is the recovery signal here. Before, the page just
+    // swapped the host-unreachable panel for the stuck sign-in panel.
+    blockedHosts.add('host-1');
+    const store = newStore([remoteServer('srv-a', 'host-1')]);
+    await store.ensureAuthConfig('srv-a');
+
+    blockedHosts.delete('host-1');
+    await store.ensureAuthConfig('srv-a');
+
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+  });
+
+  it('does not carry a pre-outage sign-in-options failure past the skip', async () => {
+    // The failure recorded before the host went down belongs to a check that
+    // is no longer running — the skip must not let it sit there as if it
+    // were still current, or unblocking would show it "once more" for a
+    // check that never actually happened during the outage.
+    const store = newStore([remoteServer('srv-a', 'host-1')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('fetch failed'));
+    await store.ensureAuthConfig('srv-a');
+    expect(store.authConfigCheckFailed('srv-a')).toBe(true);
+
+    blockedHosts.add('host-1');
+    await store.ensureAuthConfig('srv-a');
+
+    expect(store.authConfigCheckFailed('srv-a')).toBe(false);
+    expect(getAuthConfig).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the manual refresh button', () => {
+  it('re-checks sign-in options, not just connection status', async () => {
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('offline'));
+    await store.ensureAuthConfig('srv-a');
+
+    await store.refreshServer('srv-a');
+
+    expect(getConnectionStatus).toHaveBeenCalledWith('srv-a');
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+  });
+
+  it('re-fetches sign-in options even when a config is already cached', async () => {
+    // The bug: once cached, ensureAuthConfig's short-circuit meant Refresh
+    // never asked again — a server that gained OIDC after Console cached
+    // password-only kept showing password-only until the app restarted.
+    const store = newStore([server('srv-a')]);
+    await store.ensureAuthConfig('srv-a');
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+
+    const updatedConfig = {
+      passwordLoginEnabled: true,
+      oidcEnabled: true,
+      oidcProviderLabel: 'WorkOS',
+    };
+    getAuthConfig.mockResolvedValueOnce(updatedConfig);
+
+    await store.refreshServer('srv-a');
+
+    expect(store.authConfigFor('srv-a')).toEqual(updatedConfig);
+  });
+});
+
+describe("the unreachable card's automatic retry", () => {
+  it('does not re-fetch sign-in options once they are already known', async () => {
+    // Before the manual-refresh fix, the auto-retry's call to refreshServer
+    // would have started re-fetching sign-in options on every tick forever.
+    // The retry loop exists to re-probe connectivity, not to hammer an
+    // endpoint whose answer rarely changes.
+    const store = newStore([server('srv-a')]);
+    await store.ensureAuthConfig('srv-a');
+    getAuthConfig.mockClear();
+
+    await store.retryConnection('srv-a');
+
+    expect(getAuthConfig).not.toHaveBeenCalled();
+    expect(getConnectionStatus).toHaveBeenCalledWith('srv-a');
+  });
+});
+
+describe('the reachability flag under concurrent checks', () => {
+  it('does not evict a reachable server over a later-landing sign-in-options failure', async () => {
+    // refreshServer runs the connection check and the sign-in-options check
+    // concurrently. If the connection check lands first and succeeds, a
+    // sign-in-options fetch that fails afterward must not overwrite that with
+    // "unreachable" — that would throw a perfectly signed-in user onto the
+    // cannot-reach screen over an unrelated endpoint's hiccup.
+    const store = newStore([server('srv-a')]);
+    const authPending = deferred<typeof authConfig>();
+    getAuthConfig.mockReturnValueOnce(authPending.promise);
+
+    const refreshing = store.refreshServer('srv-a');
+    await flush();
+    expect(store.isUnreachable('srv-a')).toBe(false);
+
+    authPending.reject(new Error('fetch failed'));
+    await refreshing;
+
+    expect(store.isUnreachable('srv-a')).toBe(false);
+  });
+});
+
+describe('a persistently broken sign-in-options endpoint', () => {
+  it('stays disclosed to the sign-in panel without evicting an otherwise reachable server', async () => {
+    // The durable case, as opposed to the transient one above: the
+    // sign-in-options endpoint never recovers while the server itself stays
+    // fine. isUnreachable must not flip true — once a status read has ever
+    // landed, it is the sole authority, so this failure can never reach it
+    // again — but the failure must still be visible *somewhere*, or the panel
+    // would silently keep showing a stale answer as if it were current,
+    // forever, for the rest of the session.
+    const store = newStore([server('srv-a')]);
+    await store.ensureAuthConfig('srv-a');
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+    getAuthConfig.mockRejectedValue(new Error('fetch failed'));
+
+    await store.refreshServer('srv-a');
+    await store.refreshServer('srv-a');
+    await store.refreshServer('srv-a');
+
+    expect(store.isUnreachable('srv-a')).toBe(false);
+    expect(store.authConfigCheckFailed('srv-a')).toBe(true);
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+  });
+
+  it('clears once the endpoint answers again', async () => {
+    const store = newStore([server('srv-a')]);
+    await store.ensureAuthConfig('srv-a');
+    getAuthConfig.mockRejectedValueOnce(new Error('fetch failed'));
+    await store.refreshServer('srv-a');
+    expect(store.authConfigCheckFailed('srv-a')).toBe(true);
+
+    await store.refreshServer('srv-a');
+
+    expect(store.authConfigCheckFailed('srv-a')).toBe(false);
+  });
+});
+
+describe('a server that cannot be reached', () => {
+  it('is flagged when the sign-in read fails', async () => {
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('fetch failed'));
+
+    await store.ensureAuthConfig('srv-a');
+
+    expect(store.isUnreachable('srv-a')).toBe(true);
+  });
+
+  it('is flagged when the status read fails', async () => {
+    const store = newStore([server('srv-a')]);
+    getConnectionStatus.mockRejectedValueOnce(new Error('fetch failed'));
+
+    await store.refreshStatus('srv-a');
+
+    expect(store.isUnreachable('srv-a')).toBe(true);
+  });
+
+  it('never puts the raw gateway error in the banner', async () => {
+    // What used to reach the user: "Error invoking remote method
+    // 'switchServers.getAuthConfig': GatewayError: ... fetch failed". Our own
+    // IPC method name is not something anyone can act on.
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(
+      new Error("Error invoking remote method 'switchServers.getAuthConfig': fetch failed")
+    );
+
+    await store.ensureAuthConfig('srv-a');
+
+    expect(store.error).toBeNull();
+  });
+
+  it('clears the flag once it answers again', async () => {
+    const store = newStore([server('srv-a')]);
+    getAuthConfig.mockRejectedValueOnce(new Error('fetch failed'));
+    getConnectionStatus.mockRejectedValueOnce(new Error('fetch failed'));
+    await store.refreshServer('srv-a');
+    expect(store.isUnreachable('srv-a')).toBe(true);
+
+    await store.refreshServer('srv-a');
+
+    expect(store.isUnreachable('srv-a')).toBe(false);
+    expect(store.authConfigFor('srv-a')).toEqual(authConfig);
+  });
+
+  it('is flagged per server, not across the app', async () => {
+    const store = newStore([server('srv-a'), server('srv-b')]);
+    getConnectionStatus.mockImplementation(async (serverId: string) => {
+      if (serverId === 'srv-a') throw new Error('fetch failed');
+      return { serverId, connected: false, user: null };
+    });
+
+    await store.refreshAllStatuses();
+
+    expect(store.isUnreachable('srv-a')).toBe(true);
+    expect(store.isUnreachable('srv-b')).toBe(false);
+  });
+});
+
+/**
+ * The switcher, the sidebar and the sessions under it all read the active
+ * workspace, so "servers exist but none is active" is a state the UI cannot
+ * render. Nothing on the main side picks one, so the store must.
+ */
+describe('keeping a server active', () => {
+  it('selects the first server when nothing was active', async () => {
+    listServers.mockResolvedValue([server('srv-a'), server('srv-b')]);
+    selectServer(null);
+    const store = new SwitchServersStore();
+
+    await store.init();
+
+    expect(store.activeServerId).toBe('srv-a');
+  });
+
+  it('keeps the server the user last chose', async () => {
+    listServers.mockResolvedValue([server('srv-a'), server('srv-b')]);
+    selectServer('srv-b');
+    const store = new SwitchServersStore();
+
+    await store.init();
+
+    expect(store.activeServerId).toBe('srv-b');
+  });
+
+  it('re-selects when the stored server no longer exists', async () => {
+    // Removing the active server and adding another leaves the stored id
+    // naming the removed one. Reading that as a selection left the app with no
+    // workspace at all — no switcher, no destinations, no sidebar tree — while
+    // a perfectly good server sat in the list.
+    listServers.mockResolvedValue([server('srv-b')]);
+    selectServer('srv-gone');
+    const store = new SwitchServersStore();
+
+    await store.init();
+
+    expect(store.activeServerId).toBe('srv-b');
+    expect(store.activeServer?.id).toBe('srv-b');
+  });
+
+  it('activates the first server added, which nothing else does', async () => {
+    // Adding a server does not set it active on the main side, so without this
+    // the very first one left the app with no workspace to show — the sidebar
+    // stayed on "Add a server" until the next launch.
+    listServers.mockResolvedValue([]);
+    selectServer(null);
+    const store = new SwitchServersStore();
+    await store.init();
+
+    const created = server('srv-new');
+    addServer.mockResolvedValue(created);
+    listServers.mockResolvedValue([created]);
+
+    await store.addServer('New', created.url);
+
+    expect(store.activeServerId).toBe('srv-new');
+  });
+
+  it('does not move the workspace when a second server is added', async () => {
+    listServers.mockResolvedValue([server('srv-a')]);
+    selectServer('srv-a');
+    const store = new SwitchServersStore();
+    await store.init();
+
+    const created = server('srv-b');
+    addServer.mockResolvedValue(created);
+    listServers.mockResolvedValue([server('srv-a'), created]);
+
+    await store.addServer('B', created.url);
+
+    expect(store.activeServerId).toBe('srv-a');
+  });
+
+  it('leaves nothing active when there are no servers at all', async () => {
+    listServers.mockResolvedValue([]);
+    selectServer(null);
+    const store = new SwitchServersStore();
+
+    await store.init();
+
+    expect(store.activeServerId).toBeNull();
+    expect(store.activeServer).toBeNull();
+  });
+});
+
+describe('the error banner', () => {
+  it('survives a background refresh, which cannot tell whether it is stale', async () => {
+    // A rejected password lives in the same field. A background sweep clearing
+    // it would delete the one thing telling the user what went wrong.
+    const store = newStore([server('srv-a')]);
+    await store.ensureAuthConfig('srv-a');
+    store.error = 'Invalid email or password';
+
+    await store.recoverStale();
+
+    expect(store.error).toBe('Invalid email or password');
+  });
+});

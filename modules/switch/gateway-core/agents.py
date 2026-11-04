@@ -1,0 +1,817 @@
+from __future__ import annotations
+
+import logging
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from switch_core.agent_display_name import InvalidDisplayName, normalise_display_name
+from switch_core.agent_icon import (
+    InvalidIconUrl,
+    generated_icon_choices,
+    normalise_icon_url,
+    refuse_third_party_avatar,
+)
+from switch_core.authz import Principal, require_manage
+from switch_core.bridges.agent.protocol.agent_core import (
+    AgentCore,
+    AgentExistsError,
+    AgentRenameRefused,
+)
+from switch_core.bridges.agent.protocol.agent_detail import (
+    AgentOptionsNotEditable,
+    apply_agent_options,
+    assemble_agent_detail,
+    build_agent_summary,
+    list_agent_summaries,
+)
+from switch_core.bridges.agent.protocol.types import (
+    IntegrationProfile,
+)
+from switch_core.chats.service import ChatService
+from switch_core.config import SwitchConfig
+from switch_core.db.models import User, require_tenant_id
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.gateway.auth import get_current_user, get_tenant_is_admin
+from switch_core.gateway.chats import get_chat_service
+from switch_core.gateway.dependencies import (
+    get_agent_store,
+    get_config,
+    get_protocol,
+    get_room_store,
+    get_session,
+    get_user_store,
+)
+from switch_core.gateway.known_agents import known_agent, known_agents
+from switch_core.gateway.schemas import (
+    AgentDetail,
+    AgentSummary,
+    AvatarSettingsResponse,
+    BulkRegisterResult,
+    DeleteAgentResponse,
+    IconChoicesResponse,
+    KnownAgentType,
+    RegisterAgentResponse,
+    RegisterKnownAgentRequest,
+    RegisterKnownSubagentsRequest,
+    RegisterKnownSubagentsResponse,
+    RegisterOtherAgentRequest,
+    RenameAgentRequest,
+    RenameAgentResponse,
+    UpdateAddressingPolicyRequest,
+    UpdateAgentCanManageAgentsRequest,
+    UpdateAgentDescriptionRequest,
+    UpdateAgentDisplayNameRequest,
+    UpdateAgentIconRequest,
+    UpdateAgentOptionsRequest,
+)
+from switch_core.gateway.subagent_registration import derive_subagent_registrations
+from switch_core.request_validation import public_errors
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+@router.get("")
+async def list_agents(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    _user: Annotated[User, Depends(get_current_user)],
+) -> list[AgentSummary]:
+    return await list_agent_summaries(session, agent_store, user_store)
+
+
+@router.delete("/by-name/{agent_name}")
+async def delete_agent_by_name(
+    agent_name: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> DeleteAgentResponse:
+    agent = await agent_store.get_by_name(session, agent_name)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_name}")
+    try:
+        require_manage(
+            Principal(user.id, is_admin),
+            agent.owner_id,
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can delete it.",
+        )
+    # Not held across the delete, which opens its own sessions and calls every bridge.
+    await session.commit()
+    try:
+        deletion = await protocol.delete_agent(agent_name=agent_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    logger.info("Deleted agent via gateway by name: %s", agent_name)
+    return DeleteAgentResponse(
+        ok=True, bridge_cleanup_failures=deletion.bridge_failures
+    )
+
+
+@router.delete("/{agent_id}")
+async def delete_agent(
+    agent_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> DeleteAgentResponse:
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+    try:
+        require_manage(
+            Principal(user.id, is_admin),
+            agent.owner_id,
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can delete it.",
+        )
+    # Not held across the delete, which opens its own sessions and calls every bridge.
+    await session.commit()
+    try:
+        deletion = await protocol.delete_agent(agent_id=agent_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    logger.info("Deleted agent via gateway: %s", agent_id)
+    return DeleteAgentResponse(
+        ok=True, bridge_cleanup_failures=deletion.bridge_failures
+    )
+
+
+@router.get("/known-types")
+async def list_known_agent_types() -> list[KnownAgentType]:
+    return [
+        KnownAgentType(
+            key=key,
+            connector_type=spec.connector_type,
+            tool_count=len(spec.tools),
+            options_schema=spec.options_schema.model_json_schema(),
+        )
+        for key, spec in known_agents().items()
+    ]
+
+
+@router.get("/avatar-settings")
+async def get_avatar_settings(
+    _user: Annotated[User, Depends(get_current_user)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+) -> AvatarSettingsResponse:
+    """Whether a client may draw agents with icons from outside avatar
+    services. Switch Console builds the same generated icons the bridges do,
+    so it asks here rather than sending names the operator has kept in."""
+    return AvatarSettingsResponse(
+        third_party_avatars_enabled=config.third_party_avatars_enabled
+    )
+
+
+@router.get("/icon-choices")
+async def list_icon_choices(
+    _user: Annotated[User, Depends(get_current_user)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    name: Annotated[str, Query(min_length=1, max_length=128)],
+    page: Annotated[int, Query(ge=0, le=1000)] = 0,
+) -> IconChoicesResponse:
+    """One page of generated icons for an agent called `name`: page 0 leads
+    with the one an agent of that name gets when nobody picks an icon. An
+    empty page, flagged as such, when third-party avatars are off."""
+    if not config.third_party_avatars_enabled:
+        return IconChoicesResponse(choices=[], third_party_avatars_enabled=False)
+    return IconChoicesResponse(
+        choices=generated_icon_choices(name, page), third_party_avatars_enabled=True
+    )
+
+
+@router.post("/register")
+async def register_known_agent(
+    req: RegisterKnownAgentRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+) -> RegisterAgentResponse:
+    spec = known_agent(req.agent_type)
+    if spec is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown agent type: {req.agent_type}",
+        )
+
+    try:
+        options = spec.parse_options(req.options)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=public_errors(exc)) from exc
+
+    integration_profile = spec.build_profile(options)
+    metadata = {
+        "known_agent_type": req.agent_type,
+        "known_agent_options": options.model_dump(),
+    }
+
+    try:
+        result = await protocol.register_agent(
+            registration_path="gateway",
+            name=req.name,
+            description=req.description,
+            icon_url=req.icon_url,
+            display_name=req.display_name,
+            connector_type=spec.connector_type,
+            integration_profile=integration_profile,
+            tools=spec.tools,
+            models=spec.models,
+            metadata=metadata,
+            owner_id=user.id,
+            overwrite=req.overwrite,
+        )
+    except AgentExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        # Covers InvalidIconUrl, which subclasses ValueError.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return RegisterAgentResponse(
+        id=result.agent_id,
+        api_key=result.api_key,
+        oauth_client_id=result.oauth_client_id,
+    )
+
+
+@router.post("/register-known-bulk")
+async def register_known_subagents(
+    req: RegisterKnownSubagentsRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> RegisterKnownSubagentsResponse:
+    """Register many Claude Code subagents under one parent agent (session-authed).
+
+    The owner-scoped counterpart of the agent-bridge `register-known-bulk`
+    endpoint: the signed-in user must own the parent. Each child's Switch name
+    is derived as ``<parent-name>.<subagent_name>``; a name clash fails the whole
+    batch up front rather than leaving a partial set registered. Subagents
+    inherit the parent's `channels_enabled` / `repo_dir` unless overridden in
+    `options`.
+    """
+    spec = known_agent(req.agent_type)
+    if spec is None:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown agent type: {req.agent_type}"
+        )
+    if not req.subagents:
+        raise HTTPException(status_code=400, detail="No subagents provided")
+
+    parent = await agent_store.get(session, req.parent_agent_id)
+    if parent is None:
+        raise HTTPException(
+            status_code=404, detail=f"Parent agent not found: {req.parent_agent_id}"
+        )
+    try:
+        require_manage(
+            Principal(user.id, is_admin),
+            parent.owner_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the parent agent's owner or an admin can register its subagents.",
+        ) from exc
+
+    # Derive names + per-subagent options (inheriting parent settings); reject
+    # in-batch duplicates before touching the DB.
+    try:
+        derived = derive_subagent_registrations(
+            parent_name=parent.name,
+            parent_metadata=parent.metadata_,
+            base_options=req.options,
+            subagents=[(s.subagent_name, s.description) for s in req.subagents],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Pre-check existence so a clash fails the batch before any registration.
+    if not req.overwrite:
+        clashes = [
+            d.name
+            for d in derived
+            if await agent_store.get_by_name(session, d.name) is not None
+        ]
+        if clashes:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Subagents already exist: "
+                    + ", ".join(clashes)
+                    + ". Pass overwrite=true to re-register."
+                ),
+            )
+
+    # Not held across registration, which opens its own session and calls every bridge.
+    await session.commit()
+    results: list[BulkRegisterResult] = []
+    for d in derived:
+        try:
+            options = spec.parse_options(d.options)
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=public_errors(exc)) from exc
+        integration_profile = spec.build_profile(options)
+        metadata = {
+            "known_agent_type": req.agent_type,
+            "known_agent_options": options.model_dump(),
+        }
+        try:
+            result = await protocol.register_agent(
+                name=d.name,
+                description=d.description,
+                connector_type=spec.connector_type,
+                integration_profile=integration_profile,
+                tools=spec.tools,
+                models=spec.models,
+                metadata=metadata,
+                owner_id=user.id,
+                parent_agent_id=parent.id,
+                overwrite=req.overwrite,
+            )
+        except AgentExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        results.append(
+            BulkRegisterResult(
+                subagent_name=d.subagent_name,
+                name=d.name,
+                id=result.agent_id,
+                api_key=result.api_key,
+            )
+        )
+
+    return RegisterKnownSubagentsResponse(results=results)
+
+
+@router.patch("/{agent_id}/options")
+async def update_agent_options(
+    agent_id: str,
+    req: UpdateAgentOptionsRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> AgentSummary:
+    """Replace a known-agent's options.
+
+    Body must contain the full options payload (no partial merge). The new
+    options are validated against the spec's `options_schema`, then the
+    agent's `integration_profile` is rebuilt from them via
+    `KnownAgent.build_profile` and persisted alongside the options — keeping
+    the two in sync the same way `/agents/register` does.
+
+    Only the agent's owner (or an admin) can update its options. Agents that
+    were not registered via a known-agent type (e.g. `register-other`) have
+    no editable options and return 400.
+    """
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+
+    try:
+        require_manage(
+            Principal(user.id, is_admin),
+            agent.owner_id,
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can update its options.",
+        )
+
+    try:
+        await apply_agent_options(session, agent_store, agent, req.options)
+    except AgentOptionsNotEditable as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail=public_errors(exc)) from exc
+    await session.commit()
+
+    md = agent.metadata_ if isinstance(agent.metadata_, dict) else {}
+    logger.info(
+        "Updated options for agent %s (type=%s) by user %s",
+        agent.name,
+        md.get("known_agent_type"),
+        user.name,
+    )
+
+    owner_name = user.name if agent.owner_id == user.id else None
+    return await build_agent_summary(session, agent_store, agent, owner_name)
+
+
+@router.put("/{agent_id}/icon")
+async def update_agent_icon(
+    agent_id: str,
+    req: UpdateAgentIconRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+    config: Annotated[SwitchConfig, Depends(get_config)],
+    chat_service: Annotated[ChatService, Depends(get_chat_service)],
+) -> AgentSummary:
+    """Set, change, or clear an agent's icon (CHOO-2171).
+
+    ``icon_url: null`` clears it, leaving the agent with no icon so the caller
+    renders its own fallback. Only the agent's owner (or an admin) may change
+    it. Unlike options, this applies to every agent regardless of how it was
+    registered.
+
+    The URL must be an absolute https address that is not the local machine or
+    a private network — Switch dereferences it when a bridge needs the image
+    as bytes, so an unconstrained URL would be a request made on the caller's
+    behalf from inside our network. A rejected URL returns 400 rather than
+    being stored and failing later at render time. So is an icon on an avatar
+    service while the server has third-party avatars off, which no bridge
+    would show.
+    """
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+
+    try:
+        require_manage(
+            Principal(user.id, is_admin),
+            agent.owner_id,
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can change its icon.",
+        )
+
+    try:
+        icon_url = refuse_third_party_avatar(
+            normalise_icon_url(req.icon_url),
+            third_party_avatars=config.third_party_avatars_enabled,
+        )
+    except InvalidIconUrl as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await agent_store.update(session, agent_id, icon_url=icon_url)
+    await session.commit()
+    await session.refresh(agent)
+    await chat_service.agent_changed(require_tenant_id(), agent_id)
+
+    logger.info(
+        "%s agent %s icon by user %s",
+        "Cleared" if icon_url is None else "Set",
+        agent.name,
+        user.name,
+    )
+
+    owner_name = user.name if agent.owner_id == user.id else None
+    return await build_agent_summary(session, agent_store, agent, owner_name)
+
+
+@router.put("/{agent_id}/name")
+async def rename_agent(
+    agent_id: str,
+    req: RenameAgentRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> RenameAgentResponse:
+    """Rename an agent: change the identifier people type and mention, and
+    its display name with it.
+
+    Only its owner (or an admin) may. Refused with 400 for a malformed or
+    reserved name, or a clash with an alias, a role, or a handle on a chat
+    platform; 409 when another agent has the name. A chat platform that could
+    not be updated afterwards is listed in `bridge_failures`; the rename
+    stands.
+    """
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+    try:
+        require_manage(Principal(user.id, is_admin), agent.owner_id)
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can rename it.",
+        )
+    # Not held across the rename, which opens its own sessions and calls every bridge.
+    await session.commit()
+    try:
+        result = await protocol.rename_agent(
+            agent_id=agent_id, new_name=req.name, display_name=req.display_name
+        )
+    except AgentExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (AgentRenameRefused, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    logger.info(
+        "Renamed agent %s from %s to %s by user %s",
+        agent_id,
+        result.old_name,
+        result.new_name,
+        user.name,
+    )
+    renamed = await agent_store.get(session, agent_id)
+    assert renamed is not None
+    await session.refresh(renamed)
+    owner_name = user.name if renamed.owner_id == user.id else None
+    return RenameAgentResponse(
+        agent=await build_agent_summary(session, agent_store, renamed, owner_name),
+        old_name=result.old_name,
+        bridge_failures=result.bridge_failures,
+        templates_mentioning_old_name=result.templates_mentioning_old_name,
+    )
+
+
+@router.put("/{agent_id}/display-name")
+async def update_agent_display_name(
+    agent_id: str,
+    req: UpdateAgentDisplayNameRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+    chat_service: Annotated[ChatService, Depends(get_chat_service)],
+) -> AgentSummary:
+    """Set, change, or clear an agent's human display name.
+
+    ``display_name: null`` (or a blank string) clears it, leaving the agent
+    with only its identifier. Only the agent's owner (or an admin) may change
+    it. Like the icon, this applies to every agent regardless of how it was
+    registered.
+
+    A name that is over-long or carries a line break is refused with 400 rather
+    than stored to break a message header later.
+    """
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+
+    try:
+        require_manage(
+            Principal(user.id, is_admin),
+            agent.owner_id,
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can change its display name.",
+        )
+
+    try:
+        display_name = normalise_display_name(req.display_name)
+    except InvalidDisplayName as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await agent_store.update(session, agent_id, display_name=display_name)
+    await session.commit()
+    await session.refresh(agent)
+    await protocol.update_bridge_identities(agent_id)
+    await chat_service.agent_changed(require_tenant_id(), agent_id)
+
+    logger.info(
+        "%s agent %s display name by user %s",
+        "Cleared" if display_name is None else "Set",
+        agent.name,
+        user.name,
+    )
+
+    owner_name = user.name if agent.owner_id == user.id else None
+    return await build_agent_summary(session, agent_store, agent, owner_name)
+
+
+@router.put("/{agent_id}/description")
+async def update_agent_description(
+    agent_id: str,
+    req: UpdateAgentDescriptionRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> AgentSummary:
+    """Change an agent's description. Only its owner (or an admin) may; a
+    blank description is refused with 400."""
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+
+    try:
+        require_manage(Principal(user.id, is_admin), agent.owner_id)
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can change its description.",
+        )
+
+    description = req.description.strip()
+    if not description:
+        raise HTTPException(status_code=400, detail="description must not be blank")
+
+    await agent_store.update(session, agent_id, description=description)
+    await session.commit()
+    await session.refresh(agent)
+    await protocol.update_bridge_identities(agent_id)
+
+    logger.info("Set agent %s description by user %s", agent.name, user.name)
+
+    owner_name = user.name if agent.owner_id == user.id else None
+    return await build_agent_summary(session, agent_store, agent, owner_name)
+
+
+@router.post("/register-other")
+async def register_other_agent(
+    req: RegisterOtherAgentRequest,
+    user: Annotated[User, Depends(get_current_user)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+) -> RegisterAgentResponse:
+    # External agent registered without a known profile — give it a conservative
+    # default profile (session_passive).
+    default_profile = IntegrationProfile(
+        connection_model="session_passive",
+        message_exchange=True,
+        pre_invocation_mediation=[],
+        post_invocation_mediation=[],
+        event_reporting=[],
+    )
+
+    try:
+        result = await protocol.register_agent(
+            registration_path="gateway",
+            name=req.name,
+            description=req.description,
+            icon_url=req.icon_url,
+            display_name=req.display_name,
+            connector_type="external",
+            integration_profile=default_profile,
+            owner_id=user.id,
+            overwrite=req.overwrite,
+        )
+    except AgentExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        # Covers InvalidIconUrl, which subclasses ValueError.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return RegisterAgentResponse(
+        id=result.agent_id,
+        api_key=result.api_key,
+        oauth_client_id=result.oauth_client_id,
+    )
+
+
+@router.put("/{agent_id}/addressing-policy")
+async def update_addressing_policy(
+    agent_id: str,
+    req: UpdateAddressingPolicyRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    room_store: Annotated[RoomStore, Depends(get_room_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> AgentDetail:
+    """Set or clear an agent's scoped addressing policy (CHOO-1585).
+
+    ``policy: null`` clears it (the agent becomes open to anyone). Only the
+    agent's owner (or an admin) may change it.
+    """
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+
+    try:
+        require_manage(
+            Principal(user.id, is_admin),
+            agent.owner_id,
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner or an admin can change its addressing policy.",
+        )
+
+    stored = req.policy.model_dump() if req.policy is not None else None
+    await agent_store.update(session, agent_id, addressing_policy=stored)
+    await session.commit()
+
+    logger.info(
+        "Updated addressing policy for agent %s (%d rules) by user %s",
+        agent.name,
+        len(req.policy.rules) if req.policy is not None else 0,
+        user.name,
+    )
+
+    return await assemble_agent_detail(
+        session,
+        agent=agent,
+        agent_store=agent_store,
+        room_store=room_store,
+        user_store=user_store,
+        agent_session_store=protocol.agent_session_store,
+        room_role_store=protocol.room_role_store,
+        connections=protocol.connections,
+    )
+
+
+@router.put("/{agent_id}/can-manage-agents")
+async def update_can_manage_agents(
+    agent_id: str,
+    req: UpdateAgentCanManageAgentsRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    room_store: Annotated[RoomStore, Depends(get_room_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> AgentDetail:
+    """Turn the agent's "can manage agents" capability on or off.
+
+    With it on, the agent may list its owner's machines and managed agents
+    and create managed agents on those machines, acting for its owner. Only
+    the agent's owner may change it — not an admin, since the agent then acts
+    on the owner's own machines. It has an effect only on a server running
+    agent management, where those operations exist.
+    """
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+    if agent.owner_id is None or agent.owner_id != user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the agent's owner can change whether it can manage agents.",
+        )
+
+    await agent_store.update(session, agent_id, can_manage_agents=req.enabled)
+    await session.commit()
+    await session.refresh(agent)
+
+    logger.info(
+        "%s 'can manage agents' for agent %s by its owner %s",
+        "Enabled" if req.enabled else "Disabled",
+        agent.name,
+        user.name,
+    )
+
+    return await assemble_agent_detail(
+        session,
+        agent=agent,
+        agent_store=agent_store,
+        room_store=room_store,
+        user_store=user_store,
+        agent_session_store=protocol.agent_session_store,
+        room_role_store=protocol.room_role_store,
+        connections=protocol.connections,
+    )
+
+
+# Declared after the literal GET routes (e.g. /known-types) so those are matched
+# first; otherwise this path-parameter route would capture them.
+@router.get("/{agent_id}")
+async def get_agent_detail(
+    agent_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    agent_store: Annotated[AgentStore, Depends(get_agent_store)],
+    room_store: Annotated[RoomStore, Depends(get_room_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    protocol: Annotated[AgentCore, Depends(get_protocol)],
+    _user: Annotated[User, Depends(get_current_user)],
+) -> AgentDetail:
+    agent = await agent_store.get(session, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent_id}")
+
+    return await assemble_agent_detail(
+        session,
+        agent=agent,
+        agent_store=agent_store,
+        room_store=room_store,
+        user_store=user_store,
+        agent_session_store=protocol.agent_session_store,
+        room_role_store=protocol.room_role_store,
+        connections=protocol.connections,
+    )

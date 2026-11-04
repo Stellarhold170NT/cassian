@@ -1,0 +1,161 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any, cast
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from switch_core.bridges.agent.api_key_cache import ApiKeyCache
+from switch_core.bridges.agent.protocol.agent_connections import AgentConnectionRegistry
+from switch_core.bridges.agent.protocol.agent_core import AgentCore
+from switch_core.bridges.agent.protocol.event_buffer import EventBuffer
+from switch_core.bridges.agent.room_access_cache import RoomAccessCache
+from switch_core.bridges.collaboration.lifecycle_service import (
+    CollaborationBridgeLifecycleService,
+)
+from switch_core.bridges.resource.service import ResourceService
+from switch_core.clients.client_lifecycle_service import ClientLifecycleService
+from switch_core.config import SwitchConfig
+from switch_core.db.stores.agent_session_store import AgentSessionStore
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.api_key_store import ApiKeyStore
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.room_service import RoomService
+from switch_core.telemetry import TelemetryService
+from switch_core.telemetry.session_start import (
+    SessionStartLimiter,
+    default_session_start_limiter,
+)
+from switch_core.trust.client import TrustClient
+
+if TYPE_CHECKING:
+    from switch_core.session_activity.outcomes import ApprovalOutcomes
+
+_state: dict[str, Any] = {}
+
+
+def init_dependencies(
+    *,
+    agent_store: AgentStore,
+    agent_session_store: AgentSessionStore,
+    room_store: RoomStore,
+    room_service: RoomService,
+    client_lifecycle: ClientLifecycleService,
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    event_buffer: EventBuffer,
+    connections: AgentConnectionRegistry,
+    resource_service: ResourceService,
+    api_key_store: ApiKeyStore,
+    api_key_cache: ApiKeyCache,
+    external_user_store: ExternalUserStore,
+    bridge_store: CollaborationBridgeStore,
+    session_factory: Any,
+    config: Any,
+    approval_outcomes: ApprovalOutcomes,
+    trust_client: TrustClient,
+    room_access: RoomAccessCache | None = None,
+    telemetry: TelemetryService | None = None,
+) -> None:
+    _state["agent_store"] = agent_store
+    _state["agent_session_store"] = agent_session_store
+    _state["room_store"] = room_store
+    _state["room_service"] = room_service
+    _state["client_lifecycle"] = client_lifecycle
+    _state["collab_lifecycle"] = collab_lifecycle
+    _state["event_buffer"] = event_buffer
+    _state["connections"] = connections
+    _state["resource_service"] = resource_service
+    _state["api_key_store"] = api_key_store
+    _state["api_key_cache"] = api_key_cache
+    _state["external_user_store"] = external_user_store
+    _state["bridge_store"] = bridge_store
+    _state["session_factory"] = session_factory
+    _state["config"] = config
+    _state["telemetry"] = telemetry
+    _state["trust_client"] = trust_client
+    _state["session_start_limiter"] = default_session_start_limiter()
+
+    _state["protocol"] = AgentCore(
+        agent_store=agent_store,
+        agent_session_store=agent_session_store,
+        room_store=room_store,
+        room_service=room_service,
+        client_lifecycle=client_lifecycle,
+        collab_lifecycle=collab_lifecycle,
+        event_buffer=event_buffer,
+        connections=connections,
+        resource_service=resource_service,
+        api_key_store=api_key_store,
+        api_key_cache=api_key_cache,
+        external_user_store=external_user_store,
+        bridge_store=bridge_store,
+        session_factory=session_factory,
+        config=config,
+        approval_outcomes=approval_outcomes,
+        trust_client=trust_client,
+        room_access=room_access,
+        telemetry=telemetry,
+    )
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with _state["session_factory"]() as session:
+        yield session
+
+
+def get_agent_store() -> AgentStore:
+    return _state["agent_store"]  # type: ignore[no-any-return]
+
+
+def get_room_store() -> RoomStore:
+    return _state["room_store"]  # type: ignore[no-any-return]
+
+
+def get_room_service() -> RoomService:
+    return _state["room_service"]  # type: ignore[no-any-return]
+
+
+def get_client_lifecycle() -> ClientLifecycleService:
+    return _state["client_lifecycle"]  # type: ignore[no-any-return]
+
+
+def get_event_buffer() -> EventBuffer:
+    return _state["event_buffer"]  # type: ignore[no-any-return]
+
+
+def get_resource_service() -> ResourceService:
+    return _state["resource_service"]  # type: ignore[no-any-return]
+
+
+def get_collab_lifecycle() -> CollaborationBridgeLifecycleService:
+    return _state["collab_lifecycle"]  # type: ignore[no-any-return]
+
+
+def get_api_key_store() -> ApiKeyStore:
+    return _state["api_key_store"]  # type: ignore[no-any-return]
+
+
+def get_api_key_cache() -> ApiKeyCache:
+    return _state["api_key_cache"]  # type: ignore[no-any-return]
+
+
+def get_config() -> SwitchConfig:
+    return _state["config"]  # type: ignore[no-any-return]
+
+
+def get_protocol() -> AgentCore:
+    return _state["protocol"]  # type: ignore[no-any-return]
+
+
+def get_telemetry() -> TelemetryService | None:
+    return cast(TelemetryService | None, _state.get("telemetry"))
+
+
+def get_session_start_limiter() -> SessionStartLimiter:
+    return cast(SessionStartLimiter, _state["session_start_limiter"])
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    return cast(async_sessionmaker[AsyncSession], _state["session_factory"])

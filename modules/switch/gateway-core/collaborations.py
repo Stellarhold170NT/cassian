@@ -1,0 +1,1542 @@
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Iterable
+from typing import Annotated, Literal
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from switch_core import messaging_platforms
+from switch_core.account_links import LINK_CODE_TTL
+from switch_core.bridges.collaboration.adapter import (
+    ConfigEditRefused,
+    DirectorySearchBusy,
+)
+from switch_core.bridges.collaboration.lifecycle_service import (
+    BridgeClaimConflict,
+    CollaborationBridgeLifecycleService,
+)
+from switch_core.bridges.collaboration.models import (
+    BridgeCredentialError,
+    BridgeInstallLink,
+    BridgeNotRunning,
+    BridgeOperationError,
+    BridgeStartRefused,
+    DirectoryUser,
+)
+from switch_core.bridges.collaboration.own_app_setup import (
+    SetupCheckError,
+    check_slack,
+    slack_create_url,
+    slack_manifest,
+)
+from switch_core.db.audit import AuditAction, record_audit_event
+from switch_core.db.models import (
+    CollaborationBridge,
+    ExternalUser,
+    ExternalUserClaim,
+    ExternalUserLinkRequest,
+    MessagingInstall,
+    User,
+    require_tenant_id,
+)
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.external_user_store import ExternalUserStore, NoSuchLink
+from switch_core.db.stores.messaging_install_store import MessagingInstallStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.gateway.auth import (
+    get_current_user,
+    get_tenant_is_admin,
+    require_tenant_admin,
+)
+from switch_core.gateway.dependencies import (
+    get_bridge_store,
+    get_collab_lifecycle,
+    get_external_user_store,
+    get_install_store,
+    get_room_service,
+    get_room_store,
+    get_session,
+    get_user_store,
+)
+from switch_core.gateway.schemas import (
+    BridgeCreateRequest,
+    BridgeDetail,
+    BridgeTypeInfo,
+    BridgeUpdateRequest,
+    ClaimIdentityRequest,
+    DirectorySearchResponse,
+    DirectoryUserSummary,
+    ExternalUserSummary,
+    IdentityClaimant,
+    LinkCode,
+    LinkRequestSummary,
+    RequireConfirmationRequest,
+    RequireConfirmationResult,
+    SlackOwnAppSetup,
+    SlackTokensCheck,
+    SlackTokensChecked,
+    UnconfirmedLink,
+    VerifyIdentitySessionRequest,
+)
+from switch_core.request_validation import describe_errors
+from switch_core.room_service import RoomService
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+async def _home_url(
+    bridge_id: str, collab_lifecycle: CollaborationBridgeLifecycleService
+) -> str | None:
+    """Link that opens the bridge's workspace in its messaging app, built by
+    the live adapter. None when the bridge is not running or the platform has
+    no such link — the same "offer it only when it works" rule the per-room
+    channel deeplink follows."""
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        return None
+    try:
+        return await adapter.home_deeplink()
+    except Exception:
+        logger.warning(
+            "Failed to build home deeplink for bridge %s", bridge_id, exc_info=True
+        )
+        return None
+
+
+async def _install_links(
+    bridge_id: str, collab_lifecycle: CollaborationBridgeLifecycleService
+) -> list[BridgeInstallLink]:
+    """One-click "add the app to a chat" links, built by the live adapter.
+    Empty when the bridge is not running or its platform has none — the same
+    "offer it only when it works" rule as the home link."""
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        return []
+    try:
+        return await adapter.install_links()
+    except Exception:
+        logger.warning(
+            "Failed to build install links for bridge %s", bridge_id, exc_info=True
+        )
+        return []
+
+
+async def _install_note(
+    bridge_id: str, collab_lifecycle: CollaborationBridgeLifecycleService
+) -> str | None:
+    """What the install links do not cover, in the platform's own terms. None
+    when the bridge is not running or the platform has nothing to add."""
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        return None
+    try:
+        return await adapter.install_note()
+    except Exception:
+        logger.warning(
+            "Failed to build the install note for bridge %s", bridge_id, exc_info=True
+        )
+        return None
+
+
+async def _attention(
+    bridge_id: str, collab_lifecycle: CollaborationBridgeLifecycleService
+) -> str | None:
+    """What a workspace admin must do for the bridge to keep working, from the
+    live adapter. None when the bridge is not running or nothing is wrong."""
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        return None
+    try:
+        return await adapter.attention()
+    except Exception:
+        logger.warning(
+            "Failed to read the attention note for bridge %s", bridge_id, exc_info=True
+        )
+        return None
+
+
+def _places_app_in_teams(
+    bridge_id: str, collab_lifecycle: CollaborationBridgeLifecycleService
+) -> bool:
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    return adapter is not None and adapter.places_app_in_teams
+
+
+#: What each platform calls the place its app is installed into, and how it
+#: is named to a person.
+_INSTALL_PLACES: dict[str, tuple[str, str]] = {
+    "slack": ("Slack", "workspace"),
+    "discord": ("Discord", "server"),
+    "teams": ("Microsoft Teams", "organisation"),
+    "telegram": ("Telegram", "chat"),
+}
+
+
+def _installed_refusal(installs: list[MessagingInstall]) -> str:
+    """Why a bridge live installs still use cannot be deleted, and what to do.
+
+    Said in what disconnecting does on the platform, which differs for each:
+    only Slack has a token to revoke, Discord's bot stays in the server, and a
+    Telegram chat leaves its connection behind to be deleted here afterwards.
+    Keyed by the platform's name rather than asked of its installer, which is
+    gone on a deployment whose app credentials were removed — exactly when the
+    installs left behind still have to protect their bridges.
+    """
+    platform = installs[0].platform
+    label, noun = _INSTALL_PLACES.get(platform, (platform, "workspace"))
+    where = (
+        f"{label} {noun} {installs[0].external_workspace_id}"
+        if len(installs) == 1
+        else f"{len(installs)} {label} {noun}s"
+    )
+    them = "it" if len(installs) == 1 else "them"
+    if platform == "telegram":
+        return (
+            f"The Switch bot is still in {where} through this connection. "
+            f"Disconnect {them} under Installed apps first, then delete the "
+            "connection here."
+        )
+    if platform == "discord":
+        return (
+            f"This connection was created by adding the Switch bot to {where}. "
+            f"Disconnect {them} under Installed apps instead: that stops Switch "
+            "using the server and removes this connection. The bot stays in the "
+            "server until you remove it in Discord."
+        )
+    if platform == "slack":
+        effect = "revokes Switch's token at Slack and removes this connection"
+    elif platform == "teams":
+        effect = "takes the app out of every team and removes this connection"
+    else:
+        effect = "removes this connection"
+    return (
+        f"This connection was created by installing the Switch app into "
+        f"{where}. Disconnect {them} under Installed apps instead: that "
+        f"{effect}."
+    )
+
+
+def _channel_ids_refused(
+    bridge_id: str, collab_lifecycle: CollaborationBridgeLifecycleService
+) -> str | None:
+    """Why the bridge binds no channel by id. None when it is not running,
+    where binding is refused anyway for want of a bridge to bind to."""
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    return None if adapter is None else adapter.channel_ids_refused()
+
+
+async def _detail(
+    bridge: CollaborationBridge,
+    *,
+    room_count: int,
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    is_default: bool | None = None,
+) -> BridgeDetail:
+    """One place every response shape is built, so a new field cannot reach
+    some endpoints and miss others. `is_default` overrides the stored value for
+    a caller that just changed it in the same request."""
+    return BridgeDetail(
+        bridge_id=bridge.id,
+        bridge_type=bridge.type,
+        display_name=bridge.display_name,
+        status=bridge.status,
+        agent_greetings_enabled=bridge.agent_greetings_enabled,
+        is_default=bridge.is_default if is_default is None else is_default,
+        preconfigured=bridge.preconfigured,
+        room_count=room_count,
+        created_at=str(bridge.created_at),
+        home_url=await _home_url(bridge.id, collab_lifecycle),
+        install_links=await _install_links(bridge.id, collab_lifecycle),
+        install_note=await _install_note(bridge.id, collab_lifecycle),
+        channel_creation_supported=collab_lifecycle.supports_channel_creation(
+            bridge.type
+        ),
+        channel_creation_enabled=bridge.channel_creation_enabled,
+        channel_ids_refused=_channel_ids_refused(bridge.id, collab_lifecycle),
+        directory_search_supported=collab_lifecycle.supports_directory_search(
+            bridge.type
+        ),
+        attention=await _attention(bridge.id, collab_lifecycle),
+        team_placement_supported=_places_app_in_teams(bridge.id, collab_lifecycle),
+        receives_webhooks=collab_lifecycle.receives_webhooks(bridge.type),
+        webhook_url=collab_lifecycle.webhook_url(bridge.id, bridge.type),
+    )
+
+
+@router.get("/types")
+async def list_bridge_types(
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    _user: Annotated[User, Depends(get_current_user)],
+) -> list[BridgeTypeInfo]:
+    types: list[BridgeTypeInfo] = []
+    for t in collab_lifecycle.get_registered_types():
+        platform = messaging_platforms.lookup(t)
+        adapter_cls = collab_lifecycle.adapter_class(t)
+        if platform is None or adapter_cls is None:
+            raise RuntimeError(f"Bridge type {t!r} is registered but not described.")
+        types.append(
+            BridgeTypeInfo(
+                key=t,
+                display_name=platform.display_name,
+                docs_slug=platform.docs_slug,
+                icon_svg=platform.icon_svg,
+                receives_webhooks=adapter_cls.receives_webhooks,
+                config_schema=collab_lifecycle.get_config_schema(t),
+                channel_creation_supported=adapter_cls.supports_channel_creation,
+                directory_search_supported=adapter_cls.supports_directory_search,
+            )
+        )
+    return types
+
+
+@router.get("/setup/slack")
+async def slack_own_app_setup(
+    _user: Annotated[User, Depends(require_tenant_admin)],
+) -> SlackOwnAppSetup:
+    """The Slack app this server needs, and Slack's create-app page filled in
+    with it, for someone connecting a Slack app of their own."""
+    manifest = slack_manifest()
+    return SlackOwnAppSetup(manifest=manifest, create_url=slack_create_url(manifest))
+
+
+@router.post("/setup/slack/check")
+async def check_slack_tokens(
+    req: SlackTokensCheck,
+    _user: Annotated[User, Depends(require_tenant_admin)],
+) -> SlackTokensChecked:
+    """Whether both tokens of a Slack app work, and the workspace they are for,
+    so nobody has to look its id up."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            checked = await check_slack(
+                http, bot_token=req.bot_token.strip(), app_token=req.app_token.strip()
+            )
+    except SetupCheckError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return SlackTokensChecked(
+        workspace_id=checked.workspace_id,
+        workspace_name=checked.workspace_name,
+        bot_name=checked.bot_name,
+    )
+
+
+@router.post("")
+async def create_bridge(
+    req: BridgeCreateRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    # Admin-only: a bridge is an unowned, workspace-wide integration holding
+    # platform secrets, so there is no owner to scope to — registering one is
+    # an admin action.
+    user: Annotated[User, Depends(require_tenant_admin)],
+) -> BridgeDetail:
+    # A shared bridge runs on this deployment's own app, which is in every
+    # tenant's workspaces, so it is made only by installing the app — the one
+    # path that proves the workspace is the caller's. Registered here, it
+    # would reach whichever workspace its config named.
+    if req.connection_config.get("event_delivery") == "shared":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "A shared connection is created by installing the app, not "
+                "registered here."
+            ),
+        )
+    try:
+        bridge = await collab_lifecycle.register(
+            bridge_type=req.bridge_type,
+            display_name=req.display_name,
+            connection_config=dict(req.connection_config),
+            channel_creation_enabled=req.channel_creation_enabled,
+            preconfigured=req.preconfigured,
+        )
+    except BridgeCredentialError as exc:
+        # The platform's own words, verbatim — it knows what is wrong with the
+        # credentials and we do not.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=describe_errors(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    is_default = bridge.is_default
+    if req.set_as_default:
+        await bridge_store.set_default(session, bridge.id)
+        is_default = True
+    await record_audit_event(
+        session,
+        tenant_id=bridge.tenant_id,
+        actor_user_id=user.id,
+        action=AuditAction.BRIDGE_CREATED,
+        target_type="collaboration_bridge",
+        target_id=bridge.id,
+        details={
+            "type": bridge.type,
+            "display_name": bridge.display_name,
+            "set_as_default": req.set_as_default,
+        },
+    )
+    await session.commit()
+
+    return await _detail(
+        bridge, room_count=0, collab_lifecycle=collab_lifecycle, is_default=is_default
+    )
+
+
+@router.post("/{bridge_id}/default")
+async def set_default_bridge(
+    bridge_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    room_store: Annotated[RoomStore, Depends(get_room_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    user: Annotated[User, Depends(require_tenant_admin)],
+) -> BridgeDetail:
+    """Nominate a bridge as the instance default, demoting the previous one."""
+    try:
+        bridge = await bridge_store.set_default(session, bridge_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await record_audit_event(
+        session,
+        tenant_id=bridge.tenant_id,
+        actor_user_id=user.id,
+        action=AuditAction.BRIDGE_DEFAULT_SET,
+        target_type="collaboration_bridge",
+        target_id=bridge.id,
+        details=None,
+    )
+    await session.commit()
+
+    rooms = await room_store.get_by_bridge(session, bridge_id)
+    return await _detail(
+        bridge, room_count=len(rooms), collab_lifecycle=collab_lifecycle
+    )
+
+
+@router.get("")
+async def list_bridges(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    room_store: Annotated[RoomStore, Depends(get_room_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    _user: Annotated[User, Depends(get_current_user)],
+) -> list[BridgeDetail]:
+    bridges = await bridge_store.get_all(session)
+
+    details = []
+    for bridge in bridges:
+        rooms = await room_store.get_by_bridge(session, bridge.id)
+        details.append(
+            await _detail(
+                bridge, room_count=len(rooms), collab_lifecycle=collab_lifecycle
+            )
+        )
+
+    return details
+
+
+@router.patch("/{bridge_id}")
+async def update_bridge(
+    bridge_id: str,
+    payload: BridgeUpdateRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    room_store: Annotated[RoomStore, Depends(get_room_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    # Admin-only for the same reason as registering one: a bridge is an unowned,
+    # workspace-wide integration, so there is no owner to scope mutation to.
+    user: Annotated[User, Depends(require_tenant_admin)],
+) -> BridgeDetail:
+    bridge = await bridge_store.get(session, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+
+    if (
+        payload.channel_creation_enabled
+        and not collab_lifecycle.supports_channel_creation(bridge.type)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{bridge.type} cannot create channels from Switch, so this "
+                "connection cannot be allowed to. Create the chat on the "
+                "platform and add the bot to it; Switch adopts it as a room."
+            ),
+        )
+
+    if payload.connection_config is not None:
+        current = bridge.connection_config or {}
+        merged = {**current, **payload.connection_config}
+        # How a bridge receives its events is decided by where it came from —
+        # an install, or someone's own bot — and changing it on the edit form
+        # would turn one into the other with none of what that takes.
+        if merged.get("event_delivery") != current.get("event_delivery"):
+            raise HTTPException(
+                status_code=422,
+                detail="event_delivery cannot be changed on an existing connection.",
+            )
+        # A connection on an app the deployment owns may hold settings that
+        # decide where the deployment's credential is pointed; only the ones
+        # its adapter names are anyone's to change.
+        editable = collab_lifecycle.editable_config_keys(bridge.type, current)
+        if editable is not None:
+            locked = sorted(
+                key
+                for key, value in payload.connection_config.items()
+                if key not in editable and current.get(key) != value
+            )
+            if locked:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"{', '.join(locked)} cannot be changed on this "
+                        "connection: Switch manages it for the installed app."
+                    ),
+                )
+        # Not held across the platform's credential check; nothing is written
+        # until it passes, so a refused edit still changes nothing.
+        await session.commit()
+        try:
+            await collab_lifecycle.check_edited_connection_config(
+                bridge_id=bridge_id, bridge_type=bridge.type, connection_config=merged
+            )
+            # Asked now rather than at the restart below, so an edit that would
+            # point a shared bridge at a workspace this tenant never installed
+            # into is refused instead of stored and then failing to start.
+            await collab_lifecycle.check_start_guards(
+                bridge_id=bridge_id,
+                tenant_id=bridge.tenant_id,
+                bridge_type=bridge.type,
+                connection_config=merged,
+            )
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=describe_errors(exc)) from exc
+        except BridgeStartRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except (BridgeClaimConflict, BridgeCredentialError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            await collab_lifecycle.check_config_edit(
+                bridge_id=bridge_id,
+                bridge_type=bridge.type,
+                current=current,
+                connection_config=merged,
+            )
+        except ConfigEditRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except BridgeNotRunning as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except BridgeOperationError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    if payload.agent_greetings_enabled is not None:
+        bridge = await bridge_store.set_agent_greetings_enabled(
+            session, bridge_id, payload.agent_greetings_enabled
+        )
+    if payload.channel_creation_enabled is not None:
+        bridge = await bridge_store.set_channel_creation_enabled(
+            session, bridge_id, payload.channel_creation_enabled
+        )
+    if payload.preconfigured is not None:
+        bridge = await bridge_store.set_preconfigured(
+            session, bridge_id, payload.preconfigured
+        )
+    if payload.connection_config is not None:
+        bridge = await bridge_store.merge_connection_config(
+            session, bridge_id, dict(payload.connection_config)
+        )
+    await record_audit_event(
+        session,
+        tenant_id=bridge.tenant_id,
+        actor_user_id=user.id,
+        action=AuditAction.BRIDGE_UPDATED,
+        target_type="collaboration_bridge",
+        target_id=bridge_id,
+        details={
+            "agent_greetings_enabled": payload.agent_greetings_enabled,
+            "channel_creation_enabled": payload.channel_creation_enabled,
+            "connection_config_keys": sorted(payload.connection_config)
+            if payload.connection_config is not None
+            else None,
+        },
+    )
+    await session.commit()
+
+    # A running adapter holds the config it was built with, so a change only
+    # takes effect on restart. Doing it here means enabling something is the
+    # whole operation rather than a change that quietly does nothing until the
+    # next deploy.
+    if payload.connection_config is not None:
+        await collab_lifecycle.restart(bridge_id)
+    if payload.preconfigured is not None:
+        collab_lifecycle.note_preconfigured(bridge_id, payload.preconfigured)
+    rooms = await room_store.get_by_bridge(session, bridge_id)
+    return await _detail(
+        bridge, room_count=len(rooms), collab_lifecycle=collab_lifecycle
+    )
+
+
+@router.get("/{bridge_id}/users")
+async def list_bridge_users(
+    bridge_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    _user: Annotated[User, Depends(get_current_user)],
+) -> list[ExternalUserSummary]:
+    bridge = await bridge_store.get(session, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+
+    users = await external_user_store.get_by_bridge(session, bridge_id)
+    claims = await external_user_store.claims_for(session, [u.id for u in users])
+    names = await _user_names(session, user_store, claims)
+    return [
+        ExternalUserSummary(
+            id=u.id,
+            bridge_id=u.bridge_id,
+            external_user_id=u.external_user_id,
+            external_username=u.external_username,
+            claimed_by=_claimants(claims.get(u.id, []), names),
+        )
+        for u in users
+    ]
+
+
+async def _user_names(
+    session: AsyncSession,
+    user_store: UserStore,
+    claims: dict[str, list[ExternalUserClaim]],
+) -> dict[str, str]:
+    """Display names for every Switch user appearing in these claims.
+
+    Resolved in one pass over the user table rather than a lookup per
+    claimant: a bridge's user list is otherwise N+1 in the number of claims.
+    """
+    wanted = {claim.user_id for found in claims.values() for claim in found}
+    if not wanted:
+        return {}
+    return {u.id: u.name for u in await user_store.get_many(session, wanted)}
+
+
+def _claimants(
+    claims: list[ExternalUserClaim], names: dict[str, str]
+) -> list[IdentityClaimant]:
+    def label(user_id: str) -> str:
+        return names.get(user_id) or user_id
+
+    return [
+        IdentityClaimant(
+            user_id=claim.user_id,
+            user_name=label(claim.user_id),
+            verified=claim.verified_at is not None,
+        )
+        for claim in sorted(claims, key=lambda c: label(c.user_id).lower())
+    ]
+
+
+@router.get("/{bridge_id}/directory")
+async def search_bridge_directory(
+    bridge_id: str,
+    query: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    _user: Annotated[User, Depends(get_current_user)],
+) -> DirectorySearchResponse:
+    """Find someone on a messaging platform so they can be claimed.
+
+    Switch only records someone as an `ExternalUser` once they have spoken, so
+    a freshly connected workspace has nobody to pick from. Asking the platform
+    instead is what makes claiming an identity possible before you have ever
+    posted.
+
+    Platforms with no searchable directory — Telegram, where a bot can only see
+    who has spoken to it — fall back to exactly that: the accounts Switch has
+    already seen on this bridge. The response says which of the two answered, so
+    the caller can explain why the list is narrower rather than presenting a
+    partial answer as a whole one. It is a smaller list, not an error: refusing
+    outright would leave owner-only addressing unusable on those platforms even
+    for someone Switch knows perfectly well.
+    """
+    bridge = await bridge_store.get(session, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Bridge is not running — start it before searching its directory",
+        )
+
+    known = {
+        u.external_user_id: u
+        for u in await external_user_store.get_by_bridge(session, bridge_id)
+    }
+    # Not held across the platform search below.
+    await session.commit()
+
+    source: Literal["directory", "known"] = "directory"
+    note: str | None = None
+    try:
+        found = await adapter.search_directory_users(query)
+    except NotImplementedError as e:
+        source = "known"
+        note = str(e)
+        found = _known_as_directory_users(known.values(), query)
+    except DirectorySearchBusy as e:
+        raise _search_busy(e) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    claims = await external_user_store.claims_for(
+        session, [u.id for u in known.values()]
+    )
+    names = await _user_names(session, user_store, claims)
+    return DirectorySearchResponse(
+        source=source,
+        note=note,
+        users=[
+            DirectoryUserSummary(
+                external_user_id=person.external_user_id,
+                username=person.username,
+                display_name=person.display_name,
+                email=person.email,
+                known_external_user_id=(
+                    known[person.external_user_id].id
+                    if person.external_user_id in known
+                    else None
+                ),
+                claimed_by=(
+                    _claimants(claims.get(known[person.external_user_id].id, []), names)
+                    if person.external_user_id in known
+                    else []
+                ),
+            )
+            for person in found
+        ],
+    )
+
+
+def _known_as_directory_users(
+    known: Iterable[ExternalUser], query: str
+) -> list[DirectoryUser]:
+    """The accounts Switch has already seen, shaped like a directory answer.
+
+    Substring rather than prefix matching, because this list is what someone
+    falls back to when the platform cannot be searched, and being unable to
+    find yourself there is the end of the road. No email: an account is
+    recorded from a message, which carries no address.
+    """
+    needle = query.strip().casefold()
+    if not needle:
+        return []
+    return sorted(
+        (
+            DirectoryUser(
+                external_user_id=u.external_user_id,
+                username=u.external_username,
+                display_name=u.external_username,
+                email=None,
+            )
+            for u in known
+            if needle in u.external_username.casefold()
+        ),
+        key=lambda u: u.display_name.casefold(),
+    )
+
+
+def _search_busy(e: DirectorySearchBusy) -> HTTPException:
+    """A directory refusing more searches for now, as a 429 saying when to retry."""
+    return HTTPException(
+        status_code=429,
+        detail=str(e),
+        headers={"Retry-After": str(math.ceil(e.retry_after))},
+    )
+
+
+async def _require_directory_account(
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    *,
+    bridge_id: str,
+    external_user_id: str,
+    username: str,
+) -> None:
+    """Raise unless the platform's directory really lists this account.
+
+    This is an existence check, not an ownership one: ownership is what the
+    account proves by confirming the link (CHOO-3881). What it prevents is
+    provisioning a human actor for an id that came from nowhere: the claim
+    body is user-supplied, and the row it creates is permanent.
+
+    Only reached for an account Switch has never seen. One it has recorded is
+    already proof the account exists, and the caller claims it without asking
+    the platform — which is the only path open on a platform whose directory
+    cannot be searched.
+    """
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Bridge is not running — cannot look this account up",
+        )
+    try:
+        candidates = await adapter.search_directory_users(username)
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=501,
+            detail=f"{e}. This account cannot be linked until Switch has seen it.",
+        ) from e
+    except DirectorySearchBusy as e:
+        raise _search_busy(e) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+    if not any(c.external_user_id == external_user_id for c in candidates):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No account {username!r} with that id exists on this "
+                "workspace's directory"
+            ),
+        )
+
+
+@router.post("/{bridge_id}/identities")
+async def claim_bridge_identity(
+    bridge_id: str,
+    payload: ClaimIdentityRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+) -> ExternalUserSummary:
+    """Start linking a platform identity to a Switch user (CHOO-2137).
+
+    This is what makes owner-only addressing enforceable: until the person
+    behind a Slack or Mattermost account is known to be a particular Switch
+    user, an owner-scoped rule can never recognise them.
+
+    The link waits until the account confirms it by posting a one-time code
+    (CHOO-3881), and counts for nothing before then: who an account is
+    recognised as is for the account's holder to say. A claim for yourself
+    comes back with the code; one an admin makes for someone else does not,
+    and the person asks for their own.
+
+    Claiming one for someone else is an admin action; claiming one for
+    yourself is not. Claims are **not exclusive** — several Switch users may
+    claim the same account, and each is then recognised as themselves on it.
+    An exclusive claim would let whoever got there first keep the real person
+    from ever being recognised by their own agents, so a second claim is
+    ordinary rather than a conflict.
+    """
+    # Read once: provisioning an unseen account expires everything this
+    # session holds, the caller included, and an expired row cannot be
+    # reloaded from synchronous attribute access.
+    caller_id = user.id
+    if not payload.expects_confirmation:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Linking a chat account now has to be confirmed from that "
+                "account with a one-time code, and this version of Switch "
+                "Console cannot show one. Update Switch Console, then link the "
+                "account again."
+            ),
+        )
+    bridge = await bridge_store.get(session, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+
+    target_user_id = _require_self_or_admin(
+        user, is_admin, payload.user_id, "claim a messaging identity"
+    )
+    # Standing in this tenant, not existence: `users` is deployment-wide, and
+    # a claim names who the account is recognised as inside this tenant. An
+    # organization's `org_admin` stands in every workspace of it.
+    if (
+        await user_store.effective_tenant_role(
+            session, require_tenant_id(), target_user_id
+        )
+        is None
+    ):
+        raise HTTPException(status_code=404, detail="Switch user not found")
+
+    bridge_type, connection_config = bridge.type, bridge.connection_config or {}
+    # Not held across asking the platform.
+    await session.commit()
+    await _refuse_unlinkable(collab_lifecycle, bridge_id, payload.external_user_id)
+
+    external_user = await external_user_store.get_by_external_id(
+        session, bridge_id, payload.external_user_id
+    )
+    if external_user is None:
+        # Nobody has seen this person speak yet, which is the normal case right
+        # after connecting a workspace. Provision the identity now rather than
+        # making them post something first — but only once the platform agrees
+        # the account exists. Provisioning mints a human actor, so taking the
+        # request's word for it would let any signed-in user conjure accounts
+        # for people who do not exist.
+        # Not held across the directory search or provisioning's own session.
+        await session.commit()
+        await _require_directory_account(
+            collab_lifecycle,
+            bridge_id=bridge_id,
+            external_user_id=payload.external_user_id,
+            username=payload.username,
+        )
+        collaboration_core = collab_lifecycle.get(bridge_id)
+        if collaboration_core is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Bridge is not running — start it before claiming an "
+                    "identity Switch has not seen yet"
+                ),
+            )
+        try:
+            external_user = await collaboration_core.ensure_external_user(
+                external_user_id=payload.external_user_id,
+                external_username=payload.username,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        session.expire_all()
+        external_user = await external_user_store.get_by_external_id(
+            session, bridge_id, payload.external_user_id
+        )
+        if external_user is None:
+            raise HTTPException(
+                status_code=500,
+                detail="Identity was provisioned but could not be read back",
+            )
+
+    claim = await external_user_store.get_claim(
+        session, external_user.id, target_user_id
+    )
+    if claim is not None and claim.verified_at is not None:
+        # Already linked and confirmed: nothing to wait for.
+        return await _identity_summary(
+            session, external_user_store, user_store, external_user, None
+        )
+
+    request = await external_user_store.request_link(
+        session, external_user, target_user_id, requested_by_user_id=caller_id
+    )
+    # Read again now the request is written: a code posted while this ran may
+    # have confirmed the link, and a request for it would wait forever.
+    claim = await external_user_store.get_claim(
+        session, external_user.id, target_user_id
+    )
+    if claim is not None and claim.verified_at is not None:
+        await external_user_store.cancel_link_request(
+            session, external_user, target_user_id
+        )
+        await session.commit()
+        return await _identity_summary(
+            session, external_user_store, user_store, external_user, None
+        )
+    code = (
+        await _issue_code(
+            session,
+            external_user_store,
+            collab_lifecycle,
+            request,
+            bridge_type=bridge_type,
+            connection_config=connection_config,
+        )
+        if target_user_id == caller_id
+        else None
+    )
+    await record_audit_event(
+        session,
+        tenant_id=external_user.tenant_id,
+        actor_user_id=caller_id,
+        action=AuditAction.BRIDGE_IDENTITY_LINK_REQUESTED,
+        target_type="external_user",
+        target_id=external_user.id,
+        details={"bridge_id": bridge_id, "user_id": target_user_id},
+    )
+    await session.commit()
+
+    return await _identity_summary(
+        session,
+        external_user_store,
+        user_store,
+        external_user,
+        LinkRequestSummary(user_id=target_user_id, code=code),
+    )
+
+
+async def _issue_code(
+    session: AsyncSession,
+    external_user_store: ExternalUserStore,
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    request: ExternalUserLinkRequest,
+    *,
+    bridge_type: str,
+    connection_config: dict[str, object],
+) -> LinkCode:
+    code, expires_at = await external_user_store.issue_link_code(session, request)
+    return LinkCode(
+        code=code,
+        expires_at=expires_at,
+        expires_in_seconds=int(LINK_CODE_TTL.total_seconds()),
+        instructions=collab_lifecycle.link_code_instructions(
+            bridge_type, connection_config, code
+        ),
+    )
+
+
+async def _identity_summary(
+    session: AsyncSession,
+    external_user_store: ExternalUserStore,
+    user_store: UserStore,
+    external_user: ExternalUser,
+    link_request: LinkRequestSummary | None,
+) -> ExternalUserSummary:
+    claims = await external_user_store.claims_for(session, [external_user.id])
+    names = await _user_names(session, user_store, claims)
+    return ExternalUserSummary(
+        id=external_user.id,
+        bridge_id=external_user.bridge_id,
+        external_user_id=external_user.external_user_id,
+        external_username=external_user.external_username,
+        claimed_by=_claimants(claims.get(external_user.id, []), names),
+        link_request=link_request,
+    )
+
+
+async def _identity_on_bridge(
+    session: AsyncSession,
+    external_user_store: ExternalUserStore,
+    bridge_id: str,
+    external_user_row_id: str,
+) -> ExternalUser:
+    external_user = await external_user_store.get(session, external_user_row_id)
+    if external_user is None or external_user.bridge_id != bridge_id:
+        raise HTTPException(status_code=404, detail="Identity not found")
+    return external_user
+
+
+async def _unlinkable_reason(
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    bridge_id: str,
+    external_user_id: str,
+) -> str | None:
+    """Why the account cannot be linked, asking the platform. Call holding no
+    connection: it may wait on the platform."""
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Bridge is not running — cannot check this account",
+        )
+    try:
+        return await adapter.account_unlinkable_reason(external_user_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+async def _refuse_unlinkable(
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    bridge_id: str,
+    external_user_id: str,
+) -> None:
+    reason = await _unlinkable_reason(collab_lifecycle, bridge_id, external_user_id)
+    if reason is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This account cannot be linked to anyone. {reason}",
+        )
+
+
+def _require_self_or_admin(
+    caller: User, is_admin: bool, user_id: str | None, doing: str
+) -> str:
+    """The Switch user a request acts for: the caller, or anyone for an
+    admin."""
+    target_user_id = user_id or caller.id
+    if target_user_id != caller.id and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only an admin may {doing} for another user",
+        )
+    return target_user_id
+
+
+@router.post("/{bridge_id}/identities/{external_user_row_id}/code")
+async def issue_identity_link_code(
+    bridge_id: str,
+    external_user_row_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    user: Annotated[User, Depends(get_current_user)],
+) -> LinkCode:
+    """A fresh code that confirms the caller's link to this account
+    (CHOO-3881), replacing any code issued before.
+
+    For a link the caller started, one an admin started for them, or one made
+    before links needed confirming, which keeps working meanwhile. Only ever
+    for the caller: the code is the Switch half of the proof.
+    """
+    caller_id = user.id
+    bridge = await bridge_store.get(session, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+    external_user = await _identity_on_bridge(
+        session, external_user_store, bridge_id, external_user_row_id
+    )
+    bridge_type, connection_config = bridge.type, bridge.connection_config or {}
+    external_account_id = external_user.external_user_id
+    # Not held across asking the platform.
+    await session.commit()
+    unlinkable = await _unlinkable_reason(
+        collab_lifecycle, bridge_id, external_account_id
+    )
+    if unlinkable is not None:
+        # A link made before links needed confirming may point at such an
+        # account. It cannot be confirmed, and must not go on counting.
+        removed = await _drop_older_link(
+            session, external_user_store, external_user, caller_id, bridge_id
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This account cannot be linked to anyone. {unlinkable}"
+                + (" Your earlier link to it has been removed." if removed else "")
+            ),
+        )
+    # Locked first, so a code posted at this moment is either redeemed before
+    # this reads the claim or waits for the new code to replace it.
+    request = await external_user_store.lock_link_request(
+        session, external_user.id, caller_id
+    )
+    claim = await external_user_store.get_claim(session, external_user.id, caller_id)
+    if claim is not None and claim.verified_at is not None:
+        raise HTTPException(
+            status_code=409, detail="This account has already confirmed the link"
+        )
+    if request is None:
+        if claim is None:
+            raise HTTPException(
+                status_code=404,
+                detail="You have not started linking this account. Link it first.",
+            )
+        request = await external_user_store.request_link(
+            session, external_user, caller_id, requested_by_user_id=caller_id
+        )
+        await record_audit_event(
+            session,
+            tenant_id=external_user.tenant_id,
+            actor_user_id=caller_id,
+            action=AuditAction.BRIDGE_IDENTITY_LINK_REQUESTED,
+            target_type="external_user",
+            target_id=external_user.id,
+            details={"bridge_id": bridge_id, "user_id": caller_id},
+        )
+    code = await _issue_code(
+        session,
+        external_user_store,
+        collab_lifecycle,
+        request,
+        bridge_type=bridge_type,
+        connection_config=connection_config,
+    )
+    await session.commit()
+    return code
+
+
+async def _drop_older_link(
+    session: AsyncSession,
+    external_user_store: ExternalUserStore,
+    external_user: ExternalUser,
+    user_id: str,
+    bridge_id: str,
+) -> bool:
+    """Remove `user_id`'s link to this account if it is one made before links
+    needed confirming, and say whether there was one."""
+    claim = await external_user_store.get_claim(session, external_user.id, user_id)
+    if claim is None or claim.verified_at is not None:
+        return False
+    try:
+        await external_user_store.release(session, external_user, user_id)
+    except NoSuchLink:
+        # Unlinked another way since it was read, which is the outcome wanted.
+        return False
+    await record_audit_event(
+        session,
+        tenant_id=external_user.tenant_id,
+        actor_user_id=user_id,
+        action=AuditAction.BRIDGE_IDENTITY_RELEASED,
+        target_type="external_user",
+        target_id=external_user.id,
+        details={"bridge_id": bridge_id, "user_id": user_id, "by": "unlinkable"},
+    )
+    await session.commit()
+    return True
+
+
+@router.post("/{bridge_id}/identities/{external_user_row_id}/verify-session")
+async def verify_identity_with_session(
+    bridge_id: str,
+    external_user_row_id: str,
+    payload: VerifyIdentitySessionRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    user: Annotated[User, Depends(get_current_user)],
+) -> ExternalUserSummary:
+    """Confirm the caller's pending link with the account's own session token.
+
+    The alternative to posting a code, for the bundled deployment's setup: it
+    holds the login of the Mattermost account it creates, but no channel has
+    an agent in it yet to hear a code. A session token is as good a proof as a
+    post, since the platform says whose it is. Mattermost only.
+    """
+    caller_id = user.id
+    external_user = await _identity_on_bridge(
+        session, external_user_store, bridge_id, external_user_row_id
+    )
+    request = await external_user_store.get_link_request(
+        session, external_user.id, caller_id
+    )
+    if request is None:
+        raise HTTPException(
+            status_code=404,
+            detail="You have no link to this account waiting to be confirmed",
+        )
+    adapter = collab_lifecycle.get_adapter(bridge_id)
+    if adapter is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Bridge is not running — cannot check this session token",
+        )
+    # Not held across the platform call.
+    await session.commit()
+    try:
+        account_id = await adapter.account_id_for_session(payload.token)
+    except NotImplementedError as e:
+        raise HTTPException(status_code=501, detail=str(e)) from e
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    if account_id != external_user.external_user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="That session token belongs to a different account",
+        )
+    # A session proves who holds the account, not that one person does: a
+    # bot's token is as good a proof as a person's, and its account is one
+    # whoever runs it posts as. Such a link can never count, so it goes.
+    unlinkable = await _unlinkable_reason(
+        collab_lifecycle, bridge_id, external_user.external_user_id
+    )
+    if unlinkable is not None:
+        try:
+            await external_user_store.cancel_link_request(
+                session, external_user, caller_id
+            )
+        except NoSuchLink:
+            pass
+        else:
+            await session.commit()
+        raise HTTPException(
+            status_code=409,
+            detail=f"This account cannot be linked to anyone. {unlinkable}",
+        )
+
+    request = await external_user_store.lock_link_request(
+        session, external_user.id, caller_id
+    )
+    if request is None:
+        raise HTTPException(
+            status_code=409, detail="The link was cancelled while it was being checked"
+        )
+    await external_user_store.confirm_link_request(session, request)
+    await record_audit_event(
+        session,
+        tenant_id=external_user.tenant_id,
+        actor_user_id=caller_id,
+        action=AuditAction.BRIDGE_IDENTITY_CLAIMED,
+        target_type="external_user",
+        target_id=external_user.id,
+        details={"bridge_id": bridge_id, "user_id": caller_id, "by": "session"},
+    )
+    await session.commit()
+    return await _identity_summary(
+        session, external_user_store, user_store, external_user, None
+    )
+
+
+@router.get("/{bridge_id}/identities/unconfirmed")
+async def list_unconfirmed_identity_links(
+    bridge_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    _admin: Annotated[User, Depends(require_tenant_admin)],
+) -> list[UnconfirmedLink]:
+    """The links on this bridge made before links needed confirming
+    (CHOO-3881), which count until their owners confirm them. What an admin
+    reads before `require_identity_confirmation` stops trusting them."""
+    if await bridge_store.get(session, bridge_id) is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+    found = await external_user_store.unconfirmed_claims(session, bridge_id)
+    claims: dict[str, list[ExternalUserClaim]] = {}
+    for external, claim in found:
+        claims.setdefault(external.id, []).append(claim)
+    names = await _user_names(session, user_store, claims)
+    return sorted(
+        (
+            UnconfirmedLink(
+                id=external.id,
+                external_user_id=external.external_user_id,
+                external_username=external.external_username,
+                user_id=claim.user_id,
+                user_name=names.get(claim.user_id) or claim.user_id,
+            )
+            for external, claim in found
+        ),
+        key=lambda link: (link.user_name.casefold(), link.external_username.casefold()),
+    )
+
+
+@router.post("/{bridge_id}/identities/require-confirmation")
+async def require_identity_confirmation(
+    bridge_id: str,
+    payload: RequireConfirmationRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    admin: Annotated[User, Depends(require_tenant_admin)],
+) -> RequireConfirmationResult:
+    """Stop trusting this bridge's links made before links needed confirming
+    (CHOO-3881), until each owner confirms theirs with a code.
+
+    Each becomes a link waiting for its account, as if its owner had just
+    started it, so it counts for nothing until then. Their owner-only agents
+    stop recognising them in the meantime, which is the point and what an
+    admin is told before running it. Only the links named are moved: the
+    ones the admin was shown, not any that appeared since. Links already
+    confirmed, and other bridges, are untouched; running it again moves
+    nothing.
+    """
+    bridge = await bridge_store.get(session, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+    moved = await external_user_store.require_confirmation(
+        session,
+        bridge_id,
+        [(link.id, link.user_id) for link in payload.links],
+        requested_by_user_id=admin.id,
+    )
+    await record_audit_event(
+        session,
+        tenant_id=bridge.tenant_id,
+        actor_user_id=admin.id,
+        action=AuditAction.BRIDGE_IDENTITY_CONFIRMATION_REQUIRED,
+        target_type="collaboration_bridge",
+        target_id=bridge_id,
+        details={"moved": len(moved)},
+    )
+    await session.commit()
+    return RequireConfirmationResult(moved=len(moved))
+
+
+@router.delete("/{bridge_id}/identities/{external_user_row_id}/request")
+async def cancel_identity_link_request(
+    bridge_id: str,
+    external_user_row_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+    user_id: str | None = None,
+) -> ExternalUserSummary:
+    """Stop waiting for the account to confirm a link (CHOO-3881) — your own,
+    or someone else's if you are an admin.
+
+    Never touches a claim: walking away from confirming a link made before
+    links needed confirming leaves that link working. Unlinking is
+    `release_bridge_identity`.
+    """
+    external_user = await _identity_on_bridge(
+        session, external_user_store, bridge_id, external_user_row_id
+    )
+    target_user_id = _require_self_or_admin(
+        user, is_admin, user_id, "cancel a link to a messaging identity"
+    )
+    try:
+        await external_user_store.cancel_link_request(
+            session, external_user, target_user_id
+        )
+    except NoSuchLink as e:
+        raise HTTPException(
+            status_code=404,
+            detail="That user has no link to this account waiting to be confirmed",
+        ) from e
+    await record_audit_event(
+        session,
+        tenant_id=external_user.tenant_id,
+        actor_user_id=user.id,
+        action=AuditAction.BRIDGE_IDENTITY_LINK_CANCELLED,
+        target_type="external_user",
+        target_id=external_user.id,
+        details={"bridge_id": bridge_id, "user_id": target_user_id},
+    )
+    await session.commit()
+    return await _identity_summary(
+        session, external_user_store, user_store, external_user, None
+    )
+
+
+@router.delete("/{bridge_id}/identities/{external_user_row_id}")
+async def release_bridge_identity(
+    bridge_id: str,
+    external_user_row_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    external_user_store: Annotated[ExternalUserStore, Depends(get_external_user_store)],
+    user_store: Annotated[UserStore, Depends(get_user_store)],
+    user: Annotated[User, Depends(get_current_user)],
+    is_admin: Annotated[bool, Depends(get_tenant_is_admin)],
+    user_id: str | None = None,
+) -> ExternalUserSummary:
+    """Drop a claim on a platform account, and any link to it still waiting to
+    be confirmed — your own, or someone else's if you are an admin. Anyone
+    else's claim on the same account is left standing."""
+    external_user = await _identity_on_bridge(
+        session, external_user_store, bridge_id, external_user_row_id
+    )
+    target_user_id = _require_self_or_admin(
+        user, is_admin, user_id, "release a messaging identity"
+    )
+
+    try:
+        released = await external_user_store.release(
+            session, external_user, target_user_id
+        )
+    except NoSuchLink as e:
+        # Deleting nothing and reporting success would make a mistyped user id
+        # look like an unlink that worked.
+        raise HTTPException(
+            status_code=404,
+            detail="That user has no link to this messaging account",
+        ) from e
+    await record_audit_event(
+        session,
+        tenant_id=external_user.tenant_id,
+        actor_user_id=user.id,
+        # A link that never counted was cancelled, not released.
+        action=(
+            AuditAction.BRIDGE_IDENTITY_RELEASED
+            if released.claim
+            else AuditAction.BRIDGE_IDENTITY_LINK_CANCELLED
+        ),
+        target_type="external_user",
+        target_id=external_user.id,
+        details={"bridge_id": bridge_id, "user_id": target_user_id},
+    )
+    await session.commit()
+    return await _identity_summary(
+        session, external_user_store, user_store, external_user, None
+    )
+
+
+@router.delete("/{bridge_id}")
+async def delete_bridge(
+    bridge_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    bridge_store: Annotated[CollaborationBridgeStore, Depends(get_bridge_store)],
+    room_store: Annotated[RoomStore, Depends(get_room_store)],
+    room_service: Annotated[RoomService, Depends(get_room_service)],
+    install_store: Annotated[MessagingInstallStore, Depends(get_install_store)],
+    collab_lifecycle: Annotated[
+        CollaborationBridgeLifecycleService, Depends(get_collab_lifecycle)
+    ],
+    # Admin-only: deleting a bridge cascades into deleting every room on it, so
+    # this is the most destructive operation on the router.
+    user: Annotated[User, Depends(require_tenant_admin)],
+) -> dict[str, bool]:
+    bridge = await bridge_store.get(session, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="Bridge not found")
+
+    # Before a single room is deleted, because the rooms do not come back. A
+    # bridge built by an install holds a token this deployment did not issue
+    # and the platform still honours, and the install row's pointer at it is a
+    # real foreign key — so this delete would destroy every room on the bridge
+    # and *then* be refused by Postgres, leaving the bridge running, the rooms
+    # gone and a live credential nobody has revoked.
+    installs = await install_store.list_for_bridge(session, bridge_id=bridge_id)
+    if installs:
+        raise HTTPException(status_code=409, detail=_installed_refusal(installs))
+
+    rooms = await room_store.get_by_bridge(session, bridge_id)
+    tenant_id = bridge.tenant_id
+    details = {
+        "type": bridge.type,
+        "display_name": bridge.display_name,
+        "rooms_deleted": len(rooms),
+    }
+    # Not held across the deletes, which open their own sessions and call Matrix.
+    await session.commit()
+    # The channels stay: the bot may already have lost its access to them.
+    for room in rooms:
+        await room_service.delete_room(room.id, retire_channel=False)
+
+    await collab_lifecycle.remove(bridge_id)
+    await record_audit_event(
+        session,
+        tenant_id=tenant_id,
+        actor_user_id=user.id,
+        action=AuditAction.BRIDGE_DELETED,
+        target_type="collaboration_bridge",
+        target_id=bridge_id,
+        details=details,
+    )
+    await session.commit()
+    return {"ok": True}

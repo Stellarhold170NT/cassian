@@ -1,0 +1,34 @@
+# Documentation
+
+Two sets of documents, with different owners and different audiences.
+
+## `official/`
+
+The reader-facing Switch documentation, published at
+[docs.switchagents.ai](https://docs.switchagents.ai). It is written in
+[`sandbox-quantum/docs`](https://github.com/sandbox-quantum/docs) as Mintlify MDX
+and converted to Markdown here so that agents working in this repository can read
+what users are told.
+
+**Generated — do not edit.** Change the source pages in the docs repository, then
+run `just sync-docs`. Every file under `official/` is rewritten on each run, so
+an edit made here is lost without warning. Start at
+[`official/TOC.md`](official/TOC.md), which lists the pages in the order the
+site presents them.
+
+## `old/`
+
+Design and operator material written for this repository: the architecture
+overview, the agent protocol, per-bridge setup guides, gateway OIDC sign-in
+setup, the multi-tenancy design and its phased plan, and running Switch
+locally for development. None of it is published,
+and none of it is covered by the pages under `official/` — where the two
+describe the same thing, this is the deeper account and the published page is
+the one users act on.
+
+## Reference pages at this level
+
+- [`TEMPLATES.md`](TEMPLATES.md): the template language, the one YAML
+  document that describes agents and rooms to create and the params a
+  deployer fills in. The bundled Switch expert (`switch-expert/template.yaml`)
+  is the worked example.

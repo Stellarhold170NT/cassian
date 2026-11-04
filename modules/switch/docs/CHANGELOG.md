@@ -1,0 +1,5485 @@
+# Changelog
+
+All notable changes to Switch are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project aims to adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Switch ships several independently-versioned artifacts, each with its own
+section below. Every artifact carries three-part semver (`MAJOR.MINOR.PATCH`)
+and a changelog, without exception.
+
+A version says **where an artifact is** — which release you are running. It says
+nothing about what that release can talk to. Compatibility is carried separately
+by the contract revisions in [`artifacts.yaml`](artifacts.yaml), which move
+independently: a release that changes nothing on the wire bumps its version and
+leaves its contracts alone.
+
+- **switch-core** — the backend service (`core/`). Released by tagging
+  `switch-v<version>`; the version lives in `core/pyproject.toml`. See
+  [RELEASING.md](RELEASING.md).
+- **switch-console** — the desktop app (`dash/`). Released by tagging
+  `switch-console-v<version>`; the version lives in
+  `dash/apps/switch-console-desktop/package.json`.
+- **agent-runtime** — the Switch protocol client and MCP runtime
+  (`dash/packages/switch-agent-runtime/`), published to a package registry.
+- **sidecar** — the remote runtime Switch Console deploys to an agent host
+  (`dash/apps/switch-console-desktop/src/sidecar/`). Versioned in
+  `sidecar-version.ts` and deployed by Switch Console, not published separately.
+- **switch-connector** / **switch-connector-codex** / **switch-connector-opencode**
+  — the three connectors (`connectors/`), versioned in their respective
+  manifests. The first two are installed from the plugin marketplace; the
+  OpenCode one is written by Switch Console, which has no marketplace to install
+  from, so its version identifies the source rather than an install.
+
+Three things are **not** separately versioned, and ship under the switch-core
+release so a single tag pins the whole stack: the **operator dashboard**
+(`gateway/`), the **Helm chart**, and the **standalone compose artifact**. Their
+versions are stamped at package time from the switch-core version; do not add a
+version of their own to them without also giving them a release of their own.
+
+---
+
+## switch-core
+
+### [Unreleased]
+
+#### Security
+- **A refused request is no longer repeated back.** When the gateway or the
+  agent API refused a request as invalid, the 422 repeated what was sent: a
+  password too short to accept, or the whole body, password included, when
+  another field was missing. Registering or editing a Slack, Discord or Teams
+  connection with a config that did not fit quoted part of its bot token or
+  secret, and on an edit that could be the stored token, which nothing else
+  returns. Anything that records error responses (APM, proxies, browser HAR
+  captures) could end up holding passwords and tokens. Each error now says
+  only where and what is wrong (`type`, `loc` and `msg`), and the agent API no
+  longer writes the request body to its log. A script that read `input` or
+  `ctx` from a 422 will find them gone. A validation rule that raised its own
+  error on the agent API now answers 422 rather than 500.
+- **Agents are no longer handed a key that never expires.** Datadog connects
+  with an API key and an application key that do not expire and that only
+  Datadog can revoke, and an agent granted Datadog was handed both. Switch now
+  refuses: Datadog can no longer be connected or granted, and an agent with an
+  existing Datadog grant is told why when it asks. A Datadog connection made
+  before can still be disconnected; revoke the keys in Datadog if they were
+  ever granted to an agent.
+- **Service connections start off in a new workspace.** A workspace created
+  from now on has every service connection switched off until a workspace
+  admin switches each on under Connectors. Workspaces that already had members
+  keep every service on by default, as before, along with every switch an
+  admin already set.
+- **A Google Workspace token is never handed out with more than an hour
+  left,** and one Google issues for longer is refused.
+- **Withdrawing access says what it could not take back.** Removing a grant,
+  disconnecting, or switching a service off for the workspace cannot revoke an
+  Atlassian or Google Workspace token already given to an agent, since that
+  token is the owner's own. The change now marks those tokens withdrawn and
+  its warning names the service and the time until which they may keep
+  working: up to an hour for Google Workspace, and up to eight hours for
+  Atlassian, whose tokens cannot be asked for shorter.
+- **A template's room params name only rooms its runner can see.** A room
+  param checked its value against every room on the server, and `$first` or
+  a list of candidates could settle on someone else's private room. That told
+  the runner the room existed and could write its name into their new room.
+  Now a room the runner cannot read reads as missing.
+
+#### Added
+- **An agent controller can send its agents' operations on its socket.**
+  Every operation a controller's agents call was an HTTP request of its own,
+  parsed, routed and authenticated with the controller's token, though the
+  controller already holds an authenticated WebSocket to the server. The
+  socket now takes them as `call` frames and answers each with a
+  `call.result` frame carrying the status and body the HTTP route
+  (`POST /agents/{id}/ops/{operation}`) would have answered with. A call is
+  authorized as that request is: the controller checked against its row, and
+  the agent's binding to it. The socket's first frame offers calls
+  (`calls.max_in_flight`, 64); a call over that is answered 429
+  `capacity_exceeded` without running, so the controller sends it over HTTP.
+- **A reconnect storm is paced instead of taking the pool.** When a pod goes
+  away, every agent and controller it held opens a connection on the pods
+  left within seconds. On staging (two pods, 1,000 agents, one pod deleted)
+  those opens took the whole database pool: requests and the process lease
+  timed out with them, and the surviving pod dropped agents of its own. Each
+  process now opens at most `AGENT_OPEN_LIMIT` (8) agent and controller
+  connections at once. An open that finds no slot within 2 s, which keeps it
+  well inside the timeout of the proxy in front, is refused before
+  authentication with 503 and `retry_after_s`, its place in the line at the
+  pace opens are taking in that process, so the storm comes back as a queue
+  spread over what the process can take. A caller that comes back early keeps
+  its time. `switch.agent.opens_deferred` counts the refusals, by route.
+- **The Helm chart can put switch-core on chosen nodes.**
+  `switchCore.nodeSelector` and `switchCore.tolerations` go onto the
+  switch-core pods as written, so they can run on a node group of their own,
+  such as one kept for load tests. Both are empty by default, which places the
+  pods as before.
+- **Organizations set up their own connector apps and switch services for
+  their workspaces, behind `organization_connector_apps`, off by default.**
+  With the flag on (and `service_connections`), the dashboard's Organization
+  page gains two sections for organization admins:
+  - **Connectors.** An organization saves its own GitHub App, Google client
+    or Airtable integration, checked with the vendor as the operator's are.
+    Every workspace in the organization then signs in, is issued and is
+    refreshed through it rather than the server's. An organization's app
+    that stops working makes the service unavailable in its workspaces,
+    with the reason, and never falls back to the server's. A workspace's
+    service listing says whose app it goes through (`app_source`).
+  - **Services.** An organization switches each service on or off for its
+    workspaces. Unlocked, its setting applies where a workspace admin hasn't
+    set the service themselves; locked, it applies everywhere and workspace
+    admins can't change it. Wherever a change leaves a service off, the
+    tokens issued for it there are revoked; any a change could not reach,
+    the periodic token upkeep revokes within five minutes. A workspace admin can drop their
+    own switch (`DELETE /gateway/workspace/services/{service}`) to take the
+    organization's setting.
+
+  Every change is recorded in the organization's audit log. The platform
+  operator has no say in an organization's apps or services unless they are
+  one of its admins. With the flag off, nothing changes: the routes aren't
+  mounted and no workspace consults its organization. The migration adds
+  two empty tables either way.
+- **The `[CONN]` log lines say when a client fell back to the event stream.**
+  `/events` takes optional `fallback` and `fallback_close_code` parameters,
+  and the `[CONN] opened` and `[CONN] reattached` lines end with
+  `fallback=<reason>:<close code>` only when they are present, so a new agent
+  runtime whose WebSocket never opened is told apart from a client built
+  before the socket. Unknown reasons log as `other` and anything but a short
+  numeric close code is dropped.
+- **Templates carry packages.** A room in a template takes `packages:`, a list
+  of packages that already exist, by `id` or by `name`, attached when the room
+  is created. The person running the template must be able to attach each one
+  by hand; a package that is missing, ambiguous or not theirs stops the run
+  before the room exists. A template never creates or changes a package.
+  Capturing a room (`GET /rooms/{id}/yaml`) now lists its packages by `id`,
+  so a room built again from its capture gets them back (#910).
+- **An agent can read its own addressing policy.** `get_agent_detail` now
+  returns `addressing`: the kind of policy (`owner_only`,
+  `owner_and_owner_agents`, `anyone` or `custom`) and, when an agent looks
+  itself up, its rules with the people, agents and rooms they name. So an
+  agent can tell someone who may answer its questions and approvals instead
+  of guessing. Another agent sees only the kind.
+- **Console hears when your managed agents or machines change.** A signed-in
+  user's Console opens one WebSocket per workspace (`/gateway/changes/ws`), and
+  switch-core tells it when one of their managed agents or machines changed, so
+  Console reads it again instead of polling. A notice names a kind and an id
+  and carries nothing else. Notices travel between replicas on the signal bus,
+  so a change made through one pod reaches a Console connected to another
+  (#717).
+- **The Airtable connection.** A person connects Airtable from Switch Console,
+  choosing at Airtable's consent screen which bases and workspaces to share,
+  and a granted agent reads and updates records and comments in them, as that
+  person, through Airtable's MCP server. Each server's operator registers and
+  publishes an Airtable OAuth integration and saves it under Connector apps,
+  or names it in `AIRTABLE_CLIENT_CONFIG_PATH` (Helm:
+  `switchCore.airtableClientSecret`); see `docs/old/airtable-setup.md`.
+  Without it, Airtable is listed as not set up. Like Google Workspace, it
+  needs `GATEWAY_PUBLIC_URL`: Airtable sends people back to the server's own
+  callback. On a server without one, both are listed as unavailable
+  (`needs_public_url`), saying why, rather than failing when someone
+  connects.
+  Airtable offers no read-only sign-in, so every connection can write;
+  changing tables and fields is not asked for, and Airtable refuses it.
+  Airtable cannot revoke a sign-in, and an integration reaches the bases of
+  every grant a person gave it, so a sign-in Switch stops using still works
+  and widens their next connection. Disconnecting or reconnecting says so and
+  where in Airtable to remove it, as any OAuth service without revocation now
+  does rather than reporting a failed revoke.
+- **Connector apps set up Airtable.** An app's entry in `GET /connector-apps`
+  gains `redirect_uris` (every address to register), `needs_public_url` and
+  `scopes`. The dashboard's Connectors page walks Airtable's Builder Hub, with
+  its redirect URL to copy and the scopes to tick, and saves only once the
+  operator confirms the integration's support details are set: no check can
+  see whether it is published, so a passing one says so. Saving an app
+  answers with its checks too, so the page can show them. A passing Google
+  Workspace check now says it can't see the redirect URI either: Google
+  compares it only when someone signs in.
+
+#### Changed
+- **Workspaces belong to organizations. Upgrade by replacing every pod, and
+  downgrade the database before rolling back.** Every existing workspace gets
+  an organization of its own, and its owners become the organization's admins.
+  An organization admin administers every workspace in it without being added
+  to each. A release from before organizations doesn't know about organization
+  admins: if old and new pods serve together during a rolling update, or after
+  a rollback that keeps the new database, an owner removed from a workspace by
+  an old pod is still the organization's admin and can come back into it. So
+  for this release, replace every switch-core pod at once rather than rolling
+  them, and to roll back, first downgrade the database to the revision before
+  `238c68b7306e` (`alembic downgrade 238c68b7306e-1`), then start the older
+  release.
+- **Messages no longer queue for the database's NOTIFY lock.** Postgres
+  lets one transaction that sends a `NOTIFY` commit at a time, and the
+  triggers on `messages` and `agent_events` sent one from every message's
+  transaction, so the whole deployment stopped near 300 messages a second
+  however many pods or vCPUs it had. The router now writes without them and
+  announces its rows once they have committed, through one announcer per
+  process that sends everything queued since its last send in a single
+  transaction (`announcer.py`). Same channels and payloads, so pods of the
+  previous release and this one hear each other during a rolling update; the
+  migration is expand only. A reader re-checks its rooms, and the agent
+  event listener forgets the heads it was told, every 20 to 30 seconds, so an
+  announcement lost with a process that died right after its commit costs a
+  delay, not a message. Signals go through the same announcer.
+- **The statements every message write costs run on asyncpg directly.**
+  Taking the room's lock, reading its head, storing the agents' own events
+  and reading the room's agent members again under the lock go straight to
+  asyncpg on the transaction's connection (`db/raw.py`), as the delivery
+  reads do, rather than through SQLAlchemy's execution.
+- **The two reads behind every delivery run on asyncpg directly.** A
+  stream reads an agent's events, and counts its unread messages, for every
+  event it delivers, and under load SQLAlchemy's work around each statement
+  cost more than Postgres took to run it. `db/raw.py` runs a statement
+  SQLAlchemy compiled once on the session's own asyncpg connection, in its
+  transaction and under its tenant, with SQLAlchemy's type conversions and
+  timed into `db.query.duration` as every other statement is.
+- **Pods start in seconds again with many rooms.** Every process checks at
+  startup that each room has its clients, under a lock that lets one
+  process at a time through, and read each room on its own to do it. With
+  tens of thousands of rooms that took about 100 seconds, so processes
+  starting together were restarted while they waited. Rooms are now read a
+  thousand at a time.
+- **Idle agents behind a controller cost the database far less.** A
+  controller stream's pass, including the one after every idle interval,
+  read each of its agents' events in a session of its own; it now reads all
+  their heads in one query and reads only the agents with something new. And
+  each process's 30-second re-check of controllers held by another process
+  read every agent's rooms with a query of its own, which grew with
+  processes times agents; it is now one query per controller.
+- **A delivery to an agent behind a controller takes two database
+  transactions instead of four.** The controller's stream read the heads of
+  all its agents to find the work, again after delivering, and again before
+  waiting. It now reads them once a pass, and an event that arrives after
+  that read wakes the stream for the next pass.
+- **A controller keeps its socket when a delivery pass cannot get a
+  database connection.** When a pod was too busy to hand its streams a
+  connection within the pool timeout, the controller's stream ended and its
+  socket closed, and every agent on it reconnected, which needs more of
+  what was short. The pass is now tried again after a short wait, doubling
+  to 5 seconds, and the socket closes only if it is still failing after a
+  minute.
+- **Switch's own reader is woken only by commands.** The process that holds
+  a workspace's admin client read every row of every room to find the
+  `!command` rows it answers. A new row's announcement now names its type,
+  and that reader is woken for command rows only and reads only those, from
+  a partial index on them. Its warnings for tags nobody can answer are
+  already posted by the process that writes the message.
+- **The heads-up for tagging an agent that isn't in the room comes from the
+  process that wrote the message, and costs nothing when every name tagged
+  is one of the room's agents.** The admin's consumer, which reads every
+  message in a workspace on one process, checked each message with an `@`:
+  two database sessions and a lookup for every name tagged. Under load that
+  one process fell behind the rest. The check now runs once a message has
+  committed, on whichever process wrote it, and only when the message tags
+  a name that is none of the room's agents (a role, a person, an agent not
+  in the room). The warnings read as before.
+- **The server spends less CPU on its event loop and on finding the agent
+  sending a message.** It now runs on uvloop wherever uvloop is installed,
+  which is every platform but Windows. Finding the actor of the agent
+  sending a message no longer looks through every client's actor, and
+  compiled mention patterns are kept per name. In a CPU profile under
+  message load the event loop's own work was about 15% of a pod's CPU and
+  the actor lookup about 3%.
+- **Creating a room or an agent no longer looks through every running
+  client.** Every process keeps an actor for every client, and finding a
+  workspace's admin, or the actor of an agent registered in another process
+  a moment before, read all of them. Each is now found from an index of the
+  running clients by type and by agent. While 10,000 agents were being
+  created, these lookups took about 11% of a process's CPU in a profile.
+- **Each database transaction costs the server a little less.** Binding the
+  workspace to a transaction built and compiled the same statement every
+  time; it is now sent to the driver as it is. And timing who holds a pooled
+  connection worked out the borrower's name and a short stack on every
+  checkout; the name is now kept per function, and the stack is written out
+  only for a hold long enough to log.
+- **Usage analytics read the database far less per message in a large
+  workspace.** With usage reporting on, each message looked up its room's
+  platform and member counts, its sender and the agent's runtime, each kept
+  for five minutes in caches of at most 10,000 entries. Quiet rooms missed
+  every time, and with thousands of agents the caches evicted what they were
+  about to be asked again. A room's facts are now kept for fifteen minutes,
+  a sender and an agent's runtime, which do not change, for an hour, and up
+  to 50,000 of each.
+- **A post's first checks are kept until a signal says they changed.**
+  Every post checks that its agent is in the room and that no budget
+  covering it has run out, and a controller relaying it checks the
+  membership again: two transactions per post. Each process now keeps those
+  answers as it keeps a controller token's rows. Triggers on `room_agents`,
+  `rooms` and `usage_budgets` signal every change, so an answer is kept while
+  the signal connection listens and for `AGENT_AUTH_CACHE_TTL_SECONDS`
+  otherwise. A refusal is never kept. `ROOM_ACCESS_CACHE_MAX_ENTRIES`
+  (20,000) bounds what is kept.
+- **An agent's stream reads in one database session per pass, and pooled
+  connections are no longer pinged before use.** A pass that delivered a
+  message opened a session for each of its reads, six pool checkouts and six
+  transactions, and the pre-ping added a transaction to every checkout. The
+  reads of a pass now share one session, for an agent on its own socket and
+  for each agent an agent controller serves. `DB_POOL_PRE_PING` now defaults
+  to `false`: after a database restart the first query on each pod fails, along
+  with any query running at the time, and the pool then replaces every
+  connection it held. Set it to `true` behind
+  anything that drops idle connections. In a load test of 300 agents at 10
+  messages a second on 2 pods, CPU per message fell by a quarter and database
+  transactions per message by more than two thirds. At most half of a pod's
+  pool goes to streams' passes at once, so requests still get a connection
+  when the pod's CPU is saturated.
+- **A cloud machine can move to another instance type and keep its disk.**
+  The hosted controller now launches every new instance of a machine as the
+  instance type in its `gateway.json`, at the same moment it already moves the
+  machine onto the configured image, and `upgrade --gateway-config` moves a
+  stopped machine onto both. Changing `instance_type` therefore resizes
+  existing machines as well as new ones; a machine that only stops and starts
+  keeps its instance and type. `allowed_instance_types` is no longer bound to
+  the controller's state database, so it can change while machines exist, and
+  `status` and `list` report `instance_type_allowed` for each machine. A
+  database bound before this release is accepted and rebound on first start,
+  as long as `allowed_instance_types` has not changed in the same deploy.
+- **The Helm chart runs switch-core as a ServiceAccount of its own.**
+  It is `<release>-switch-core` (`switchCore.serviceAccount`) where it used to be
+  the namespace's `default`, which every pod that names no account shares, so
+  anything trusting switch-core's identity, such as the distributed Teams app's
+  federated credential, trusts switch-core alone. `create: false` with a `name`
+  runs it as an account made elsewhere. A Teams app whose federated
+  credential trusts `default` stops getting tokens after this upgrade: add a
+  credential for `system:serviceaccount:<namespace>:<release>-switch-core`
+  first, and remove the old one once the new pod is up.
+- **Agents and controllers are pinged every 10 seconds instead of every 2.**
+  A connection is now declared dead after 30 seconds without a beat, up from
+  6, so a client that goes away holds its room slot and shows online for up to
+  30 seconds. The interval is advertised on every open, so clients follow it
+  without an update. The agent auth cache now gives each entry a random 80 to
+  120% of `AGENT_AUTH_CACHE_TTL_SECONDS`, so entries filled together after a
+  restart do not all expire together, and that setting must stay below 25
+  seconds (the 30 second heartbeat TTL, less the jitter) or startup refuses it.
+- **Following the conversation is described the same way everywhere, and the
+  chart can turn it on.** The feature added in 0.31.0 is off unless
+  `follow_the_conversation` is among the enabled feature flags
+  (`FEATURE_FLAGS_ENABLED`, or `switchCore.featureFlags.enabled` in the Helm
+  chart). The Switch skill and the agent runtime's instructions no longer tell
+  agents that a message without their name can never reach them: a person's
+  follow-up can, while other agents' chatter still does not. The chart lists
+  the flag and, while it is on, sets `FOLLOW_THE_CONVERSATION_WINDOW_SECONDS`
+  from `switchCore.followTheConversation.windowSeconds` (default 300).
+- **Agents name room groups by path.** `create_room` and `create_room_group`
+  take a group as a path such as `Fraud/Incidents` (the top-level group, then
+  each child), so two groups called `Incidents` under different parents no
+  longer break every agent request that names one. A bare name still works
+  when only one group has it; when several do, the error lists each match by
+  its path so the agent can retry with the right one, and an unknown path
+  names the first part that was not found. A group id is accepted too.
+- **Room group names are unique among siblings.** Creating, renaming or moving
+  a group next to one with the same name (ignoring case) is refused with an
+  error naming the existing group, from the dashboard, the API and agents
+  alike. The same name under different parents is still fine. Deleting a
+  group whose subgroup would move up next to a namesake is refused too, and
+  the dashboard now shows why. Names can no longer contain `/` or be blank.
+  Existing duplicates are left as they are and can be reached by id.
+- **Delivering an event to an agent behind a controller no longer reads the
+  agent's head first.** The notification of a new agent event already carries
+  its number, and the controller's stream now keeps it as the agent's head, so
+  a delivery costs the agent's own read alone, where it read the heads of all
+  the controller's agents first. The heads are still read after each idle
+  interval, when an agent is attached, and after the listener reconnects.
+- **Delivering an event to an agent costs three statements, where it cost
+  seven.** The rooms dropped after the agent's cursor are read with its
+  events, and the unread count reads the agent's baseline, the room's window
+  and the agent's user id in the statement that counts.
+- **Writing a message no longer costs four statements for each agent it is
+  for.** The agents' own events are stored together, in two statements and
+  one savepoint, where each agent's event took a savepoint, a numbering, an
+  insert and a release of its own.
+- **A controller's stream waits on three events, where it waited on one per
+  agent and two more.** Every attached agent's doorbell now rings the stream's
+  one bell.
+- **Reading an agent's own events no longer builds its query each time.**
+  Each shape of the read is built once and run with bind parameters.
+- **A message addressed to a connected agent no longer reads the agent's
+  membership after it commits.** That read stops an agent removed from the
+  room in the meantime from saying anything there, and a connected agent has
+  nothing to say about a message addressed to it, so the read is now made only
+  before a refusal or an offline notice is posted, or a machine woken.
+- **Message telemetry reads a workspace's rooms, clients and agents at once.**
+  The first lookup that misses reads all of them, where each room, sender and
+  agent was read on its own, so in a large workspace most messages no longer
+  cost a lookup.
+- **Registering, renaming or deleting an agent no longer makes every process
+  read every client and agent.** The change now names the clients it touched,
+  and each process reads only those, where it read every client of the
+  workspace and, with a messaging app connected, every agent as well. The
+  30-second re-check reads every client only when a fingerprint of the
+  workspace's clients and agents has changed since its last full read, where
+  it read them all every time.
+- **The 30-second re-check of which controller runs each agent reads one
+  query, and nothing when no placement changed.** Every process read every
+  placed agent's definition, document included, then each controller with a
+  query of its own. It now reads the columns a binding is made of in one
+  query per workspace, and only when a fingerprint of the placements has
+  changed since its last full read.
+- **The 30-second re-check of who holds each controller's socket no longer
+  reads every controller each time.** It compares a fingerprint of their
+  connections and of the live processes first, and when it reads, reads only
+  the connection columns, where it read every row with its status and
+  platform, and the rooms of every agent on a controller another process held.
+- **Writing to a room for the first time through a process no longer reads the
+  room.** A process's clients now share the room ids they look up, where each
+  kept its own, and the first one a process misses reads every open room of
+  the workspace at once, so with many agents behind a load balancer most sends
+  no longer start with a read of the room.
+- **Checking a message against Switch Trust no longer reads its settings each
+  time.** Each process keeps the settings it read until they change: saving or
+  clearing them in the gateway tells every process, so a change still takes
+  effect on the next message. Settings are read again after 30 seconds at most,
+  for a change whose signal was lost.
+- **Reading an agent's budget standings no longer builds their query each
+  time.** The standings are read twice for every message an agent posts, and
+  building the query cost more than running it; it is now built once.
+- **Reading a room's context costs one transaction.** The room's newest
+  message number, the membership check and the history read share one
+  session, where each opened its own.
+- **A controller's requests no longer read its row and its agent's row each
+  time.** They were kept for 5 seconds, and a controller's requests, spread
+  over several processes, rarely came back to one within that. They are now
+  kept until a signal says they changed, which triggers on `agents` and
+  `agent_controllers` send, and a miss reads all of the controller's agents
+  at once. `CONTROLLER_AUTH_CACHE_MAX_AGENTS` (20,000) bounds the agent rows
+  kept.
+- **Reading an agent's rooms uses an index.** `room_agents` is indexed on
+  `agent_id`; reads by agent scanned the whole table, 2.9 ms each at 10,000
+  agents.
+- **Recording a message's usage builds its statement once.** The insert was
+  built for every message an agent sent; it is built once and run with bind
+  parameters.
+- **A controller's access token is verified once.** Each process keeps the
+  tokens that verified until they expire, where every request verified its
+  token again; revocation is still checked on every request.
+
+#### Fixed
+- **A client in more than 32,767 rooms starts reading them.** The reads a
+  client makes as it starts matched its rooms with one parameter each, and
+  Postgres takes at most 32,767 per statement. Switch's own client is in
+  every room of its workspace, archived ones included, so past that many it
+  failed to start, retried, and failed again while the process ran, taking
+  up rooms one at a time in between. The rooms now go as one array.
+- **On Slack, the 👀 and the activity card no longer arrive after the agent's
+  reply.** Every running turn's card was redrawn every 5 seconds to tick its
+  clock. Slack closes a streamed card after 10 minutes, so on a longer turn
+  each tick was a full message edit, and Slack allows about 50 of those a
+  minute for the whole workspace. A few long turns used that up, Slack made the
+  bridge wait, and new turns' cards and 👀 waited behind the clock redraws. The
+  clock now moves once a minute, and a running card shows whole minutes
+  ("Working… 3m"). Clock redraws stop while Slack is making the bridge wait,
+  and new turns go ahead of them. The 👀 goes on as soon as a turn starts
+  rather than once its card has posted. A card is redrawn as soon as Slack
+  closes its stream, instead of showing still-running steps as failed until
+  the next change. A turn whose first draw into its stream fails keeps that
+  card rather than posting a second one under it.
+- **An agent is told why a machine's CLI cannot be used.** When
+  `create_agent` or `update_agent_detail` was refused because a provider was
+  not logged in, it said the owner needed to log in, even when the machine had
+  reported a login its agents could not use, which logging in does not fix
+  (a Codex login in the OS keyring, say). The refusal now gives what the
+  machine said instead, and `list_machines` shows it as each provider's
+  `problem`.
+- **A Teams app on a federated credential can deploy from the Helm chart.**
+  switch-core's migrate init container and the pre-upgrade migration Job were
+  given the Teams app's settings but not its projected token, so
+  `TEAMS_APP_FEDERATED_TOKEN_FILE` named a missing file and both refused to
+  load their configuration: with `switchCore.teamsApp.credential: federated`,
+  no release could migrate or start. The two that migrate are no longer given
+  the Teams app at all.
+- **The agent HTTP API answers a refused or malformed request with a 4xx, not
+  a 500.** Inviting an agent to a room the caller may not change answered 500
+  instead of 403, and so did looking up a room the agent is not in. A room
+  history request whose `since` or `before` is not an ISO 8601 timestamp
+  answered 500 instead of 400; it now says which parameter was wrong, and so
+  does `read_context` (#1045). One whose offset moves it outside the years 1
+  to 9999 in UTC is refused the same way instead of answering 404, and a time
+  in the last millisecond of 9999 is no longer refused at all.
+- **Creating a user refuses a role the server does not understand.** An
+  account is a user or an admin, and only the exact role `admin` grants
+  operator rights. `POST /users` accepted any role string, so `Admin` or
+  `owner` created an account that was shown with that role, was stored with
+  it, and had no operator rights. Anything other than `user` or `admin` is now
+  a 422 and creates nothing. The Add User dialog offers only those two, so
+  only scripts calling the API were affected. Accounts already stored with
+  another role are left as they are, still listed with that role and still
+  treated as ordinary users; `SELECT id, email, role FROM users WHERE role
+  NOT IN ('user', 'admin')` finds them.
+- **Every way of setting a password now applies the same rules.** Signup
+  already required 8 characters and at most 72 bytes. Changing your own
+  password checked only the 8 characters, and an admin creating a user checked
+  nothing, so a short or empty password went through, and a long passphrase
+  was saved as just its first 72 bytes, the most bcrypt reads. Both now refuse
+  what signup refuses, saying why. Creating a user also trims, lowercases and
+  checks the email the way signup does, so the same address with a stray
+  space no longer makes a second account, and an address with no dot in its
+  domain is refused. A script that creates users through `POST /users` gets a
+  422 for either. Passwords already saved still work (#1035).
+- **Full garbage collections no longer stall the server for hundreds of
+  milliseconds.** Once boot has built what lasts for the life of the process
+  (modules, the ORM's mappers, the app's routes), the server freezes it out of
+  garbage collection, so a full pass walks only what was made since. The
+  clients and bridges started after that stay collectable, since replicas hand
+  them to one another. The dashboard's pause chart now shows the average pause
+  next to p99, as Datadog keeps the average for longer.
+- **Agents no longer read offline while their replica shuts down.** With several
+  replicas, a stopping replica released its lease before its 5 s drain, so for
+  up to about 6 s the other replicas counted its connected agents as gone: `@role`
+  mentions did not reach the holder, rooms got false "offline" notices, and stop
+  and reset commands were refused. It now drains first and closes its sockets
+  as it releases.
+- **A request card posted in a thread now mentions the person who can answer
+  it.** Approval and question cards go into the thread of the turn that raised
+  them, and on Slack they used to mention nobody there, so an owner who was not
+  in the thread was never told and the agent waited. A card in a thread now
+  mentions the person who asked when the agent's addressing policy lets them
+  answer, otherwise the agent's owner if they may answer, otherwise nobody.
+  It never mentions more than one person, even when the policy lets anyone
+  answer. Cards at the top of a channel mention whoever asked, as before.
+- **`!list-references` and `!list-documents` include what packages bring.**
+  They listed only what was attached to the room directly, so a room whose
+  references all came from a package answered "No references in this room."
+  while its agents were sent them. Items from attached packages now follow
+  the direct ones, each marked with the package it comes from (for example
+  `(github, via Payments service context)`); an item attached both ways is
+  listed once, as direct (#911).
+- **The template guide agents read now covers a room's `roles:`,
+  `references:` and `docs:`.** All three already worked in a room resource
+  and appear when a room is captured, but the guide stopped at `aliases:`, so
+  an agent writing a template did not know they existed or what shape they
+  take. It now gives each one's fields, a sentence on what it does, and a
+  short example.
+- **switch-buddy no longer says the Mattermost switch waits for a server
+  restart.** Turning it on starts Mattermost straight away on a running local
+  server, but switch-buddy's instructions still said it took effect at the next
+  start, which sent people to restart the server for nothing (#1021).
+- **The Teams command menu fits Teams' limit again.** Switch's own Teams app
+  listed thirteen commands, one more than Teams allows, once `/remove-agent`
+  joined it. Both Teams apps now offer the same twelve: `/remove-agent` is in,
+  and `/room-url` leaves the menu but still works when typed. A self-hosted
+  Teams app shows the change once its package is rebuilt with `--bump` and
+  uploaded again.
+
+#### Removed
+- **Breaking for HTTP clients: the `/agents/{id}/moderation/…` routes are
+  removed** and answer `404`. They predate the operations door, which runs the
+  same operations as MCP. Call `POST /agents/{id}/ops/<operation>` with the
+  operation's arguments as the JSON body instead:
+  `POST moderation/rooms` is `create_room`,
+  `POST moderation/rooms/{room_id}/invite` is `invite_agent_to_room`,
+  `GET moderation/rooms` is `list_all_rooms`,
+  `GET moderation/rooms/{room_id}` is `get_room_detail`,
+  `GET moderation/agents` is `list_agents`, and
+  `GET moderation/bridges` is `list_bridges`. The reply is
+  `{"result": …}` in the operation's own shape, so `list_all_rooms` gives
+  `room_id` where the old route gave `id`.
+- **`!run-cmd`, and the terminal command in offline replies.** A CLI started
+  with that command got none of the Switch tools, so it never brought the agent
+  online. The reply for an agent that is offline or not live now says what's
+  wrong and who has to act, with no start command to paste. Where the owner
+  starts it from Switch Console, the reply names the room to connect it to and
+  the provider's sign-in command, for when Console says it is signed out. An
+  always_on agent says its connector is down, whatever provider it registered
+  through. Slack apps that list `/run-cmd` in their manifest keep showing it,
+  answering "Unknown command", until an admin deletes it; Discord and Telegram
+  drop it from their command lists by themselves (#730).
+
+### [0.31.0] - 2026-10-20
+
+#### Added
+- **One address per Switch server.** A deployment is reached at a single address
+  instead of separate gateway and API hosts (#753).
+- **Agents can follow a conversation without being `@`-mentioned.** A person's
+  untagged reply in a thread, their next message in an exchange with an agent,
+  or any message in a room with an assigned agent reaches that agent. It is off
+  unless `follow_the_conversation` is among the enabled feature flags
+  (`switchCore.featureFlags.enabled`); people control it per room with
+  `!follow-ups on|off`, `!assign-agent` and `!unassign-agent` (#869).
+- **Template version 2.** A template can start with `version: 2` and describe
+  its agents and rooms as `resources:`, each with a `type:`, that refer to each
+  other by key. An entry can be made conditional with `if:`, and `{key.name}`
+  fills in another resource's name. Templates without `version: 2` keep working
+  as before (#851).
+- **Official templates.** Switch ships templates every workspace sees, listed
+  first, with ids starting `official:`. They can be run but not edited or
+  deleted. The Switch expert, which used to be bundled in Switch Console, is
+  now one of them (#851).
+- **Event-loop stall probe.** switch-core checks for event-loop stalls every
+  100 ms and reports them, so a blocked loop shows up (#713).
+- **The server's operator sets up connector apps from the dashboard.** A
+  Connectors page lets you set up your GitHub App and Google Workspace's OAuth
+  client with no restart. Changes are recorded in a new server-wide audit log
+  (`server_audit_events`). To use this you need the `service_connections` flag
+  on.
+- **A connection knows the app it signed in through.** A connection made
+  through an app the operator has since replaced shows as needing
+  reconnection, and an agent asking for its token is told to reconnect
+  rather than handed the vendor's refusal. A sign-in that started before the
+  app was replaced is asked to start again. Connections made before this
+  release are unaffected.
+- **Confluence through the Atlassian connection.** Connecting Atlassian now
+  also asks for Confluence's read, search and write scopes, so a granted agent
+  reaches Confluence pages as well as Jira. People who connected before must
+  connect again to get Confluence.
+- **Operators can keep names away from outside avatar services.** An agent with
+  no icon of its own is drawn by api.dicebear.com with its name as the seed.
+  With `THIRD_PARTY_AVATARS_ENABLED=false` (Helm
+  `switchCore.thirdPartyAvatars.enabled`), no names are sent to outside avatar
+  services and each platform shows its own default icon.
+- **The Helm chart can take the invitation SMTP username from its Secret.**
+  Some relays issue usernames that are credentials in their own right (an
+  Amazon SES SMTP username is an access key id). With
+  `switchCore.smtp.usernameFromSecret: true`, the chart reads it from
+  `secrets.gatewaySmtpUsername`, or from `GATEWAY_SMTP_USERNAME` in
+  `secrets.existingSecret`, instead of `switchCore.smtp.username`. Setting
+  both is refused at render time.
+- **Agent controllers update themselves to the release Switch names.** Set
+  `switchCore.controllerRelease` (version, URL and SHA-256, all three or none)
+  and any controller running another version downloads that release, checks
+  it and installs it once it is idle. Every Switch release now publishes a
+  matching controller package, release candidates included, so controllers
+  follow the server they belong to. To roll back, point the values at the
+  previous release. Switch Console's own controller still updates with Console.
+- **Workspace admins can turn a service off for their workspace.** With the
+  `service_connections` flag on, an admin can switch off a service such as
+  GitHub or Google Workspace. While it is off, nobody in the workspace can
+  connect it, grant it to an agent or get a token for it, and running sessions
+  lose it within half a minute (GitHub tokens are revoked straight away).
+  Grants are kept, so turning it back on needs no re-grant. Services are on
+  by default, so an upgraded server behaves as before.
+
+#### Changed
+- **Upgrading from 0.30 or earlier: two things now work the other way round.**
+  - **switch-core can run as multiple replicas.** Before 0.31.0 the chart
+    refused any `switchCore.replicaCount` above 1. Now any replica can serve
+    any agent, each bridge and connector is held by one replica at a time, and
+    if a replica goes away another picks up its work. With more than one
+    replica an upgrade rolls a pod at a time instead of taking the server down.
+    Agent events now live in Postgres rather than one process's memory, so a
+    restart no longer loses what was queued (#886, #815, #858).
+  - **Running a template creates agents.** Before 0.31.0, `run_template`
+    created rooms only, and `agents=` filled every agent slot with an agent you
+    already had. Now a run creates each agent the template describes, as a
+    managed agent on the machine the entry names (this needs agent management
+    and the "can manage agents" permission). `agents=` now means "use this
+    existing agent instead of creating one", and only for an entry that says
+    `allow_existing: true`. Every agent entry also needs `provider`,
+    `machine` (or `location`) and `directory`, so a template written for 0.30
+    gets warnings and won't save until you add them or save with
+    `bypass_warnings=true` (#851).
+- **A caller repeating a refused request is answered with 429 from memory,**
+  rather than re-doing the refused work each time (#750).
+- **Console links work on chat platforms.** A `switchdash://open/...` link an
+  agent posts reaches Slack, Discord, Telegram and Teams as a clickable https
+  link to the new public `GET /deeplink/open/{page}`, which opens that page in
+  Switch Console. A server with no public address (`GATEWAY_PUBLIC_URL`) sends
+  the link's label and the page's name instead. Mattermost servers that allow
+  the `switchdash` scheme get the link unchanged.
+- **Deleting a room can retire its channel.** `DELETE /gateway/rooms/{id}`
+  and bulk delete take `retire_channel` (default false). When it is set,
+  Switch archives the room's Slack or Mattermost channel, deletes its Discord
+  channel, or has the bot leave its Telegram chat; Teams channels and direct
+  messages stay. Without it, the channel is left as it is. The delete
+  responses say what happened (`channel`), and room detail says what retiring
+  would do (`channel_on_delete`). A channel that could not be retired is
+  reported, and the room is still deleted. Disconnecting a messaging app
+  leaves channels as they are.
+- **The Switch expert is offered only where switch-buddy is not.** A server
+  with agent management and switch-buddy on serves switch-buddy alone; every
+  other server keeps the official Switch expert. Agents made from it are
+  unchanged.
+- **Usage telemetry goes to `telemetry.switchagents.ai` by default.** The
+  default `TELEMETRY_ENDPOINT` (Helm `switchCore.telemetry.endpoint`) was
+  `https://telemetry.flintai.dev`, an older name for the same relay that is
+  being retired. A deployment that sets the endpoint explicitly is unaffected;
+  one relying on the default moves to the new host on upgrade. Nothing is sent
+  unless `TELEMETRY_ENABLED=true`.
+- **Documentation links point at `docs.switchagents.ai`.** Links in the docs
+  and the synced `docs/official` pages used `docs.flintai.dev`, the older name
+  for the same site. Old links still redirect.
+- **A sign-in that returns through the server goes straight back to Switch
+  Console.** Google Workspace and GitHub send the browser back to the server
+  rather than to the computer it left from. The server used to stop there on
+  a page naming the Switch account and asking the person to continue; it now
+  sends the browser on to Switch Console at once. The page remains only when
+  the return cannot be verified or the consent was cancelled. What ties a
+  sign-in to the browser and the Console that started it is unchanged.
+
+- **Signing in to a service connects it without a confirm step.** Once the
+  browser returns, the server exchanges the code, reads the account and keeps
+  the connection in one step, and Switch Console shows the result. It used to
+  hold the sign-in until the person confirmed the account in Console. The
+  account is chosen at the vendor, and Disconnect undoes a wrong one. The
+  flow's `complete` route now answers with the account and any warning, its
+  status reads `connected` or `failed` with the reason, and the `confirm`
+  route is gone, for GitHub's flow as well; a Switch Console from before this
+  release cannot finish a sign-in against this server, so update both
+  together. Migration `bf016e18bc16`, expand-only.
+- **New agents answer their owner and the owner's own agents.** Every path
+  that creates an agent without an addressing choice (registration,
+  `create_agent`, template runs, switch-buddy's template) now gives it the
+  "me and my agents" policy instead of owner-only, so the agents one person
+  creates can address each other out of the box. A template agent with no
+  `addressing` gets `owner-agents`. Other people and their agents stay out,
+  an explicit owner-only choice is kept, and existing agents keep their
+  policy. The "others can use these grants" warning no longer counts the
+  owner's own agents.
+#### Removed
+- **The `/admin` command.** It did nothing and is no longer offered in rooms
+  or registered with Slack, Discord or Telegram; a command without a handler
+  is never registered.
+- **Breaking (agent-facing): the task protocol is removed.** The
+  `delegate_task`, `accept_task`, `update_task`, `finalise_task`,
+  `cancel_task` and `list_tasks` tools are gone from MCP and the operations
+  door, the `/agents/{id}/tasks…` HTTP routes answer `404`, and no task events
+  are delivered. The documentation has said not to use them since 0.9.x. Agents
+  coordinate with `post_message` and `send_targeted_message`, and the
+  instructions they receive no longer mention tasks. `connect_to_room` drops
+  each participant's `can_delegate` and `can_accept`, and neither `!status`
+  nor the dashboard shows them. Stored
+  integration profiles that still carry `task_protocol` load as before, with
+  the key ignored. Existing rows in the `tasks` table are left in place; no
+  migration.
+#### Security
+- **An agent icon URL must spell its host plainly.** A link with a backslash,
+  or a host with percent-encoding or non-ASCII characters, is refused: browsers
+  and chat clients read such a host differently from Switch, so its checks
+  could not tell where the image would be loaded from.
+
+#### Fixed
+- **A controller Switch Console runs on an SSH host is no longer shown as behind.**
+  It enrolls like a standalone controller, so Core named it the release and the
+  Machines page marked it behind, though it runs Console's bundle and cannot
+  follow Core. Console now starts it with `--updated-by-console`; it follows no
+  release, reports `controller.updated_by: "console"` in its status, and Core
+  names it none, as for Console's own controller. One started from an older
+  Console bundle shows behind until Console replaces that bundle.
+- **Usage telemetry no longer carries the `ENVIRONMENT` or `SERVICE_NAME`
+  settings.** From 0.28.0 through 0.30.0, with `TELEMETRY_ENABLED=true`, every
+  event sent to the Flint relay carried both, as `deployment.environment`,
+  `service.name` and the OTLP scope name. They are free text an operator sets
+  for their own logs (Helm `switchCore.logging.environment` and `serviceName`),
+  so a value such as a company name left the deployment despite the promise of
+  no free text. Usage events now always say `switch-core` and omit the
+  environment; `flint_env` still says which Amplitude project they belong in.
+  The operational OTLP export to your own collector is unchanged.
+
+### [0.30.0] - 2026-10-12
+
+#### Added
+- **Multi-tenancy.** Several workspaces per person, with sign-up, invitations,
+  workspace roles, per-workspace usage budgets, and Switch Cloud sign-in (#627).
+- **Distributed Telegram app.** One Telegram app any workspace connects, like
+  the other platforms (#583).
+- **Distributed Teams app.** A Teams app any organisation installs for itself
+  (#632).
+- **Switch Trust guardrails.** Every message is checked before it is sent;
+  blocked, redacted and alerted/errored outcomes are handled, blocked senders
+  are named and redacted senders notified. Configurable from a Switch Trust
+  settings panel backed by a gateway API (#679, #739, #747).
+- **Per-message telemetry and activity tiers.** switch-core reports per-message
+  events and rolls activity into tiers for the dashboards, on top of an events
+  refactor and dashboard-accuracy fixes (#719, #610, #558).
+- **Room-wide mention.** A mention that pages a room's people on its platform
+  and wakes no agent (#542).
+- **Windows support for managed agents and the controller** (#765).
+- **Self-contained integration points.** Adding a messaging platform (#720) or
+  an agent CLI (#763) is now a single plugin entry.
+- **Build provenance and usage reporting.** switch-core reports the commit it
+  was built from with its metrics and logs (#710), how long garbage collection
+  pauses the process by generation (#711), and the count of active staff
+  accounts in the usage snapshot (#724).
+- **Deploy-time feature flags.** Capabilities are gated by a feature-flag
+  setting (`FEATURE_FLAGS_ENABLED`, Helm `switchCore.featureFlags.enabled`)
+  rather than per-capability environment variables. Known flags:
+  `agent_management`, `hosted_agents`, `switch_cloud`, and
+  `ecosystem.show_owners`.
+- **An agent or controller that keeps repeating a refused request is answered
+  429 from memory.** After 8 identical refusals (401, 403, 404 or 426 for the
+  same bearer token, or the same controller credential, on the same method and
+  path of an agent or controller route) within two minutes, Switch answers that request 429 with
+  `Retry-After` for a minute without looking up its credential or touching
+  the database. One request goes through when the wait is over; refused
+  again, the wait doubles, up to 15 minutes, and any other answer clears it.
+  It protects the server from old clients that retry a refusal forever. New
+  metric `switch.http.refusals_throttled`, with a panel on the dashboard.
+- **Switch cloud machines that run the agents controller sleep when idle,
+  and wake on a message.** Such a machine is stopped once its status reports
+  say no session has run for `HOSTED_IDLE_STOP_MINUTES` (released, as before,
+  when no agent is placed on it). A message addressed to one of its agents
+  starts it again; the room is told once that the machine is starting, and
+  Switch keeps the message for the agent until it is back. Placing an agent on
+  a sleeping machine starts it too, and is judged by its last report. A
+  machine its owner stopped stays stopped, and says so.
+- **Switch cloud machines can run the agents controller.** With
+  `HOSTED_MACHINE_RUNTIME=controller` (Helm `switchCore.hostedMachineRuntime`)
+  and agent management on, a cloud machine claimed from then on enrolls the
+  standard `switch-agent-controller` with a one-time code Core hands the hosted
+  controller at prepare (the same code on every retry of a revision, valid 30
+  minutes), instead of running the hosted worker. The controller it enrolls as
+  becomes the machine's (`hosted_machines.controller_id`, kind `ec2`, "Switch
+  cloud"); its status reports make the machine ready; the managed agents placed
+  on it are the machine's agents, and keep it from being retained. Launches are
+  refused in that mode, and such machines are not stopped when idle yet.
+  Machines claimed before keep the worker runtime. Migration `e7a2c4b9d013`.
+- **Provider logins sealed to a machine.** A controller registers an X25519
+  public key (at enrollment, or once afterwards); its owner gives the machine a
+  provider login sealed to that key, which Switch stores and relays as
+  ciphertext it cannot open (`PUT/GET/DELETE
+  /gateway/management/controllers/{id}/provider-logins/{provider}`, and
+  `GET /v1/management/controllers/{id}/provider-credentials/{provider}` for the
+  controller). Giving one queues a `provider.login` operation the machine takes
+  it up with; revoking the machine deletes its logins. Migration
+  `d41c7a9e2b58` adds `sealed_provider_logins`.
+- **The `service_connections` feature flag** shows or hides service
+  connections. Off, which is the default, the routes for connections,
+  sign-ins, keys and grants are not mounted: agent hosts read that as no
+  grants, and Switch Console and the dashboard offer GitHub's link alone, as
+  before. Turn it on with `FEATURE_FLAGS_ENABLED=service_connections` (Helm:
+  `switchCore.featureFlags.enabled`) for everything below.
+- **Agents use their owner's GitHub through grants.** A person connects their
+  GitHub account once; an agent's owner then grants it repositories, to read or
+  to read and push, from the agent's page in the gateway or in Switch Console.
+  The agent's sessions get installation tokens for exactly those repositories,
+  valid for at most an hour, each issue recorded. They are revoked when the
+  grant narrows or goes, the owner disconnects GitHub or re-links another
+  account, the agent is deleted, or its owner leaves the workspace. Agents with
+  a runtime of their own cannot be granted anything yet. New routes:
+  `GET /agents/{id}/service-grants` and `POST /agents/{id}/service-tokens/{service}`
+  for agents and their controllers, and `/gateway/service-connections` and
+  `/gateway/agents/{id}/service-grants` for people. Pushes, pull requests and
+  comments made this way appear as the GitHub App.
+- **Agents can use their owner's Jira, through the Atlassian connection.** A
+  person connects Atlassian from Switch Console; nothing needs configuring on
+  the server, which registers its own OAuth client with Atlassian on the first
+  connect. An agent's owner then turns Atlassian on for it: on or off, at the
+  level the person consented to when connecting (read, or read and write).
+  The agent acts as its owner in Jira, through Atlassian's MCP tools, which its
+  sessions call without the token ever reaching the coding tool. Only Jira's
+  scopes are asked for. Connecting from the web dashboard is not possible yet.
+- **Services beyond GitHub from the catalog.** A catalog entry can name the
+  generic OAuth/MCP adapter: its sign-in, the vendor's MCP servers, and whether
+  its tokens are minted per issue or the owner's own, passed through with a
+  lifetime cap. A service whose OAuth client the operator registers reads it
+  from the JSON file `<PREFIX>_CLIENT_CONFIG_PATH` names; unset, the service is
+  shown as not set up on this server, and set but unusable, the server does not
+  start. Connecting goes through `/gateway/service-connections/{service}/flows`.
+- **Agents can use their owner's Google Drive, Docs, Sheets, Slides and
+  Calendar, on self-hosted servers.** The server's operator registers an
+  internal Google app and names its client in
+  `GOOGLE_WORKSPACE_CLIENT_CONFIG_PATH` (see
+  `docs/old/google-workspace-setup.md`); without it, Google Workspace is listed
+  as not set up. A person connects from Switch Console, signing in to Google
+  through the server's own callback; their agents' sessions then run Google's
+  `gws` command-line tool with the person's access, on/off like Atlassian.
+  Gmail is not offered. Disconnecting revokes the sign-in at Google.
+- **A catalog service's tools can be the vendor's command-line tool.** An
+  `oauth` entry (the generic adapter, formerly `oauth-mcp`) names either the
+  vendor's MCP servers or a `cli` block: the binary and its pinned builds with
+  their SHA-256s, the commands and flags allowed and refused, which arguments
+  are local files, an output cap, a timeout, and how a run says the vendor
+  refused its token. `auth.oauth.authorization_params` sends extra sign-in
+  parameters a vendor needs, from a fixed allowlist. The grants answer gains
+  `cli_tools`, additively.
+- **Services people connect with a key, starting with Datadog.** A catalog
+  entry with `adapter: api_key` names the fields a person pastes (one to three
+  secret keys) or picks (a site or region, never free text), a call that
+  checks them, and header or environment templates that put them into the
+  vendor's MCP requests or CLI runs. Core checks a key with its vendor before
+  storing it, encrypted, through
+  `PUT /gateway/service-connections/{service}/key`, and hands it to sessions an
+  hour at a time like any pass-through token; the coding tool never sees it.
+  Keys are not refreshed, and disconnecting forgets one but cannot revoke it
+  at the vendor, which the answer says. The grants answer's MCP servers carry
+  their `headers` templates and a CLI its `env` ones (both additive). Datadog
+  needs MCP access turned on for the organization and an application key with
+  `mcp_read`.
+- **`DISABLED_SERVICES`** switches catalog services off on a server, as JSON
+  mapping each to the reason people are shown (an empty one reads "Switched off
+  on this server."). A switched-off service is listed with its reason and
+  cannot be connected, granted or issued a token; disconnecting still works.
+- The service token answer gains `expires_in` and `use_until`: a holder asks
+  again by `use_until`, at most an hour away, whatever the vendor's token
+  lifetime. The grants answer gains each service's `mcp_servers`. Both are
+  additive.
+- **A grant change reaches running sessions within a minute.** The grants
+  answer carries each grant's `revision` and the token answer the
+  `grant_revision` it was issued under (both additive). An agent host holding a
+  token reads the grants again at most every 30 seconds and asks for a new
+  token once its grant has moved on, so a widened grant, one turned off, or
+  one removed and made again applies without restarting the session. A
+  service first granted after a session started reaches it when it next
+  starts, as its tools are set up then.
+- The dashboard's Service access shows services such as Atlassian as on/off
+  switches beside GitHub's grant, and says why one cannot be turned on: not
+  connected yet, or switched off or not set up on this server.
+- **`GITHUB_APP_CONFIG_PATH` and `GITHUB_APP_PRIVATE_KEY_PATH`** configure the
+  GitHub App (both or neither; the key path absolute). The Helm chart sets
+  them from `switchCore.githubConnectionsSecret` and the new
+  `switchCore.githubAppPrivateKeyPath`, the signing key's path in a Secret the
+  chart mounts.
+  `SERVICE_TOKEN_RETENTION_DAYS` (default 30) sets how long issue records are
+  kept; tokens' values are dropped as soon as they expire.
+- **The Helm chart turns agent management on from its values.**
+  `switchCore.agentManagement.enabled` and `secrets.controllerTokenSecret` (or
+  `CONTROLLER_TOKEN_SECRET` in `secrets.existingSecret`) set
+  `AGENT_MANAGEMENT_ENABLED`, `CONTROLLER_TOKEN_SECRET` and
+  `CONTROLLER_STATUS_INTERVAL_SECONDS` on switch-core and its migration Job. Until
+  now they had to be added with `kubectl set env` after each upgrade, rolling the
+  pods twice. Rendering fails when the secret is missing or shorter than 32
+  characters. Remove variables set by hand before the first upgrade that renders
+  them (see the chart README).
+- **`global.preStopSleepSeconds`** (default `5`): the gateway waits that long
+  in a `preStop` hook before SIGTERM, so a roll stops sending it requests
+  before it shuts down while its replacement is already serving. Rendered only
+  on Kubernetes 1.30+ (the native `sleep` action); `0` turns it off.
+  switch-core and Mattermost roll with `Recreate`, so they get no hook.
+
+#### Changed
+- **The published Helm chart pins its images by digest.** The release writes
+  each image's registry digest into the chart's values before packaging, so
+  `switchCore.image`, `gateway.image` and `setup.image` default to
+  `<image>:<version>@sha256:…`, and `global.imageRegistry` defaults to the
+  registry the release published to. Pinning the chart version now pins the
+  exact images; a deployment no longer needs to set the three image values.
+- **Breaking for some values files: `global.imageRegistry` now has a default.**
+  An image value that names a registry (`ghcr.io/acme/switch-core:1.0`,
+  `localhost/…`, `host:5000/…`) is used as written, as before. One that names a
+  Docker Hub namespace without a registry (`acme/switch-core:1.0`) now gets the
+  default registry prepended; write it as `docker.io/acme/switch-core:1.0`.
+- **`imagePullPolicy` for switch-core, gateway and setup defaults to `""`**:
+  `IfNotPresent` for a digest-pinned image, `Always` for anything else, so an
+  install that opts out of the pin with a mutable tag keeps pulling it. An
+  explicit policy still wins.
+- **Every merge to main publishes a dev build** of the images and chart, under
+  `ghcr.io/<owner>/dev/` and `<next patch>-dev.<run>.g<sha>`: never `latest`,
+  apart from the release packages, and pruned after 30 days beyond the newest
+  20. Each publishing run records every digest in its summary and in a
+  `release-pins` artifact, and a version already in the registry is never
+  published again.
+- **The hosted controller is published with every release and dev build**: its
+  image as `switch-hosted-controller` and its chart as
+  `charts/switch-hosted-controller`, versioned with switch-core and pinned to
+  its image by digest (`image.repository`, `image.digest`). The dev charts also
+  carry a `main` tag that follows the newest build of main.
+
+#### Changed
+- **The agent connection runs over a single WebSocket** between the server and
+  the runtime, replacing the previous connection (#652, #687).
+- **Room access-permission changes are restricted to owners/admins** (#638).
+- **The bundled Mattermost no longer calls Mattermost Inc.** (#733).
+- **Agent icons switched to DiceBear gaze** (#685).
+- **Faster startup and fewer requests.** Agents and rooms are read in bulk at
+  startup (#743), the room and agent list queries are batched so they don't grow
+  with the data (#709), and Console makes fewer managed-agent requests with one
+  query for their machines (#702).
+- **Agent management moved behind the `agent_management` feature flag.** The old
+  `AGENT_MANAGEMENT_ENABLED` setting is gone: switch-core refuses to start when
+  it is still set to true, and the Helm chart refuses to render with
+  `switchCore.agentManagement.enabled: true`. Enable the `agent_management` flag
+  instead.
+- **Hosted launches require `agent_management`.** `HOSTED_LAUNCH_CAPACITY` above
+  0 now needs the `agent_management` flag enabled.
+- **GitHub moves onto service connections when the new release first starts,**
+  once per workspace: each GitHub connection. A connection that cannot be read
+  is skipped and logged, and its owner connects GitHub again. So is a second
+  person linked to the same GitHub account as someone else: they must connect a
+  different GitHub account, or the first must disconnect theirs. A workspace
+  whose move fails is logged and tried again at the next start; the others
+  still move. The old table is left as it was, but nothing is written back to
+  it: after rolling back to the previous release, people connect GitHub again
+  (GitHub renews sign-ins by replacing them, so the copies there stop working
+  within hours), and disconnects and removed grants made on this release do
+  not carry back. Rolling back means downgrading this release's migrations,
+  which drops the service connection, grant and token record tables and
+  everything made in them on this release. Tokens already handed out then stay
+  valid until they expire, within the hour, as nothing is left to revoke them.
+
+#### Removed
+- **The `feature_flags` table is dropped.** The migration logs which flags were
+  on at upgrade so they can be re-expressed through the feature-flag setting.
+- A new migration adds `service_oauth_clients`, where the server keeps the
+  OAuth clients it registered with vendors such as Atlassian, encrypted with
+  the server keys and re-encrypted when they rotate. Downgrading it drops the
+  table; the server registers again on the next connect.
+
+#### Deprecated
+- `HOSTED_GITHUB_CONFIG_PATH` still configures the GitHub App's sign-in, with a
+  warning, for this release. It names no signing key, so GitHub can then be
+  connected but not granted.
+
+#### Security
+- **Multi-tenant security hardening** across the server and gateway (#641).
+
+#### Fixed
+- **A silent Mattermost no longer freezes all of switch-core** (#660).
+- **Teams no longer adds users to the whole team** when a private channel is
+  mistaken for public (#591).
+- **A client that fails on the database at start is retried** instead of being
+  dropped (#742).
+- **The clock no longer redraws turns for offline agents** (#715).
+- **The Helm chart's Ingress now routes every agent API path to switch-core.**
+  `/agent-sessions` (session starts, turn activity, approval requests and their
+  answers), `/version` and `/deeplink` were missing from
+  `ingress.agentApiPaths` and from the sample Ingress, and so is `/v1`, where
+  agents controllers enroll and connect. Behind a path-routed
+  ingress they reached the gateway, which answered with its web page. Agent
+  sessions then failed mid-turn with `Unexpected token '<'`, and activity and
+  approval cards never reached messaging platforms. An install that overrides
+  `ingress.agentApiPaths`, or routes with its own Ingress, must add these paths
+  itself. A test now fails when the agent bridge serves a path the chart does
+  not route.
+
+### [0.29.0] - 2026-09-29
+
+#### Added
+- **Agents can find, run and save workspace templates (#554, CHOO-2923).** New
+  agent tools — `get_template_guide`, `list_templates`, `get_template`,
+  `run_template`, `save_template`, `update_template`, `delete_template` — let an
+  agent discover the shared and owned templates available to it, read a
+  template's document and its `params`, create the rooms a template describes by
+  filling each slot with an existing agent, and save, update or delete its own
+  templates (private or shared). Backed by template runs, agent-run tracking,
+  and refusal reasons that explain why an action was declined.
+
+### [0.28.1] - 2026-09-26
+
+#### Added
+- Observability: a peak `db.pool.in_use` gauge and a counter for database
+  connection-pool checkout timeouts (#560).
+
+### [0.28.0] - 2026-09-25
+
+#### Added
+- **Sessions live with the host; switch-core only relays (#543).** Session
+  ownership moves to Console and its sidecar — switch-core relays the agent
+  connection rather than owning session lifecycle. The agent bridge API is
+  reworked accordingly (activity routes replace the old session routes, with
+  the operation and command surfaces updated to match).
+- **Publish, edit, share and search room templates (#501).** Server-side
+  template visibility, a room-YAML export endpoint, and parameterized export
+  (values replaced with `{key}` placeholders), backing the Console's
+  capture-as-template flow and the gateway template management UI.
+- **Bound workspace creation per person (#458, CHOO-2722).**
+  `GATEWAY_MAX_WORKSPACES_PER_USER` (default 3) caps self-service workspace
+  creation; the check, creation and count run under a NOWAIT lock on the
+  caller so concurrent requests cannot slip past, and the bound counts
+  workspaces *created* (`users.workspaces_created`) so handing one over does
+  not free the allowance. `0` closes self-service; deployment operators are
+  exempt.
+- **Richer connector-event telemetry, plus DB and bridge timing (#488).**
+  Connector events gain a failure reason and a `duration_ms`, and server-side
+  DB/bridge lifecycle timing is recorded.
+- **Multi-tenancy phase 1 — tenant isolation enforced in the database.** Every
+  request and every unit of background work now binds a tenant onto its session,
+  the schema is scoped to a tenant, and row-level security enforces the boundary
+  under a restricted database role whose only exemption is the tenant-resolution
+  lookups. Tenant admin is split from the deployment-operator capability, and a
+  session with several memberships can select which tenant it acts as.
+- **Distributed messaging-install protocol.** A collaboration app can be
+  installed into a workspace and later ended through a first-class lifecycle
+  (`messaging_installs`, install/end routes, and the tenant-routing lookup),
+  inbound platform events are routed to the installing tenant and handled exactly
+  once, and `MESSAGING_PUBLIC_URL` is configurable separately from the gateway's
+  public origin.
+- **Workspaces, invitations and members.** Gateway routes to manage a workspace,
+  its invitations and its members, backed by an invitations table and the lookup
+  that resolves an invitation to a tenant.
+- **Datadog observability (#491).** OpenTelemetry metrics, a liveness/readiness
+  split (only the database gates readiness), log export, and a shipped Datadog
+  dashboard and monitor set. Tracing is not yet wired.
+- **Product-usage telemetry for switch-core (#487).**
+- **Template registry (#421)** — server-side storage and API for room templates.
+- Index on `rooms.group_id` (#404).
+
+#### Fixed
+- Removing a bridge or agent now deletes its clients and their room memberships
+  in one transaction, so client rows are no longer orphaned when a client had
+  ever joined a room (#525, CHOO-1492).
+- Removing an agent from a room no longer stops message delivery to the rest of
+  the room (#412).
+- A failed bridge read is no longer mistaken for an empty bridge list (#515).
+- The gateway refuses to delete a bridge an install created, and refuses to
+  remove a member who still owns agents in the workspace.
+- The gateway requires `GATEWAY_OIDC_SCOPES` to include `openid` and no longer
+  500s on a userinfo hiccup (#418).
+- Migration lock waits are bounded, and the deploy job runs through boot's path.
+- A log context token is never restored in a context that did not create it
+  (#428).
+- Dependency: `pyjwt` 2.12.1 → 2.13.0 (#508).
+
+#### Security
+- Room message bodies are delivered to an agent inside `BEGIN`/`END SWITCH
+  MESSAGE` markers carrying a per-message nonce. Any room participant writes the
+  body, and it previously sat as plain text directly under the `[Switch] …
+  addressed you …` header, so it could spell out a convincing header of its own
+  — or its own trailing `read_context` notice — and be read as something Switch
+  said. The nonce cannot be predicted, so the frame cannot be closed early or
+  reopened; sender display names are collapsed to a single line for the same
+  reason (#527).
+
+### [0.26.0] - 2026-09-09
+
+#### Added
+- **Multi-tenancy groundwork (phase 0).** Tenant scoping across the backend, and
+  the tenant id plus request context are now stamped on every log line.
+- **Typed `params` block in rooms YAML** with `{var}` interpolation, so room
+  definitions can be parameterised (#402).
+- **An agent can read any room it is a member of without connecting to it**
+  (CHOO-2628) — a new agent operation. (Reaches agents once the runtime and
+  connector plugins that expose it are released; the server side ships here.)
+- Users can change their own password in the gateway (#323).
+
+#### Fixed
+- **OIDC account linking hardened.** A verified OIDC identity is linked to its
+  account by email; multi-issuer and null-issuer collisions are handled rather
+  than guessed, duplicate emails no longer resolve silently, legacy identities
+  are backfilled and matched case-insensitively, and the race is retried with
+  savepoints (CHOO-2624).
+- **Agent bootstrap-key and registration hardening** — resilient bootstrap-key
+  seeding across admin changes and legacy migrations, retired key hashes are
+  revoked and keys retired rather than deleted, a config fault is no longer
+  misreported as a bad token, and the deployment-wide registration token is
+  scoped to a non-admin owner (CHOO-2624).
+- A Postgres server that fails over without closing the connection is now
+  noticed by the notify listener (CHOO-2622).
+- The setup job stays authenticated to the gateway (CHOO-2622); Helm applies the
+  secret and CA bundle before the migration that needs them.
+
+### [0.25.0] - 2026-09-06
+
+#### Added
+- `GATEWAY_OIDC_REQUIRE_EMAIL_VERIFIED` (default true) makes the OIDC
+  `email_verified` check configurable, so a deployment whose IdP addresses are
+  authoritative (e.g. Okta directory-provisioned users that never report the
+  claim as true) can opt out. The relaxed check logs a warning on every login
+  naming the claim value, so it is never silent (#387).
+
+#### Removed
+- **Matrix is gone.** Following the 0.24.0 move to a Postgres message store,
+  switch-core no longer runs or talks to a Matrix homeserver: the Tuwunel
+  service, the `matrix-nio` dependency, and all `MATRIX_*` configuration are
+  removed, and the Helm chart drops the tuwunel deployment, service and PVC. The
+  standalone compose no longer ships a Tuwunel service. Ships a migration
+  (`drop_matrix_columns`) that drops the now-unused Matrix columns (#380).
+
+#### Changed
+- **`stack-compose` contract → speaks 2** (accepts 1). The published standalone
+  compose no longer carries the `tuwunel` service or the `MATRIX_*` environment
+  variables; Switch Console's local-server mode drives the new shape (#380).
+
+### [0.24.1] - 2026-09-06
+
+#### Changed
+- The one-time history backfill now carries a bounded amount of each room's
+  history — 50 messages per room, newest first, instead of walking every room
+  to its start (an unbounded migration that could never finish on a busy,
+  long-lived channel and ran at boot with switch-core waiting on it). Override
+  with `--messages-per-room` (`0` restores the old full walk). A capped room is
+  marked backfilled and reported as `capped`, not `incomplete` (#379).
+
+### [0.24.0] - 2026-09-06
+
+#### Security
+- Mattermost connections verify TLS by default; disabling it is now an explicit
+  opt-in (#294).
+- OIDC logins are bound to the identity provider's `(iss, sub)` pair rather than
+  email, so a changed or reused email address can no longer take over an account
+  (#291).
+- Room roster changes are gated on room membership, not on a resource's
+  write-visibility (#292).
+- Room-scoped resource endpoints now require access to the room (#293).
+- Agent registration and re-registration are confined to the owner's tenant, and
+  re-registration cannot overwrite an agent owned by someone else (#290).
+
+#### Changed
+- **Internal message transport moved to Postgres `LISTEN`/`NOTIFY`.** The
+  message/notify path and event cursors are served from Postgres instead of
+  Matrix, which is kept alongside for now. Ships a database migration
+  (`message_notify_and_cursors`) (#363).
+
+#### Added
+- Agents render under their human display name on every collaboration bridge,
+  defused so an agent still never sees its own echo (#330).
+
+#### Fixed
+- `!command` now resolves `@mentions` and runs code-wrapped commands, matching
+  `/command` behaviour — both had broken once agents gained autocomplete user
+  groups (#313).
+
+### [0.23.0] - 2026-09-03
+
+#### Performance
+- **Matrix I/O no longer runs inside a database transaction.**
+  `add_agents_to_room`, `remove_agents_from_room` and `delete_room` each held a
+  connection-pool slot open across a fan-out of Matrix invites/kicks (up to 10s
+  per call), a major contributor to pool exhaustion under load. The three now
+  read short, commit, then do the Matrix work holding nothing — ordered so
+  Matrix membership can never exceed what the database records (a crash leaves
+  an under-privileged, repairable agent, never one silently reading a room
+  Switch has no record of) (#354).
+- **Per-client sync-cursor writes are staggered.** With one Matrix client per
+  participant (hundreds in a single process) and the throttle interval equal to
+  the sync long-poll, every client persisted its cursor in the same instant on
+  an idle instance — a periodic burst of concurrent one-row transactions that
+  starved the pool and cost heartbeats their connection. A sync that carried
+  nothing durable no longer earns a write, and the writes that remain no longer
+  align (#357).
+
+#### Changed
+- On the collaboration bridges, a turn that ends on an error now renders as the
+  stall it is — the reason is shown as why the turn stopped, not streamed as an
+  in-progress step under a spinner (#356).
+
+### [0.22.1] - 2026-09-02
+
+#### Performance
+- **Agent Bridge no longer holds a database connection while doing other
+  work.** Under load the connection pool could be exhausted by slots checked
+  out and left idle in transaction, which surfaced as `QueuePool limit ...
+  connection timed out` and, because heartbeats share the same pool, as
+  fleet-wide agent loss. Three fixes: a request never takes a second pool
+  checkout while holding one (targeted messages to owner-only agents were the
+  common trigger); the message path collapses six checkouts to one on an
+  internal room and two on a bridged one; and authentication is taken off the
+  heartbeat path via a single outer join plus a narrow in-process cache of
+  resolved credentials (#351).
+
+#### Added
+- New operator settings for the above: `AGENT_AUTH_CACHE_TTL_SECONDS` and
+  `AGENT_AUTH_CACHE_MAX_ENTRIES` tune the credential cache (set the TTL to `0`
+  to disable it), and the opt-in `DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT`
+  (default off) turns a leaked idle-in-transaction slot into a loud error. All
+  three are exposed as Helm chart values (#351).
+
+#### Fixed
+- Rejoin the two Alembic migration heads left by the parallel 0.22.0 merges, so
+  `alembic upgrade head` is unambiguous again — deploys from main were failing
+  on the two heads (#351).
+
+### [0.22.0] - 2026-09-02
+
+#### Added
+- Agents can carry an optional human display name, stored on the agent and
+  surfaced over the agent protocol (agent detail) and the gateway (#326).
+- **User-defined external reference types.** Reference types are no longer a
+  closed set of four. Any signed-in user can define one — slug, display name,
+  agent-facing instructions, value hint and a read/write visibility pair,
+  exactly like a Reference — from the new **Reference types** tab under
+  Resources, or over `POST /references/reference-types`. The four built-ins
+  (Google Drive, Confluence, GitHub, Jira) stay in code, cannot be edited or
+  deleted, and win any slug collision. Agents see the types their owner can
+  read, via `list_reference_types`; each entry now also carries `value_hint`
+  and `origin` (`builtin` or `user`). A type's visibility gates who may *pick*
+  it, never delivery of its instructions for a reference already attached to a
+  room — the attachment is the grant.
+- **`list_all_references` lets an agent discover references across the whole
+  instance.** Until now an agent only saw the references attached to its
+  current room. The result is scoped to what the agent's owner may read.
+  Three optional filters narrow it — `name_contains`, `type` and `owner_name`
+  — and they are ANDed. Each row carries the reference's metadata but never
+  its `value`. When the caller is connected to exactly one room, each row also
+  reports `attached_to_current_room`. An agent can therefore find a reference
+  and attach it in the same turn.
+
+#### Changed
+- **A reference value must now carry at least one URL.** An empty `urls` list
+  was already rejected, but an absent `urls` key silently validated to an empty
+  list and was stored. It is now a 400. Existing rows still read fine; the
+  failure appears the first time someone saves one — including a no-op save
+  from the reference detail page. Find them before upgrading and give each a
+  real URL:
+
+  ```sql
+  SELECT id, type FROM "references"
+  WHERE value->'urls' = '[]'::jsonb OR NOT (value ? 'urls');
+  ```
+- **`GET /references/reference-types` now requires a session** and returns
+  401 without one. It was the last unauthenticated route on the references
+  router; the set it returns is per-caller now, so it cannot be answered
+  anonymously.
+
+#### Fixed
+- Discord: create the room on the first command, not only on the first message
+  (#341).
+- Deeplinks: replaced the handoff page with a branded two-state design (#339).
+
+#### Performance
+- Agent bridge: take the sequential scan off the heartbeat path and size the DB
+  pool for it, backed by a new index on `agents.api_key_id` (#344).
+
+### [0.21.1] - 2026-09-01
+
+#### Fixed
+- Slack: normalize typed command mentions so commands addressed with a typed
+  `@agent` are recognized (#316).
+- Slack: resolve agent mentions that crossed a workspace boundary (#327).
+
+### [0.21.0] - 2026-08-25
+
+#### Added
+- The gateway's **registration keys** page can now search agent keys, and its
+  table fills the page height rather than being capped short (#177).
+- Switch's commands appear in Teams' `/` autocomplete picker. The shipped
+  manifest moves to schema v1.29 and declares `supportsTargetedMessages` plus a
+  second command list with `triggers: ["slash"]`. The two surfaces disagree
+  about the slash — the picker prints it and inserts the bare name, while the
+  mention menu inserts a title verbatim — so the lists carry the same commands
+  spelled for their own surface. A command picked from the picker is sent
+  privately to Switch and needs no `@`-mention.
+
+#### Fixed
+- A Slack turn triggered by another app's post — a workflow, a scheduled summary
+  — is handled as an ordinary request: `bot_id` was read as "nobody asked", so
+  the 👀 went on the thread root (which in such a channel need not be a message)
+  and Slack answered `message_not_found`. The message that asked is now
+  remembered whoever sent it; a mark Slack cannot place is recorded as
+  unmarkable rather than retried every progress report; and the warning names
+  the message, not just the channel. A workflow-triggered turn still gets the
+  status message and mark but no card, since Slack will not open a session
+  addressed to an app (#288).
+- A Teams message that merely began with a slash is no longer swallowed as a
+  command. Pasting `/Users/ada/notes.md` came back "unknown command" instead of
+  reaching an agent. `/` is not Switch's prefix — it opens paths, dates and
+  fractions — so an unknown `/name` is now read as text. `!` is Switch's own,
+  so `!list-agent` still answers that it is a typo.
+- An agent no longer answers Switch's own notices. A system message — a
+  command's result, "Added X to this room", the guidance shown when someone
+  tags the app itself — is output, not a request for a reply, and the marker
+  saying so was honoured by the admin client but not by agents. Two ways in: a
+  direct room addresses its agent with every message, so running
+  `/list-agents` in a 1:1 chat had the agent start a session to respond to its
+  own roster; and any notice that lists the agents present writes each `@name`,
+  which tagged all of them. Such a message now arrives as ordinary unaddressed
+  context on every platform.
+
+#### Added
+- `just teams-app-package` builds the Teams app package an operator uploads.
+  Every route into a tenant wants a `.zip` — the Developer Portal's Import app,
+  Upload a custom app, the admin centre — and none of them takes a bare
+  `manifest.json`, so the guide's "now zip these three files" was a step people
+  had to get right by hand. It also writes the app id into the three places it
+  has to match, checks the limits Teams enforces without explaining them, and
+  exits non-zero naming any placeholder left in, so a null app id cannot ship
+  quietly.
+
+#### Changed
+- The shipped Teams app manifest declares `supportsChannelFeatures: tier1`.
+  Teams requires it of any manifest at schema v1.25 or later whose bot takes
+  the `team` scope and refuses the upload without it — a validator rule, not a
+  schema one, so the package validated cleanly against the published schema and
+  was still rejected. The package builder now checks the same rule.
+- The shipped Teams app manifest moves to schema v1.27. It was written at v1.19
+  on the reasoning that older schemas upload most reliably; the tenant we
+  actually run on is on v1.27, which settles that better than the reasoning
+  did. Nothing is removed between the two and the required fields are
+  identical, so it is a version bump rather than a rewrite — and v1.25 raised a
+  command list's cap from ten entries to twelve, so the menu gains
+  `/list-switch-agents` and `/room-url`.
+
+#### Fixed
+- A Teams posts channel no longer fills with *"This message has been deleted."*
+  Teams substitutes that for any deleted message and keeps it in the post, so
+  an agent's status line — posted, moved as the conversation went on, and
+  removed at the end — left one behind per move and per turn. Talking to an
+  agent produced a column of them. The status is now posted once, stays where
+  it is, and is edited to `✓ Done · <elapsed>` when the turn ends, as it
+  already was on Mattermost for the same reason. Threads-layout channels delete
+  cleanly and are unchanged.
+- An agent addressing a Teams user by name produces a real mention again,
+  rather than flat text that notifies nobody. Teams offers a *display* name on
+  an inbound activity, and that was taken as the person's handle — so someone
+  was filed under `Louis Amaudruz`, space and all, while the matcher that turns
+  `@name` back into a mention stops at the first space. It looked for `Louis`,
+  the directory held `louis amaudruz`, and the two could never meet: anyone
+  whose handle contained a space was permanently unmentionable. A display name
+  is now traded for the one-word principal name the directory holds, and the
+  matcher recognises the names it knows however many words they run to, so
+  people already stored the old way work without being renamed.
+- Concurrent writes to a bridge's learned `connection_config` no longer lose
+  each other. The Teams bridge records a channel's team the first time it sees
+  that channel, each from its own session, so a burst of new channels was a
+  burst of read-modify-writes on one JSONB value: measured, eight concurrent
+  writes landed two. A dropped entry is exactly the state that makes Graph
+  refuse that channel's subscription after the next restart. The row is now
+  locked for the update, which also stops the serviceUrl writer clobbering it.
+- The Graph notification endpoint compares its `clientState` in constant time.
+  It is the only control that authenticates a notification's origin, and a
+  plain `!=` on a secret leaks its prefix through timing.
+- Repairing a placeholder username costs one lookup per person rather than one
+  per message. It runs on every inbound message on every bridge, and the common
+  case — a stored name that is already fine — was still opening a session and
+  querying.
+- A Graph read of a Teams channel that fails is retried later instead of being
+  believed forever. The name and layout of a channel are read together and
+  cached, and a failure was cached with them — so one blip, or a permission
+  granted a minute after the bridge started, left that channel nameless and
+  threaded as a posts channel for the life of the process. Learning a channel's
+  team now also discards anything read against the previous one, since a read
+  made against the wrong team is exactly the read Graph refuses.
+- The rejection an inbound Teams activity gets when it is addressed to the
+  wrong app id names the audience the token carries — and now reads that back
+  out of a signature-verified decode rather than an unverified one. The
+  signature had in fact already been checked by the time this ran, so nothing
+  was exploitable, but quoting an unverified claim in the message explaining
+  why a caller was rejected is a habit worth not having.
+- Teams channel capture no longer dies at a restart for any channel outside the
+  connection's configured team. A Graph subscription names the team as well as
+  the channel, and the team is only ever carried on an inbound activity — held
+  in memory it was lost on restart, and those channels fell back to the
+  configured team, where Graph answers "Channel is not present in the team".
+  Nothing recovered it: refilling the map needs an activity from the channel,
+  and without capture Teams delivers only messages mentioning the bot, so
+  addressing an agent — the normal way to use the room — never arrived. The
+  mapping is now persisted the way the Bot Connector endpoint already was.
+
+#### Added
+- Teams accepts `/command` as well as `!command`, and the setup guide carries
+  the app-manifest snippet that puts the commands above the compose box. Teams
+  has no server-registered slash commands: a manifest command list types the
+  text and the bot parses it, so the two prefixes are the same thing by the
+  time Switch sees them — but people arriving from Slack try `/` first, and
+  until now got nothing.
+
+- The Helm chart can publish and route the Microsoft Teams bridge listener. The
+  Teams adapter serves Bot Framework activities and Graph change notifications
+  from its own HTTP server on port 3978, separate from the API on 8000, and
+  nothing in the chart exposed it — so a Teams bridge could create channels and
+  post while receiving nothing back, looking healthy throughout. Set
+  `switchCore.teamsBridge.enabled=true` to publish the container and Service
+  port, and `switchCore.teamsBridge.ingress.mode` to say how the two callback
+  paths are routed: `dedicated` renders a second Ingress carrying only those
+  paths on their own host and certificate, so Microsoft can reach them while the
+  gateway stays internal; `shared` adds them to the chart's managed Ingress;
+  `external` leaves the routing to you (see `samples/ingress.example.yaml`).
+  Off by default, because bridges are created at runtime and the chart cannot
+  detect one.
+- The Teams Ingress supports sitting behind a CDN or reverse proxy: leave its
+  `host` empty and TLS off, and it renders a host-less rule that answers
+  whatever `Host` arrives. That is the shape needed when the public name belongs
+  to something upstream, and it is the only option that needs no domain of your
+  own — the setup doc carries the CloudFront recipe, including the two settings
+  (forward query strings, do not cache) without which Graph's subscription
+  handshake fails. Empty `host` with TLS enabled is still rejected, since a
+  host-less rule cannot carry a certificate.
+- The chart now refuses to render a Teams bridge that nothing can reach —
+  enabled with no routing mode, `shared` without a managed Ingress, or either
+  managed mode without a hostname. Publishing the port without a route is the
+  silent half-failure the rest of this work exists to prevent, so it is a
+  render-time error rather than something found days later.
+- `helm test` checks the Teams listener, running Graph's own validation
+  handshake against the Service. It proves the listener is bound and the port
+  published; it runs in-cluster, so it deliberately does not claim anything
+  about public reachability, and says so.
+- Post-install notes print the exact `public_base_url` to paste into the bridge,
+  and warn when its Ingress has TLS disabled — Graph only calls HTTPS it trusts.
+- The Helm chart has a `README.md`, covering which of Switch's three network
+  surfaces have to be reachable from where. Only the Teams listener needs the
+  public internet; every other bridge connects outbound.
+- Registering a bridge that would contend with an existing one for a host
+  resource is refused, naming what clashed. Teams is the case that has one: its
+  inbound listener needs a TCP port, and a second bridge on the same port failed
+  to bind inside a background task, was dropped from the running set, and never
+  retried — surfacing much later as `Bridge not running: <id>` with no stated
+  cause. Adapters declare this by implementing `exclusive_resource`; those that
+  only dial out declare nothing and are unaffected. The same check runs at
+  startup, so rows predating it get a clear error instead of a bind failure.
+- Bridge credentials are verified before a bridge is saved. Adapters start in a
+  background task whose exceptions are logged and swallowed, so credentials that
+  the platform rejects used to be stored, reported as success, and surface hours
+  later as an unrelated-looking failure. Registering a Teams bridge now asks
+  Azure for both tokens it will need first, and a refusal comes back as a 400
+  carrying Microsoft's own explanation — which names the mistake outright,
+  including the client secret **value** vs secret **ID** mix-up. Adapters opt in
+  by implementing `verify_credentials`; the default still accepts anything,
+  because an adapter that cannot check cheaply should not pretend to.
+
+#### Changed
+- A Teams bridge is five fields instead of nine. The `clientState` shared secret
+  and the Graph encryption certificate, public key and private key are generated
+  when the bridge is created rather than asked for: they are values the operator
+  invents rather than gets from Microsoft, and asking meant an invented secret,
+  an `openssl` invocation, and three PEM fields whose only symptom when pasted
+  wrong is channel capture that silently never decrypts. Supplying your own
+  through the API still wins, all three or none. Existing bridges are untouched,
+  including any left without encryption material.
+- The Teams Graph private key is no longer typed into a plaintext form field.
+  The gateway decides which inputs to mask by matching the field name against
+  `token|password|secret|api_key`, which `encryption_private_key` does not match;
+  generating it removes the field from the form entirely.
+- `docs/bridges/TEAMS_SETUP.md` rewritten. It now walks through Azure setup
+  value by value and says where each one comes from, documents the deployment
+  and public-ingress requirements (previously absent), and adds verification and
+  troubleshooting sections keyed to the errors these failures actually produce —
+  starting with the client secret **value** vs secret **ID** mix-up, which
+  surfaces only as an opaque `AADSTS7000215` at the first Graph call.
+
+#### Fixed
+- Following an "Open in Switch Console" link no longer strands the browser tab.
+  The gateway answered the click with a bare `302` to the `switchdash://`
+  deeplink; the browser hands that to the desktop app without loading a page,
+  so the tab kept whatever it last rendered — on Teams, Defender's Safe Links
+  interstitial, still saying "Verifying link . . ." after Switch Console had
+  opened, which reads as a link that hung. It now serves a page that opens the
+  app, tries to close itself, and — since browsers only let a script close a
+  window a script opened — otherwise says the handover worked and the tab can
+  be closed.
+- A Graph permission granted while the bridge is running takes effect on the
+  next call instead of within the hour. An app's roles are stamped into its
+  access token when it is issued, so consent granted afterwards is invisible
+  for the token's lifetime — Graph keeps answering `Authorization_RequestDenied`
+  on a permission the operator can see plainly granted in Azure, which sends
+  them back to look at it again. A `401` or `403` from Graph now discards the
+  cached token and retries once with a fresh one. Once, and only when the token
+  was old enough to have missed the grant, so a genuine denial costs one extra
+  round trip rather than looping.
+- A person recorded under a Teams id gets their name back on their next
+  message. Switch files someone under the name it is first given, and Teams
+  often gives none — a 1:1 activity carries no sender name — so its own id went
+  in and then read as that person's name in room titles, on their Matrix
+  account and in every agent reply addressing them. Resolving names properly
+  helped only people met afterwards; this repairs the records already written,
+  without a migration. One-way by design: an id becomes a name, never the
+  reverse, and one name never replaces another.
+- A Teams channel with no name in its activity is looked up in Graph rather
+  than falling back to its id, so an auto-created room is called something a
+  person recognises instead of `19:7641f9de326b4…`. Cached, including the
+  "asked and could not say" case.
+- An agent's first message in a Teams channel opens a post and everything it
+  says next joins that post. It used to open a fresh one each time, so an agent
+  introducing itself produced a column of one-line posts rather than a
+  conversation.
+- An agent answering in a Teams channel replies inside the post it was asked
+  in. A channel is a list of posts rather than a stream, so posting at the root
+  opens a new conversation — the question sat in one post and the answer
+  appeared as a fresh one below it. A reply that names no thread now goes to
+  the post the bridge last saw that channel speak in. Per channel, so two
+  conversations at once in the same channel can still cross; Teams offers no
+  better signal on an untied reply, and the wrong post beats a new one every
+  time. Chats and group chats are unaffected.
+- Teams messages are rendered for Teams. Shared bridge code emitted Slack's
+  `<@id>` mention form on every platform, so a Teams user was told they had
+  tagged `<@28:11111111-…>`; an `@name` was inert text, because Teams needs
+  `<at>` markup *and* a matching entity and the adapter emitted neither, so an
+  agent could never notify its owner; and single line breaks vanished, because
+  an Adaptive Card text block follows Markdown in treating one newline as
+  whitespace. Outbound bodies were also being rendered twice — callers of
+  `send_message` render first by contract, and Slack and Teams rendered again,
+  which Slack's real conversion has been quietly suffering.
+- A Teams sender with no name attached is looked up rather than filed under
+  their id. Teams omits the sender's name from some activities — 1:1 chats
+  especially — and the raw `29:…` id became that person's name in the room
+  title, on their Matrix account and in every reply addressing them. The
+  directory and the message paths now also agree on one handle (the local part
+  of the principal name) instead of storing a principal name from one and a
+  display name from the other. Existing records keep the name they were
+  created with.
+- Directory search matches on user principal name, so confirming a claim finds
+  the person who was just picked from the list. It searched display name and
+  mail only, then re-searched by principal name to confirm — a 404 for anyone
+  whose mail differs from their UPN or who has none. `User.ReadBasic.All` is
+  also now documented; without it the search fails and nobody can link an
+  account at all.
+- The "Open in Switch Console" link no longer renders as empty brackets on
+  Teams. Teams strips a link whose scheme is not http(s) — label included —
+  and the console deeplink is `switchdash://`. Teams now declares that, so the
+  URL is rewritten to the gateway redirect as it already was for Discord and
+  Telegram, and a deployment missing `GATEWAY_PUBLIC_URL` is told at startup.
+- Adding a room to a bridge no longer answers `500` when the platform refuses
+  to create the channel. Graph says exactly what is wrong — which permission is
+  missing, which value it will not take — and that sentence went to the log
+  while the operator got an unhandled exception. Platform refusals are now
+  `BridgeOperationError`, the counterpart to `BridgeCredentialError` for
+  everything after the credentials are accepted, and room creation returns a
+  `502` quoting the platform. Registering a bridge only proves it will issue a
+  token, so this class of failure always surfaces after setup has reported
+  success. Only the Teams adapter raises it so far.
+- A Teams channel subscription that fails is retried instead of leaving capture
+  dead until someone restarts the process. Graph validates a notification URL
+  by calling it, and the bridge asks for its subscriptions seconds after
+  binding its port — behind a load balancer that is precisely when nothing
+  answers yet, so the first attempt after *every* restart was refused and the
+  restart that broke capture was also the only thing that could fix it. The
+  retry backs off to a few minutes and says so when capture recovers; repeats
+  of an unchanged failure are quiet, but a change of reason is not.
+- Binding a room to a collaboration channel that already exists now establishes
+  message capture for it. Capture was only ever set up as a side effect of
+  *creating* a channel, so a room pointed at an existing one — on creation, on
+  linking a bridge to an internal room, or on moving a room between bridges —
+  heard nothing but the messages that @mentioned it. Invisible on bridges whose
+  capture is one bridge-wide stream, and on Teams it survived only until the
+  next restart happened to reconcile it.
+- A Teams activity rejected for the wrong audience says which audience it
+  carried and which one the bridge expects. The rejection is almost always the
+  Azure Bot resource and the registered app registration having different app
+  ids, and the message it replaced — `Audience doesn't match` — named neither,
+  so the one fact needed to fix it was the one fact not logged.
+
+### [0.20.0] - 2026-08-24
+
+#### Added
+- Each agent gets a mentionable **Discord role**, so its `@name` autocompletes
+  in the composer and arrives as a real pill rather than plain text that only
+  looks like one. The roles are minted empty and permissionless — mentioning one
+  notifies nobody — and an inbound `<@&…>` resolves back to the agent's name
+  before the addressing layer sees it. A Discord role carries no metadata, so an
+  agent's role is the one named exactly after it: a role made by hand is adopted
+  rather than duplicated, and one that has members is never deleted. Off with
+  `agent_roles: false`, and it turns itself off, saying why, on a server missing
+  Manage Roles or at Discord's 250-role cap (CHOO-2316).
+- Discord puts **👀 on the message an agent is answering** for as long as its
+  turn lasts. The posted status says an agent is busy; the reaction is what says
+  which message it is busy with, and an agent answering two people at once marks
+  both and clears both together. Needs the bot's Add Reactions permission;
+  without it the bridge warns and posts no reaction rather than faking one
+  (CHOO-2316).
+
+#### Fixed
+- A Discord command argument naming someone picked from the composer's `@` menu
+  is resolved to their name instead of being refused. Both the slash and typed
+  `!` forms branch off before the translation an ordinary message gets, so an
+  agent or person chosen from the menu arrived as raw `<@&…>` / `<@…>` markup
+  and was rejected as "not a single name" — quoting a string the invoker never
+  typed. Newly reachable because an agent's name now autocompletes, but the
+  typed form was wrong before that too (CHOO-2316).
+- Disconnecting a messaging app no longer fails with a 500 when a room member
+  has already left. Deleting a bridge kicks every client of every room it had,
+  and one that had already left answered a 403; "already not a member" is now
+  treated as done, while every other failure — permission denials included —
+  still raises (CHOO-2344).
+- An addressed **auto-session agent that is offline** now asks its **owner** to
+  open Switch Console — the person who can actually bring it online — instead of
+  telling the whole room to run a terminal command. The reply threads off the
+  triggering message, names the asker as the reason (dropped when they are the
+  owner), and the connect command names the agent it was generated for, so a
+  directory holding several agents answers `select_agent` on its own (CHOO-2344).
+
+### [0.19.0] - 2026-08-22
+
+#### Added
+- Telegram marks the message an agent is working on with **👀**, and clears it
+  when the turn ends — in groups, channels and 1:1 chats alike, with no
+  administrator rights needed. Outside forum topics Telegram has no threads, so
+  the mark goes on the last thing a person said, which is what the agent is
+  answering. A chat with reactions switched off loses the mark, not the turn
+  (CHOO-2314).
+- Telegram setup docs now spell out that BotFather shows the bot token **once**,
+  and what to do if it was not saved (CHOO-2314).
+
+#### Known limitations
+- **Telegram cannot autocomplete an agent's name.** Slack's per-agent user
+  groups have no Telegram equivalent: `@` autocomplete offers only real chat
+  members, there is no user-group concept, and every agent posts through one
+  bot. Real per-agent autocomplete would need a Telegram bot account per agent
+  (CHOO-2314).
+- Mattermost marks the message an agent is working on with **👀**, added when the
+  turn opens and removed when it ends. Inside a thread the mark goes on the
+  reply that asked rather than the root it hangs off, and an agent handling two
+  messages at once clears both together instead of leaving the first marked for
+  good. The reaction is added by the agent's own bot, so two agents on one
+  message read as two marks naming who is on it. Documented alongside it:
+  Mattermost has no equivalent of Slack's native progress card, and Switch does
+  not approximate one (CHOO-2317).
+#### Changed
+- The gateway's **Docs** button opens the published documentation at
+  `docs.flintai.dev` rather than the GitHub repository (CHOO-2313).
+
+#### Fixed
+- Slack's native agent-session card could vanish from a workspace and never come
+  back until the pod was replaced. A burst of Slack rate limits was being counted
+  as the app being unfit to host sessions and tripped the permanent give-up after
+  three in a row; throttling now makes the bridge stand down for the `Retry-After`
+  Slack sent rather than counting against it, and a give-up over an unrecognised
+  error expires after ten minutes instead of lasting the life of the process
+  (#276).
+- A stale or hand-deleted Slack agent card no longer turns cards off for the
+  whole workspace. A status update arriving just after a card is torn down — or a
+  user deleting the card by hand — wrote to a message that was gone, and three in
+  a row tripped the same permanent give-up. Such a card is now forgotten: the
+  turn falls back to the posted status message and the next turn opens a fresh
+  card. A step that failed to land is also no longer recorded as the card's
+  current step (#283).
+
+### [0.18.0] - 2026-08-21
+
+#### Added
+- Each agent gets a Slack **user group**, so its `@name` autocompletes in the
+  composer and arrives as a structured mention rather than plain text that only
+  looks like one. A single app still fronts every agent; the groups are minted
+  empty (mentioning one notifies nobody) and exist only to be mentionable.
+  Inbound, a `<!subteam^…>` mention resolves back to the agent's name before the
+  addressing layer sees it — including a name folded into a legal handle — and
+  outbound mentions render as the same pill. Slack owns the objects, so the
+  id↔name maps are rebuilt by reading them back, and only groups carrying
+  Switch's marker are adopted (CHOO-2277).
+- An agent's turn is mirrored onto **Slack's native agent-session status** — the
+  streamed "in progress / complete" indicator Slack renders for an app — pinned
+  to the message being worked on. It needs the app's `assistant:write` scope;
+  without it the bridge says so rather than failing silently (CHOO-2277).
+
+### [0.17.3] - 2026-08-19
+
+#### Fixed
+- The Mattermost bridge now bridges the channels a new bot is already a member
+  of. A bot's websocket opens only after Mattermost has added it to the team's
+  default channels, so it never witnessed its own joins — the first agent on an
+  instance bridged nothing, and creating a second adopted Town Square and
+  Off-Topic late and attributed to the wrong action. Current membership is now
+  reconciled on connect rather than relying on live join broadcasts alone
+  (CHOO-2203).
+
+### [0.17.2] - 2026-08-18
+
+#### Fixed
+
+- The collaboration-bridge runtime status is delivered where the reply is. When
+  an agent was addressed at channel level its reply opened a thread on the
+  triggering message while the status line stayed at the channel root, so the
+  two landed in different places. Adapters can now opt into anchoring the status
+  on the triggering message; Mattermost takes it — where a thread is a side
+  panel, a status left at the root is the one nobody opens. The typing indicator
+  is reported against the trigger's actual location (channel vs thread) rather
+  than the status's, so it shows where the person who addressed the agent is
+  watching (CHOO-2173).
+
+### [0.17.1] - 2026-08-16
+
+#### Fixed
+
+- Agent avatars no longer show a bright square on Slack's dark message list. A
+  generated avatar is a transparent DiceBear PNG and Slack composites it onto
+  white; newly generated icon URLs now name Slack's resting dark surface as the
+  background instead. Only newly generated URLs change — an icon already stored
+  keeps its URL (#239).
+
+### [0.17.0] - 2026-08-16
+
+#### Added
+
+- Agents can carry a custom icon. Switch stores a per-agent `icon_url` — a link,
+  never image bytes — accepted at registration and set, changed or cleared
+  through a dedicated `set_agent_icon` operation and `PUT /agents/{id}/icon`; it
+  is reported on the agent summary and detail. The Mattermost bridge fetches the
+  icon and re-uploads it as the bot avatar. Because Switch itself dereferences
+  the URL, it is validated to an absolute `https` address with no embedded
+  credentials and refused when it names a local, private, loopback or
+  link-local host (CHOO-2171).
+
+#### Fixed
+
+- An agent joining a room greets it again. The greeting fires when an agent
+  notices its own arrival, and since 0.9.0 it never did: auto-accepting the
+  invite began recording the room as joined a moment before the join arrived
+  over sync, so the arrival was read as one already handled. Every room an
+  agent is invited to went ungreeted, on every connection, regardless of the
+  per-connection greeting toggle. Whether the arrival has been announced is now
+  tracked separately from membership, which the bridge needs recorded as early
+  as possible. Departing a room resets it, so being added back greets again.
+- `just test-integration` runs again. Its wiring had drifted behind
+  `RoomService`, `ProtocolService` and `AgentClient`, so every test errored
+  during setup — unnoticed, because the suite is excluded from the default run
+  and from CI. It is the suite that would have caught the greeting regression.
+- The bundled-stack **setup image** links the seeded Mattermost admin to its
+  owner, so a freshly seeded managed deployment comes up already knowing which
+  chat account the owner is — owner-only addressing then works without the owner
+  linking an account by hand first (CHOO-2172).
+
+### [0.16.0] - 2026-08-15
+
+#### Added
+
+- A Switch user can claim their messaging-app account as their own, linking a
+  Slack / Mattermost / Teams / Discord identity to their Switch login
+  (`external_user_claims`). Claiming searches the platform's own user
+  directory, so someone can be recognised before they have ever posted —
+  previously Switch only learned of a person when they first spoke, which left
+  a freshly connected workspace with nobody to pick. Each platform is searched
+  in its own way: Slack filters a paged listing, Mattermost and Discord have
+  server-side search, and Teams queries the directory through Graph. Telegram
+  has no directory a bot may search at all, so there the list falls back to the
+  accounts Switch has already seen and says why it is narrower — a smaller
+  answer rather than a refusal, since refusing would leave owner-only
+  addressing unusable on the platform for people Switch already knows. Claims
+  are not exclusive: several Switch users may claim the same account, so nobody
+  can keep the real person from being recognised by claiming it first
+  (CHOO-2137).
+- An addressing rule can name the agent's **owner**, or **any agent that owner
+  runs**, rather than a list of identities. Both resolve when the message
+  arrives, so they survive connecting a new workspace, recreating a bridge,
+  registering another agent, or the agent changing hands. The second is what
+  lets one person's manager agent keep dispatching their own workers under an
+  owner-scoped policy — that is the owner acting through a program, where
+  someone else's agent is not (CHOO-2137).
+- `GET /agents` reports each agent's `addressing_policy`, which until now was
+  only on `GET /agents/{id}`. So "which of these agents answers only its owner"
+  is one list read rather than a read per agent — the shape a client needs to
+  ask that at all, instead of a request storm (CHOO-2137).
+
+#### Changed
+
+- A messaging app declares **whether its user directory can be searched**
+  (`directory_search_supported`, beside `channel_creation_supported`). False
+  for Telegram, where a bot can only name people who have messaged it. Read
+  from the adapter class, so it is answerable before a connection of that type
+  exists — which is when a client has to decide whether asking someone to pick
+  themselves out of a directory is a question worth putting (CHOO-2137).
+- **Disconnecting a messaging app now removes the identities Switch made for
+  it** — the app's own Matrix client and the puppet behind every person Switch
+  saw on it. They were left behind, and the app's own client is not merely
+  untidy: its Matrix name was derived from the app's type and display name, so
+  disconnecting an app and connecting one named the same failed outright on the
+  leftover (`duplicate key value violates unique constraint
+  "clients_matrix_user_id_key"`). The name now carries a random tail as well,
+  because deleting the row is necessary but not sufficient: the homeserver has
+  no call for removing an account, so the old Matrix user is still there, and
+  adopting it would mean logging in with a password Switch no longer holds —
+  shared-secret registration reports an existing user as success without
+  applying the new one, which reads as a working connection that can never
+  connect. Abandoned homeserver accounts are logged on removal rather than
+  passed over in silence (CHOO-2137).
+- **An agent pings its owner, not a handle typed into its config.** The
+  per-agent `notify_user` option is gone; who to @-mention when an agent needs
+  input is now the agent's owner, resolved through the messaging account that
+  person has claimed on the platform the room is bridged to. A handle only ever
+  means something on one platform — the same person is one name on Slack and
+  another on Telegram — so a single configured string was at best right in one
+  room, and on Discord and Teams it went out as plain text that notified nobody
+  while looking like it had. An agent with no owner, or an owner who has linked
+  no account there, now **says so in the nudge** instead of posting a line with
+  the mention silently missing: a ping that reaches no one and an agent that
+  never asked look identical otherwise. Existing `notify_user` values are
+  ignored rather than migrated, and drop out of an agent's options the next
+  time they are written (CHOO-2137).
+- **Newly created agents are owner-only by default**: only their owner may
+  address them, from any room, and no agent unless the owner says so. The
+  default is applied where every registration path converges, so it holds
+  for Switch Console, the gateway, the agent bridge, the configure skill and
+  bulk subagent registration alike. Existing agents are left open — the default
+  is not applied retroactively, since that would mute every agent whose owner
+  has not yet claimed an identity. Server-side connector agents opt out: they
+  are services a deployment offers everyone, not one person's assistant
+  (CHOO-2137).
+- In-room commands are subject to the addressing policy, not just messages —
+  `!reset`, `!interrupt` and `!compact` drive an agent as surely as a mention
+  does, and previously reached a restricted agent from anyone in the room. A
+  command naming the agent draws the same one-line refusal; a room-wide command
+  is declined quietly rather than producing a refusal from every restricted
+  agent present (CHOO-2137).
+- `send_targeted_message` reports a target whose policy forbids the sender as
+  `not_permitted`, rather than as "live" for a message that will never move it.
+  The message is still sent and the target still declines it in the room: a
+  refusal belongs where the request was made, not only in the sender's account
+  of it, and the same request should not succeed or fail depending on which
+  tool carried it — a plain `@name` was never blocked. `delegate_task` remains
+  the exception and fails at the sender, because a task is a row somebody is
+  expected to work rather than something a room can decline (CHOO-2137).
+- An agent that refuses a sender because its owner cannot be identified says
+  so, and points at linking the account in Switch Console — rather than giving
+  the owner the generic refusal from their own agent (CHOO-2137).
+
+### [0.15.0] - 2026-08-14
+
+#### Added
+- Telegram collaboration bridge, at parity with Slack, Mattermost and Discord
+  (CHOO-1686). A single bot backs every agent — Telegram has no per-message
+  identity override — so an agent is named at the head of its messages, beside a
+  stable colour derived from that name, which is the closest thing to a
+  per-agent avatar Telegram allows. Inbound arrives by long polling, so no
+  public ingress is needed. Chats cannot be created by a bot, so a Telegram
+  connection declares that up front and rooms are provisioned when the bot is
+  added to a chat. Multi-file messages post as a
+  single album, and outbound Markdown is converted to Telegram's HTML subset
+  rather than its stricter MarkdownV2. See `docs/bridges/TELEGRAM_SETUP.md`.
+- One-click install links for a bridge, offered on the operator dashboard and
+  built by the adapter (`install_links`); empty for platforms installed through
+  their own admin UI. Telegram supplies one, for groups: pick the group, confirm,
+  done. It asks for **no permissions at all** — a bot posts and deletes its own
+  messages in a group as an ordinary member — so adding the bot no longer means
+  promoting it by hand. Setting a Telegram bridge up is now one BotFather setting
+  (Group Privacy off, once per bot, before the bot is added anywhere) and then a
+  link per group. Channels are added from their Administrators screen, and get no
+  link: that would need Telegram's `admin=` parameter, which not every client
+  implements, and the ones that do not open a chat with the bot instead — a link
+  that works for some people is worse than a documented step that works for all
+  of them. The dashboard's **Add to a chat** dialog says so: alongside the links,
+  a bridge can supply an `install_note` naming the chats no link reaches and the
+  route they take instead, so a missing button is never all the operator sees.
+- A bridged chat is told what the bridge can see in it, and told again whenever
+  that changes — so promoting the bot confirms itself and retracts the earlier
+  warning, and a demotion does not pass unmentioned. Visibility is settled per
+  chat rather than inferred from the bot's global privacy setting, which is what
+  made an administrator bot report a fault it did not have. A chat the bridge can
+  only see mentions in — no admin, privacy mode on — is a supported way to run
+  and is disclosed as one: a notice in the chat, and a warning naming each such
+  chat at startup. Where the answer rests on the global setting rather than on
+  admin status it is taken on trust and logged as such: Telegram reads that
+  setting when the bot joins and no API call reports which value a given chat
+  got, so a bot that predates the change is still filtered and only a re-add or a
+  promotion fixes it.
+
+- Whether a messaging-app connection may create channels is now declared rather
+  than discovered by failing, in two parts: what the platform can do at all
+  (Telegram cannot — the Bot API has no call for it) and what an operator
+  permits this connection to do, set when the app is registered and changeable
+  afterwards. The second can only narrow the first. A deployment can therefore
+  withhold channel creation from Slack or Teams as well, for a bot that holds no
+  such permission or an organisation that would rather channels were made by
+  people. The answer reaches everyone who acts on it: the room forms in the
+  dashboard and Switch Console stop offering the option and say which reason
+  applies, `list_bridges` carries `can_create_channels` so an agent can choose a
+  bridge that works, and a refused create is a `400` naming what to do instead.
+
+#### Fixed
+- Creating a room on a bridge that cannot make channels returned "Internal
+  Server Error". The adapter's explanation — make the chat on the platform, add
+  the app, Switch adopts it — was thrown away at four of the six doors into room
+  creation, because `NotImplementedError` subclasses `RuntimeError` and every
+  caller catches only `ValueError`. It is now a `ValueError` subclass, so the
+  message survives to the caller as a 4xx. Opening a DM is governed the same way.
+- Telegram admin notices reached the chat as Markdown source, `**` and backticks
+  included. They are written in Switch Markdown like every other body but were
+  handed to the API without the conversion, and everything goes out with
+  parse_mode HTML. Two notices were also written with single-asterisk emphasis,
+  which no platform's converter recognises — Slack bolded them by accident and
+  Telegram italicised them.
+- The "Open in Switch Console" link on Telegram no longer disappears, and can no
+  longer take its message with it. It is a `switchdash://` URL and Telegram
+  renders only `http(s)`/`tg:`: the client dropped the link and kept the label,
+  or the API rejected the whole message. An unsupported scheme is now posted as
+  tap-to-copy text, and the bridge warns at startup when a platform that only
+  renders web links is running without `GATEWAY_PUBLIC_URL` — which is what
+  makes the link real, in the Telegram app and on Telegram Web alike.
+- A Telegram message Telegram rejects is retried unformatted whatever the
+  reason. The retry only fired when the error contained "parse", so a rejection
+  worded any other way — "unsupported URL protocol" among them — lost the entire
+  message to a single log line.
+- A Telegram command that needs an argument is usable from the `/` menu.
+  Telegram sends a command the instant it is tapped, with no chance to type one
+  and no way for a bot to declare that one is wanted, so `/invite_agent` always
+  arrived bare — and answering with its usage line left retyping the whole
+  command by hand as the only way through, which is what the menu was for. The
+  bot now asks for what is missing, with Telegram's own reply prompt so the
+  composer opens ready, and runs the command when you answer. Giving the
+  argument up front skips it; the prompt is one-shot, so talk that continues
+  under it stays ordinary chat.
+- The no-agents notice advertises `/invite_agent` on Telegram, the only spelling
+  Telegram will register and therefore the only one its command menu offers. It
+  named the hyphenated form, which the client will not autocomplete. All three
+  forms are now listed.
+- The Telegram brand icon renders correctly in Switch Console's dark theme. The
+  plane was a hole punched through the disc rather than a white shape, so it
+  showed the background through it and came out black.
+- Bridge row action icons line up down the column again. A row carries one icon
+  or two depending on whether its platform offers an install link, and the pair
+  was not anchored to the same edge as the single, so the delete buttons sat at
+  different positions on different rows.
+- Telegram links are built from the username the Bot API reports rather than the
+  one in the bridge's config. A configured name that is not the bot's resolves to
+  whichever account does own it, so every link opened a chat with a stranger —
+  and the mismatch was already detected and then ignored, with the wrong value
+  used anyway. The bot's own name wins and the correction is logged.
+- The "add to a Telegram group" link is withheld from a bot BotFather has barred
+  from groups. Telegram answers such a link by opening a chat with the bot, which
+  from the outside is indistinguishable from a link that does nothing; the reason
+  is logged with the setting to change instead.
+- The group install link no longer asks to be an administrator, which made it
+  unusable for the groups most people have. Telegram builds that picker from
+  groups the person already administers, excluding basic groups — promoting a
+  bot in one converts it to a supergroup — so for anyone whose groups are all
+  basic it offered nothing to pick and Telegram opened a chat with the bot
+  instead, reading as a link that did nothing. Admin was only ever bought for
+  the privacy-mode exemption, and turning Group Privacy off in BotFather buys
+  the same thing once per bot rather than once per group. Promotion remains
+  documented as the repair for a single chat that was added before that setting
+  was changed, and the bot asks for it in the chat when it applies.
+- A room follows its Telegram chat when the chat is reissued a new id, which
+  Telegram does silently whenever a group becomes a supergroup. The room was
+  left bound to the old id, so nothing anyone typed reached Switch again while
+  sends kept working — Telegram forwards those — leaving a bridge that looked
+  alive and was deaf. Adapters now report the change (`CollaborationAdapter`
+  gains `set_channel_migration_handler`) and the room is re-pointed, or the
+  refusal is logged with the id to re-point it at by hand.
+
+### [0.14.0] - 2026-08-14
+
+#### Added
+
+- `opencode` is a registerable known agent type, alongside `claude-code` and
+  `codex`. It carries its own option set — auto-session, working directory and
+  notify-user — rather than borrowing another type's, and the start-session
+  command it shows in a room passes the prompt as a flag, since OpenCode reads
+  its first positional argument as a directory to open.
+
+#### Fixed
+
+- The OpenCode server-side connector no longer hangs when the OpenCode server
+  raises a tool permission request. The connector's event loop ignored
+  `permission.updated`, so no reply was ever sent, the session never went idle,
+  and the response stream blocked forever. Permission requests are now answered
+  automatically — this connector reports tool calls after the fact and performs
+  no pre-invocation mediation, so there is nothing for a prompt to gate.
+- The Mattermost bridge no longer litters a channel with "(message deleted)"
+  placeholders while an agent works. Mattermost's web client shows that
+  placeholder for any message removed while it is on screen — a permanent
+  delete looks no different to it, and no server setting turns it off — so the
+  agent's status line is now retired by editing it into a "✓ Done · 2m14s"
+  marker rather than being deleted, and it no longer moves down the channel to
+  follow the conversation (each move was a delete of its own). The marker
+  carries nothing else: it stays in the channel permanently, so it is kept to
+  the fact that the turn finished and how long it took.
+
+### [0.13.2] - 2026-08-12
+
+#### Fixed
+- `read_context`'s own documentation no longer tells agents to page by passing
+  `oldest_timestamp` back as `before`. The first is epoch milliseconds and the
+  second is parsed as ISO-8601, so following it raised instead of paging.
+
+### [0.13.1] - 2026-08-11
+
+#### Fixed
+- The first message bridged from a channel member is no longer dropped when that
+  member's puppet had joined the room in an earlier run (#199). `wait_joined`
+  only resolved on a join it observed live, so a puppet already in the room from
+  a previous process never satisfied the wait and the send was skipped. It now
+  checks current membership up front and returns immediately when the puppet is
+  already joined.
+
+### [0.13.0] - 2026-08-10
+
+#### Added
+- The Discord collaboration bridge registers native slash commands (`/…`) that
+  map onto the same in-room command dispatcher as typed `!` commands, giving
+  Discord the interaction surface Slack already had. One
+  implementation, two entry points: a slash invocation is reassembled into the
+  same positional `@token` string the `!` handlers already parse. Argument shapes
+  come from a new shared `Command.args_spec` in the command registry — validated
+  up front, so a malformed spec names the offending command and fails in CI
+  rather than taking the bridge down at startup — and registration is
+  guild-scoped. Requires the `applications.commands` OAuth2 scope: a bot invited
+  without it runs but answers only `!`-prefixed commands.
+
+#### Changed
+- **Breaking (agent-facing):** `read_context` returns
+  `{threads, truncated, oldest_timestamp}` rather than a bare list of thread
+  groups, and every entry carries a `kind`. Both connector skills
+  are updated.
+
+#### Fixed
+- `read_context` seeks to a `before` window via the homeserver's
+  `timestamp_to_event` rather than paging over everything newer to reach it,
+  and falls back to a scan with its own page budget when the server cannot
+  answer. Previously the walk shared the read budget, so a window
+  deep in a busy room returned empty however small a `limit` was asked for.
+- `read_context` now pages the homeserver instead of reading a single
+  `/messages` page, so agents see the whole room rather than the last slice of
+  it. `before` pages backwards into older history rather than
+  filtering one page, and the response reports `truncated` and
+  `oldest_timestamp` so a shortened read can never pass as a complete one. Room
+  joins now appear in the timeline as `kind: "room_join"` entries. The
+  `GET /agents/{id}/rooms/{id}/history` endpoint, which read the result as a
+  flat message list when it has always been thread groups and so returned no
+  events at all, is fixed with it.
+- Discord no longer silently drops outbound messages over its 2,000-character
+  limit. Both send paths caught the 400, logged it, and returned
+  `None`, so the message never reached the channel; text is now split on line (or
+  word) boundaries, reopening a fenced code block across the break so a torn fence
+  doesn't render the remainder as plain text. `help`, at 2,063 characters, had
+  been failing to post as `!help` for as long as the command list has been this
+  long.
+- The "no agents in this channel" notice now gives each platform its own invite
+  syntax instead of one Slack-shaped `/invite-agent @agent-name` line.
+  Discord names the argument as a field (`/invite-agent agent:agent-name`), and
+  Mattermost and Teams — which register no slash commands — no longer point at a
+  command that does not exist.
+- Outbound `@name` mentions on the Slack bridge resolve to real `<@U…>` mentions
+  from the `external_users` table, primed at startup and topped up as puppets are
+  created. The name→id map was previously filled only as a side effect
+  of resolving an inbound sender, so it was empty after every restart and whether
+  a person was actually notified depended on whether they happened to have posted
+  since — otherwise the mention went out as plain text. Matching is now
+  case-insensitive, and app/bot rows, whose `B…` id cannot form a valid user
+  mention, are skipped.
+- The first message from a channel member the room does not yet know is no longer
+  dropped. Provisioning the sender's puppet only *invited* it; the
+  join landed asynchronously from the puppet's own sync loop while the triggering
+  message was relayed immediately, and a send issued before the join is rejected
+  by the homeserver — a failure that was then swallowed.
+  `_ensure_user_in_matrix_room` now blocks on a new `ClientBase.wait_joined()`
+  (bounded by a 30s timeout) after inviting, and returns `None` rather than
+  relaying into a room the sender is not in; inbound relay failures are logged as
+  errors instead of silently skipped. This hit app/bot senders every time — they
+  key on `bot_id` and are never pre-warmed by a join.
+
+### [0.12.4] - 2026-08-09
+
+#### Added
+- Cross-artifact version compatibility, part 1 — every artifact declares what it
+  is and what it speaks. `artifacts.yaml` is the one authored
+  registry of contract revisions; per-language modules are generated from it and
+  CI fails if they are stale or hand-edited. switch-core reads its own release
+  version, discloses it and its ranges on authenticated surfaces only (the
+  `connection_state` frame, the 409 refusal body, the gateway session response,
+  and an authenticated credential-scoped `GET /version`), and records what each
+  client declared. **Nothing acts on the declarations yet** — a client that
+  declares nothing connects exactly as before.
+- The authentication surface is now **frozen**: never versioned, permanently
+  backward-compatible, and excluded from `gateway-api`, so a client can always
+  authenticate far enough to be told what is wrong.
+
+#### Fixed
+- The agent-protocol check no longer defaults a silent client to the server's own
+  version. It defaulted to agreement, and since no shipped client ever sent
+  `?protocol=`, the check had never once fired. Absent now records as unknown —
+  and still connects.
+- A protocol refusal names which side is behind. It always said "update the
+  Switch agent runtime", which for a client ahead of the server sent the user to
+  downgrade the side that was already right.
+- The compatibility check is a range overlap rather than exact equality. The two
+  numbers are equal today, so nothing changes yet.
+- `SWITCH_VERSION` is required by the standalone compose instead of defaulting to
+  `latest`, which silently floated the whole stack to whatever had most recently
+  been published.
+- The Helm chart no longer claims a version it has not been at for months. The
+  real one is stamped at package time; the file now says `0.0.0-dev`.
+- Refreshed the stale switch-core version in `uv.lock`, which the release
+  procedure never re-locked.
+
+#### Security
+- Bump core Python dependencies (cryptography, aiohttp, starlette, mcp,
+  pydantic-settings, joserfc, python-multipart) to current releases.
+
+### [0.12.3] - 2026-08-07
+
+#### Added
+- Collaboration bridges expose a workspace/home deeplink so a client can open
+  the messaging app's workspace from the gateway.
+
+#### Security
+- Admin-gate every collaboration-bridge write: updating and deleting a bridge
+  were ungated, so any authenticated user could toggle agent greetings or delete
+  a bridge (which cascades into deleting every room on it) — now admin-only
+.
+
+### [0.12.2] - 2026-08-07
+
+#### Changed
+- The collaboration-bridge runtime indicator now follows the agent: it moves to
+  the foot of the conversation and into the thread the triggering message belongs
+  to (instead of staying where the turn opened), and the agent — not the bridge
+  watching traffic — decides when it moves (new `anchor_event_id` on the
+  runtime-state protocol), so it no longer jumps below a human's message before
+  the agent has been handed it.
+
+#### Fixed
+- Runtime-indicator robustness: serialise refresh vs repositioning, and don't
+  strand the indicator when a turn ends mid-move.
+- Discord: delete an agent's messages through the same webhook that posted them
+.
+- Agent bridge: clamp a resumed cursor to the in-memory buffer head on heartbeat,
+  so a connection no longer silently skips events up to a stale cursor after a
+  switch-core restart.
+- Agent bridge: write the legacy room-binding row only for connectionless
+  (MCP-transport) callers, so a connection-backed `connect_to_room` no longer
+  leaves an unread, never-cleaned binding row behind.
+
+### [0.12.1] - 2026-08-05
+
+#### Security
+- Retire the unauthenticated `/collab` bridge-admin API (#120).
+- Re-scan and bump dependency CVEs (#123).
+- Local stacks are secure by default: published ports bind to `127.0.0.1`
+  (`SWITCH_BIND_ADDR=0.0.0.0` is now an explicit opt-in for network exposure),
+  `.env.example` ships every secret blank, and `just init-env` generates strong
+  random credentials — no more `admin/admin` reachable on `0.0.0.0` (#122).
+
+#### Fixed
+- Enforce one session of an agent per room: `connect_to_room` now refuses with
+  HTTP 409 when another session of the same agent already holds the room, and a
+  takeover evicts and reports the displaced session — instead of silently
+  stranding a session in a room whose events go elsewhere (#109).
+
+### [0.12.0] - 2026-08-04
+
+#### Added
+- Codex registered as its own gateway known-agent (connector_type "Codex") with
+  a Codex-flavored "no live session" command, instead of falling back to Claude's
+  builder (#91).
+- `cancel_task` agent operation — a requester can abandon a task it delegated,
+  recording the reason and notifying the room; served on both the MCP server and
+  the HTTP front door (#79).
+
+#### Changed
+- `list_participants` now includes each participant's `status` and `alias` (both
+  null when unset) (#79).
+
+### [0.11.0] - 2026-08-03
+
+#### Added
+- Agent bridge push transport (design + Stages A & B): a sequenced,
+  non-destructive per-agent event buffer plus a push connection with SSE
+  delivery (`GET /agents/{id}/events`, one `POST /connection/beat` for liveness
+  and cursor), replacing long-poll's destroy-on-read queue; presence becomes a
+  union of heartbeat and live connection, and connection status is derived from
+  what a connection observes rather than a declared `connection_model`. Backward
+  compatible — polling keeps working and old/new state are read together
+ (#100).
+
+### [0.10.0] - 2026-07-30
+
+#### Added
+- Full attachment support — any file type and multiple files per message, in both
+  directions across Slack, Mattermost, and Discord. Non-image files are relayed
+  instead of silently dropped, multi-file messages are coalesced into a single
+  platform post, and the 20MB size cap is now enforced inbound too; oversize or
+  failed files are disclosed in the room rather than dropped (#93).
+
+### [0.9.0] - 2026-07-29
+
+#### Added
+- Every room now gets a collaboration bridge by default: a bridge can be marked
+  default and is used when a room names none, with `internal_only` as the
+  explicit opt-out; a bundled Mattermost is provisioned across compose and Helm
+ (#84).
+
+#### Changed
+- Restyle the Switch Gateway web UI onto the Hoot design system — new light/dark
+  theme, icon-rail shell, and consistent formatting conventions; nav
+  destinations unchanged (#87).
+
+### [0.8.1] - 2026-07-24
+
+#### Fixed
+- Prevent a duplicate Switch room from being created when provisioning a Slack
+  channel (race on bridge channel provisioning).
+
+### [0.8.0] - 2026-07-24
+
+#### Added
+- Scoped agent-addressing permissions — control which agents and rooms an agent
+  may address, enforced server-side.
+
+### [0.7.0] - 2026-07-24
+
+#### Added
+- Microsoft Teams collaboration bridge — rooms can bridge to Teams channels,
+  joining Slack, Mattermost, and Discord as supported platforms.
+- Discord bridge polish: deeplink redirect, room icon, and outbound image relay
+.
+
+#### Changed
+- Relicensed to Apache-2.0 + Commons Clause, with a CLA gate for contributions
+.
+
+#### Fixed
+- Detach dependent rooms before removing a bridge, so bridge removal no longer
+  leaves rooms in a broken state (#35).
+
+### [0.6.0] - 2026-07-20
+
+#### Added
+- Discord collaboration bridge — rooms can bridge to Discord channels, joining
+  Slack and Mattermost as supported platforms.
+
+### [0.5.0] - 2026-07-20
+
+#### Added
+- New `POST /gateway/auth/refresh` endpoint: re-mints the `switch_auth` cookie
+  from a still-valid session, enabling clients (switchdash) to silently renew
+  sessions before the 24h expiry.
+- Standalone compose: bind address and host ports are configurable via env
+  vars (`SWITCH_BIND_ADDR`, `POSTGRES_HOST_PORT`, `API_HOST_PORT`, …) —
+  consumed by switchdash's local-server mode.
+
+### [0.4.0] - 2026-07-19
+
+#### Added
+- The standalone Docker Compose file is published to GHCR as a versioned OCI
+  artifact (`standalone-compose:<version>`, plus `latest`) on every release,
+  pinned to the same version as the images and chart — switchdash's
+  local-server mode consumes it.
+
+### [0.3.0] - 2026-07-17
+
+#### Added
+- Agents can send images from rooms, relayed out through the Slack and
+  Mattermost collaboration bridges.
+
+### [0.2.1]
+
+#### Fixed
+- switch-core Deployment now uses `strategy: Recreate` so upgrades don't briefly
+  run two pods — a second replica collided with the singleton's in-memory Matrix
+  sync / collaboration-bridge sessions and could leave a bridge stuck until a
+  manual restart.
+
+### [0.2.0]
+
+#### Added
+- Helm chart: `global.imagePullSecrets` for pulling the images from a private
+  registry (e.g. a private GHCR namespace); defaults to empty so public-image
+  installs are unchanged.
+
+### [0.1.0]
+
+#### Added
+- Packaging metadata for `switch-core` (authors, URLs, classifiers, license
+  placeholder) and a `switch-core` console entry point.
+- Image-publishing CI: multi-arch (amd64/arm64) `switch-core`, `gateway`, and
+  `setup` images published to GHCR, plus the Helm chart published as an OCI
+  artifact, on `switch-v*` tags.
+- Documented release procedure (this file + `RELEASING.md`).
+
+#### Changed
+- Distribution endpoints (electron-updater target, plugin-marketplace source,
+  image registry/namespace) centralized so the eventual public-repo move
+ is a configuration flip.
+
+- Initial internal version. History predating the changelog lives in the git log.
+
+---
+
+## switch-console
+
+### [Unreleased]
+
+#### Added
+- **Replace a messaging app's token without disconnecting it.** When a bot
+  token is rotated or leaked, a workspace admin can paste the new one from the
+  connection's menu on the server page. The connection restarts with it and
+  keeps its rooms. Offered on connections to your own bot, not on ones that
+  came from installing Switch's app.
+- **Airtable's logo on the Connections grid.**
+- **Admin → Connector apps sets up Airtable.** Its dialog walks Airtable's
+  Builder Hub with the redirect URL to copy and the scopes to tick, and asks
+  the operator to confirm the integration's support details are set, which no
+  check can see. A server that does not send `redirect_uris`,
+  `needs_public_url` and `scopes` is read as before.
+- **Saving a connector app shows what its check said.** After Check and save
+  or an updated secret, the app's page opens with the vendor's answer and any
+  note, as Check it works shows them.
+- **Connectors says why Airtable or Google Workspace can't be connected on a
+  server without a public address**: the operator is told to set
+  `GATEWAY_PUBLIC_URL`, and everyone else whom to ask.
+- **Codex sessions can use an API key kept in the OS keyring.** With
+  `cli_auth_credentials_store = "keyring"` or `"auto"`, the execution machine's
+  Codex keeps its login in the keyring, where a session's own Codex home cannot
+  find it, so every session failed with "Sign in on the execution machine with
+  codex login" while `codex login status` said it was signed in (#1048). When
+  the machine has no `auth.json` to copy, a session now asks its Codex for the
+  API key as it starts and keeps it in the memory of the session's own Codex
+  process: it is not written to a file, put in the environment or copied into
+  another keyring entry, and a changed key is picked up at the next start. A
+  ChatGPT login in the keyring cannot be handed over, and the session says so
+  with the file-storage workaround; it also refuses to hand over the key when an
+  administrator's Codex configuration would have it saved elsewhere. A session
+  that still has a working login of its own, such as one it copied while the
+  machine had an `auth.json`, starts as before; a copy that no longer works is
+  removed.
+
+#### Changed
+- **Managed agents and machines update when the server says they changed.**
+  Against a server that pushes change notices, Console reads those lists
+  again when told to, and otherwise only every five minutes instead of every
+  15 to 30 seconds; against one that does not, it polls as before (#717).
+- **One name for the controller.** Console, the Gateway and the docs say
+  "agent controller" everywhere, matching the `switch-agent-controller`
+  package, instead of a mix of "agent controller" and "agents controller".
+  The delete dialog on a server's page now calls it "this Switch server that
+  Console runs" rather than a "managed server", which read like "managed
+  agent"; it was the only place Console showed that name.
+
+#### Fixed
+- **Console no longer opens to a blank window on a database a newer build
+  has changed.** Stable and Canary share one database, so after Canary added a
+  migration, an older build found tables it was not written for, applied
+  nothing, and failed its first query with nothing on screen. Console now
+  refuses a database carrying a migration it does not know, before changing
+  anything, and says why: open the build that last used it, download a newer
+  release (a build that cannot start cannot update itself), or move the data
+  folder aside to start empty. Migrations are tracked one by one, so a
+  migration applied out of order is applied rather than skipped. Any other
+  startup failure now shows the error and a Reload button instead of a blank
+  window. drizzle-kit now defaults to the dev data folder's database rather
+  than the installed app's.
+- **Giving a machine a Vertex AI login no longer pre-fills a project.** The
+  Google Cloud project field started out filled with one organisation's own
+  project, so anyone else who kept it got a sign-in failure with nothing to
+  say why. It now starts empty, with a placeholder; the region still starts
+  at `global`.
+- **Two agent hosts starting at once on Windows no longer crash each other.**
+  A host reading another host's ownership ticket while that host replaced or
+  deleted it got `EPERM` from Windows and exited. It now tries the read again
+  for a few seconds, as it already did for its own writes.
+- **Codex is no longer shown as ready with a login sessions cannot use.** A
+  ChatGPT login kept in the OS keyring passed Console's sign-in check, so
+  Codex showed as signed in while every session failed: a session takes that
+  login only from `auth.json`. The check now reports a login sessions cannot
+  reach as not signed in, and says why: a ChatGPT login or a Bedrock key
+  Codex keeps in the keyring, an `auth.json` Codex ignores because it is set
+  to use the keyring, and an API key in the keyring that Codex will not hand
+  over or that an administrator's Codex configuration stops Switch handing to
+  sessions. It gives the switch to file storage where that helps and names
+  the Codex home it checked (from `~` when it is under your home folder), and
+  when it cannot tell, it says so and why.
+  Otherwise an API key in the keyring still counts as signed in, since
+  sessions are handed it. The provider status card and the warning beside an
+  agent now show what the check said when a provider is not signed in,
+  instead of a generic line.
+- **Console stops offering a sign-in that cannot help.** When a provider's
+  check says signing in would not fix it (an administrator pinning where
+  Codex keeps logins, or a check that could not finish, say), the status
+  card, Settings → Agent providers and switch-buddy say it can't be used yet
+  and why, instead of "Not signed in" with the login command or a Sign in
+  button.
+- **A relative `CODEX_HOME` is refused.** Codex reads one from whichever
+  directory it starts in, which differed between Console's check and
+  Switch's sessions, so the two could look at different Codex homes. Both
+  now say to set an absolute path, and a session will not start with one.
+- **Settings → Agent providers keeps this computer's report current.** It
+  prefers the report from the server Console is on, rereads it while open and
+  after the controller reports again, and the install section says so when
+  Console's own check disagrees with the controller's.
+- **The local Switch server starts on Intel Macs without Homebrew.**
+  cryptography publishes no wheel for Intel Macs, so the Intel build of
+  Console compiled its own against the build machine's Homebrew OpenSSL, and
+  on a Mac without Homebrew the server failed to start with `Library not
+  loaded: /usr/local/opt/openssl@3/lib/libssl.3.dylib`. The bundled
+  cryptography now carries its own OpenSSL, as cryptography's wheels for Apple
+  silicon do, and a macOS build fails if anything in the local server links a
+  library that is neither macOS's nor shipped with it.
+- **Setting up a server notices Docker once it starts.** "Set up a server on
+  this computer" checked for Docker only when the step opened, so installing or
+  starting Docker meanwhile left the setup skipping Mattermost until you went
+  back. It now checks again every few seconds, and when Console regains focus,
+  while Docker isn't answering.
+- **Starting Docker with the server page open now enables the Mattermost
+  switch.** The server page checked for Docker only when it opened, so Docker
+  Desktop started afterwards left the switch greyed out until you left the
+  page and came back. It now checks again the way the setup step does. A
+  running server whose Mattermost was left out or failed to start, because
+  Docker was off, shows the switch off, so turning it on brings Mattermost up
+  without a restart (#1021).
+- **A local Mattermost shows up as soon as it is ready.** When the Mattermost
+  beside a local server finished setting up, pages already open kept showing no
+  Mattermost and asked you to link an account until the server was restarted.
+  They now refresh the messaging apps and linked accounts the moment it is up
+  (#1021).
+- **Agents say who can answer their questions and approvals.** The Switch
+  skill said a request card needed the owner's linked identity and room
+  membership. Its addressing policy decides, and agents now read theirs with
+  `get_agent_detail` and name the people who can answer.
+- **Giving this computer's Codex login to a machine explains a keyring
+  login.** When Codex keeps its login in the OS keyring
+  (`cli_auth_credentials_store = "keyring"` or `"auto"`), it said "This
+  computer is not signed in to codex". It now says the login is in the keyring,
+  which cannot be given to another machine, and gives the workaround for a
+  machine whose organization does not enforce the keyring: switch Codex to file
+  storage, which keeps the login in plaintext, and sign in again (#1048).
+
+### [0.40.1] - 2026-10-21
+
+#### Added
+- **Managed agents and template-made rooms are reported, and managed servers
+  point at the current relay** (#963).
+
+#### Fixed
+- **Search under agent management shows managed agents, not legacy ones**
+  (#975).
+- **Deleting a managed agent removes the Console agent it was moved from**
+  (#974).
+
+### [0.40.0] - 2026-10-20
+
+#### Added
+- **Chat-first Console backed by Switch rooms.** Console leads with agents and
+  rooms and a chat view, with a room summary shown in place and quieter tool
+  activity in chats (#716, #934).
+- **Guided first-run onboarding with switch-buddy.** A fresh install walks
+  through onboarding and ends in a chat with switch-buddy — an assistant that
+  knows its context and can hand you Console links — with an intro animation
+  and page entrances (#879, #915, #942, #932, #930).
+- **Run a local Switch server without Docker** (#915).
+- **Delete my account** from Console (#915).
+- **Stable ships with onboarding and the managed server's feature flags on
+  (Switch Cloud off).** A stable build now shows the first-run onboarding, and
+  the Switch server Console manages starts with agent management, agent chats,
+  switch-buddy, follow-the-conversation and service connections enabled. Switch
+  Cloud stays off in stable.
+- **The server's operator sets up connector apps in Console.** For the
+  operator, the Admin page has a Connector apps section under Server, below
+  the workspace's switches: the GitHub App and Google Workspace's OAuth
+  client as tiles, the
+  ones needing attention first, each with its state and the one thing to do
+  next. A tile opens the app's page, with its client, its secret's last four
+  characters or its key's fingerprint, who uses it and a check with the
+  vendor; updating a secret, switching to a different app and removing it are
+  in its menu. Setting one up walks through creating it at the vendor, with
+  the values to paste and copy buttons, then checks and saves it in one step,
+  marking the value the vendor refused. It is the dashboard's Connectors page,
+  which stays for now. Needs a server from this release.
+- **Console follows a server that keeps names away from avatar services.** On a
+  server with `THIRD_PARTY_AVATARS_ENABLED=false`, Console no longer loads
+  DiceBear or ui-avatars.com images for that server's agents and shows their
+  initials instead. Its icon picker offers only an image link and refuses one
+  to either service, new agents are created without a generated icon, and it
+  no longer writes generated icons onto existing agents. Until it has heard
+  from a server, Console shows initials rather than send a name, and it reads
+  the setting again every few minutes, so a server restarted with it changed
+  needs no Console restart. A setting it cannot read counts as off: the icon
+  picker says so and offers to ask again, and a new agent is still created,
+  without a generated icon. Agents on servers that leave the setting on look as
+  before. Older versions of Console load those images whatever the server says.
+
+#### Changed
+- **Link your account right after adding a messaging app.** Every way into
+  connecting an app, including a Console link from switch-buddy, now ends by
+  offering to link your own account on it (Telegram explains how instead).
+  The server's Home page keeps a **Link your … account** prompt until you do.
+- **The delete-room dialog asks about the channel.** Deleting a room keeps
+  its channel unless you tick **Also archive the … channel** (or delete it on
+  Discord, or have the bot leave on Telegram); the dialog says what will
+  happen either way, and shows what to clean up by hand when the server could
+  not retire it. Teams channels always stay. Needs a server from this
+  release; an older one gets "the channel may remain".
+- **A new agent starts on "Me and my agents".** "Who can talk to your agent"
+  now opens on **Me and my agents (default)**: you and any agent you own.
+  **Only me** is still one choice away, and agents that already exist keep
+  their setting. A template agent with no `addressing` is created the same
+  way.
+- **Usage data goes to `telemetry.switchagents.ai`.** Console reported to
+  `telemetry.flintai.dev`, an older name for the same relay that is being
+  retired. Only where it is sent changes; what is sent, and the opt-out, do not.
+- **A sign-in comes back to Console on its own.** When the browser returns
+  from a service's sign-in, Console comes to the front with the next step
+  showing, and the browser's page says the sign-in is done and the tab can be
+  closed. It used to stay behind the browser, with a page telling the person
+  to return to it and confirm. Services whose sign-in returns through the
+  server (Google Workspace, GitHub) also no longer stop on the server's
+  "Continue in Switch Console" page, with a server from the same release.
+- **A sign-in connects without a confirm step.** Once the browser returns,
+  the server keeps the connection and Console shows the result: a service
+  whose agents are added from its page opens that page with the search ready,
+  and any other shows "connected" in the dialog. Console no longer asks to
+  confirm the account first; the account is chosen at the vendor, and
+  Disconnect undoes a wrong one. A sign-in the server refuses, such as an
+  account already linked to someone else in the workspace, shows the reason in
+  the dialog, and the browser's page says to look there. GitHub's sign-in
+  works the same way. Needs a server from this release.
+- **A connector's agents are managed on its page, the way a room's
+  participants are.** The connector's page lists the agents using it as
+  cards, with each agent's avatar and what runs it, under an "Agents" heading
+  with the count. "Add agent" opens a search of your other agents under the
+  cards, and choosing one turns the service on for it at once. Connecting a
+  service now lands on its page with that search open, instead of a checklist
+  in the connect dialog. An agent others can address is offered with a note
+  that it would act as you. A cross on a card, shown on hover, turns the
+  service off for that agent again, so one agent's access can be taken away
+  without disconnecting from every agent.
+- **GitHub is connected, and handed to agents, from its page like any other
+  connector.** Its page has a Repositories section: one card per account the
+  App is installed on, with its count, opening to a directory of names in
+  columns that is searched rather than scrolled once it is long, re-read as
+  the window regains focus. The section's "Choose repositories", "Change
+  repositories" once there are some, goes straight to GitHub. The connect
+  dialog ends with Done once GitHub is connected, the page behind already
+  current; it no longer offers Back or Disconnect, which the page has. "Add
+  agent" is offered for GitHub too: what every added agent gets is chosen
+  above the search, and the page says so while nothing is chosen, since no
+  agent can be added until something is. "Choose repositories" opens the
+  choice in place: the account where there are several, the repositories as
+  chips, added one by one from a search or all at once and removed with a
+  cross, and whether the agent may push. An agent's own choice is changed on
+  its Connections tab, whose form is the same choice in place of the account
+  dropdown and checkbox list.
+- **A workspace's service switches are on an Admin page.** They were a
+  "Workspace" tab on the Connectors page, beside Yours and Discover. An Admin
+  entry in the sidebar, shown to the workspace's admins and the server's
+  operator where service connections are on, opens a page laid out like
+  Settings: its sections down the side, grouped under what they reach
+  ("Workspace" and the workspace's name). Its Connectors section shows the
+  switches as tiles like Discover's: each service with its category, how many
+  members have connected it and agents use it, and who last changed it, with
+  its switch. A tile keeps its place when it flips, and switching one off
+  still asks first when anyone uses it. The Connectors page has Yours and
+  Discover again, with "Manage in Admin" in its header for an admin, and its
+  search now fills the row.
+- **Connector tools ask in approval-required and auto-accept-edits mode.**
+  Calls to a granted service's tools (Jira and Confluence through Atlassian,
+  Datadog, Google Workspace) used to run without asking in every mode. They now
+  follow the agent's mode, as its other tools do: an approval card asks first,
+  and declining tells the agent the call was refused. Full access still allows
+  them, and Switch's own room tools never ask. The first such card in a session
+  comes with a notice saying why. Claude Code, Codex and OpenCode cards name the
+  server and tool and show what the call will send, so the text of a comment
+  can be read before it is posted; a long input is cut and the card says how
+  much is not shown. Codex cards can be approved for the rest of the session. A
+  session started before the update keeps allowing them until it restarts.
+- **A Console session in "approval required" no longer inherits your own
+  Claude Code default mode.** Console now starts a Claude Code session in that
+  mode with Claude Code's `default` permission mode. It used to leave the mode
+  unset, so a `defaultMode` such as `auto` in your own Claude Code settings
+  applied, and tools, connector tools among them, could run without the
+  approval card the mode promises.
+- **A session says which services it lost or gained.** When a running session
+  restarts because its agent's services changed, it shows a notice naming
+  them, for example "Datadog was removed from this agent's tools: it was
+  switched off for the workspace, or its grant was removed." The agent is told
+  the same as it resumes, so it does not look for tools it no longer has.
+
+#### Fixed
+- **Switch buddy stops waiting on a Claude Code it cannot check.** A Claude
+  Code from before `claude auth status` left the AI provider screen on
+  "Checking" until its timeout; it now asks to sign in and says the CLI may be
+  too old. A login that is there but cannot answer a test prompt shows Claude's
+  own error next to Sign in.
+- **Settings → Agent providers finds a CLI installed since Console started.**
+  Console now looks in `~/.local/bin`, where the Claude Code and OpenCode
+  installers put their CLI, at start and on every refresh, as this computer's
+  agents controller already did. Before, a Claude Code installed by hand showed
+  "CLI not installed" there while Switch buddy was using it.
+- **Settings → Agent providers and Switch buddy agree on this computer's
+  providers.** When this computer's agents controller has reported to a
+  signed-in server, Settings shows that report, the one buddy and Switch go
+  by, and its refresh asks the controller to check again. Console's own check
+  is used only when there is no such report. Install and update still run
+  through Console's own check.
+- **A failed agent install says why.** Installing Claude Code, Codex or another
+  provider from Switch buddy showed only "Install command failed." It now says
+  when the disk is full, and otherwise adds the line of the install output that
+  says what failed.
+- **Signing in to a service through Core works on a server whose gateway and
+  API are on different hosts.** Core sends the browser through its own
+  authorize step at its public address, the API's host, where the vendor
+  returns it; Console only accepted the gateway's host and refused the sign-in
+  as an invalid URL. It now accepts either of the server's own origins, over
+  HTTPS. Google Workspace connects this way.
+- **The usage-data note says what a "yes" does on a shared server.** The
+  consent dialog and Settings said the answer applies to a server Console runs
+  for you. On a server other people also run from their own Console, a "no"
+  turns sharing off for everyone at your next start, while a "yes" leaves it as
+  it is — on stays on, off stays off — unless none of them has used the server
+  in the last 14 days. The note now says so.
+
+### [0.39.1] - 2026-10-13
+
+#### Fixed
+- **Support the gateway and API on different hosts when connecting a
+  service.** Some deployments serve the Switch dashboard and its API from
+  separate addresses. Console now accepts either of your server's own
+  addresses, over HTTPS.
+
+### [0.39.0] - 2026-10-12
+
+#### Added
+- **Service connections follow the server's `service_connections` flag,**
+  apart from cloud machines. With it off, Your Agents offers no Connections,
+  no agent shows Service access, and setting up Switch Cloud goes straight
+  from signing in to the first cloud agent; turning it on reaches a running
+  Console without a restart.
+- **Agents / Rooms sidebar and a reworked workspace menu.** On a server with
+  agent management, Console leads with Agents and Rooms above the legacy
+  Sessions, behind the server's feature flags, and the workspace menu is
+  restyled (#751).
+- **Managed server status and a Server page.** A managed server shows status
+  dots, has its own Server page, and surfaces a frozen-workspace state (#762).
+- **Switch Trust settings.** Guardrails are configured from a settings panel in
+  Console, backed by the gateway's Switch Trust API (#747).
+- **Windows support for managed agents and the controller** (#765).
+- **Canary has its own switch-core pin.** The canary build can bundle and run a
+  different switch-core release for the servers it manages than stable does — a
+  pre-release can be tried on canary without moving stable. The canary pin can
+  never be older than the stable one. Canary and stable share their managed
+  servers on one computer, so once canary has updated one, stable will not start
+  it again until stable's pin catches up (#764).
+- **Switch cloud on the agents controller.** On a server whose cloud machines
+  run the agents controller, choosing Switch cloud in the New agent form starts
+  your cloud machine and waits for it to come online (its first start takes a
+  few minutes), then creates the agent as a managed agent on it, like on any
+  machine. Once online, the machine is listed as "Switch cloud" among your
+  machines. A server whose machines run the hosted worker works as before.
+- **Give a machine a provider login.** In the New agent form, a machine with
+  a provider installed but not signed in offers to give it a login: a Claude
+  setup token or API key, a Codex or Cursor API key, or this computer's own
+  Codex, OpenCode or Antigravity sign-in. Console seals it to the machine's own
+  key before it leaves, so the server only relays it, and shows whether the
+  provider signs in with it on the machine.
+- **Agents granted GitHub can use it in every session.** Git's credential
+  helper and a `gh` wrapper are set up for `https://github.com` in the session
+  alone, and ask the agent host for a short-lived token; SSH remotes and other
+  hosts keep your own setup. Nothing is set up for an agent without a GitHub
+  grant, or on Windows yet. A token GitHub refuses is replaced on the next
+  command. Tokens are scrubbed from session logs, transcripts, activity shown
+  on messaging platforms and anything the agent posts to a room.
+- **Service access in an agent's settings and on a managed agent's page,**
+  Switch cloud agents included: its grants, the GitHub repositories they
+  reach, and a warning, with "Make owner-only", when anyone can address the
+  agent.
+- The skills of an agent's granted services reach each session, and a session
+  is told when its agent's grants could not be loaded.
+- A server's Connections show a connection that needs reconnecting, and why a
+  service cannot be granted on that server.
+- Connecting GitHub says when an organization's single sign-on hides its
+  installation of the App, and what to do, instead of waiting on access that
+  cannot appear.
+- **Connect Atlassian, and any other service the server offers, from
+  Connections.** Signing in happens in your browser and comes back to Switch
+  Console, which confirms the account with you before the server keeps it.
+  Atlassian takes a sign-in back only on a few fixed ports on your computer;
+  if all are in use, Switch Console says which to free.
+- **Agents granted a service whose tools are a command-line tool, such as
+  Google Workspace, get that tool in every session.** The session host runs
+  the vendor's pinned build itself, never through a shell, after checking each
+  command against the service's catalog entry, and keeps every file it reads or
+  writes inside the session's folder. Each run works in a folder of its own,
+  with your token in its environment for that run alone; the coding tool never
+  sees the token, and it is scrubbed from the output. The build is downloaded
+  on first use and checked against its pinned SHA-256; the agents controller
+  reports it among its tools.
+- **Agents granted a service such as Atlassian get its tools in every
+  session,** as an MCP server of their own beside Switch's. The session host
+  calls the service with your token, which never reaches the coding tool, and
+  scrubs it from everything the session records. A service that is slow or
+  failing shows as one failed server, and Switch's tools keep working. Only
+  text from a service's tools is passed on; anything else is replaced by a
+  line saying what was left out.
+- Service access in an agent's settings shows services such as Atlassian as an
+  on/off switch, saying what on means and how soon off takes effect.
+- **Connect a service with a key, such as Datadog, from Connections.** You
+  paste its keys and pick its site in a form; Switch checks the key with the
+  service before keeping it, and never shows it again. Agents granted the
+  service use it with your key, which the session host puts in each request or
+  run as the service's catalog entry says, and scrubs each key from everything
+  the session records.
+
+#### Changed
+- The agents controller reports `git` and `gh` as found, missing, or not
+  supported on Windows.
+- **An idle session now parks after a day rather than 30 minutes.** Set
+  `SWITCH_SESSION_PARK_AFTER_MS` on the session host to choose another
+  timeout, or `off` to never park.
+
+#### Fixed
+- **A session whose provider offers hundreds of models no longer dies on its
+  next message.** OpenCode signed in to many providers lists more models than
+  a session event can hold, so every update to the session was refused and
+  the host stopped when the next message arrived, leaving the room
+  unanswered. The catalog is now cut to fit (without the models' options
+  first, then without the models past what fits, the selected one kept), and
+  the session says so. A host that fails also records its failure without the
+  catalog, rather than failing again on it.
+- **A machine whose controller Switch refuses for good says so instead of
+  restarting it forever.** When the server needs a newer agents controller than
+  Console carries, "This computer as a machine" shows that Console needs an
+  update and stops restarting the controller. When the server no longer knows
+  its credential, Console forgets it as it does for a removed machine, and
+  enrolls the machine again on the next check. SSH hosts set up by Console
+  stop restarting on either and enroll again on the second.
+- A session's helper endpoint for GitHub no longer hands out the token of any
+  other service the agent was granted.
+- **A Claude Code session is no longer parked while its background subagents
+  are still working.** The idle timer only looked at turns, so a session whose
+  turn had ended with subagents still running in the background was stopped
+  after the idle timeout, taking the subagents with it. Those subagents now
+  count as activity, and the idle wait starts again when the last one stops.
+
+### [0.38.1] - 2026-10-01
+
+#### Fixed
+- **Clean recovery after the machine sleeps.** On wake, a watcher no longer
+  takes itself over, a silently-dropped SSH connection is detected rather than
+  trusted until it says it closed, and an agent shows a single status row
+  instead of duplicates (#621).
+
+### [0.38.0] - 2026-09-30
+
+#### Changed
+- **Updating the sidecars on a host with many agents takes a fraction of the
+  SSH round trips.** Each agent's bring-up used to check the host's shared
+  bundle for itself — half a dozen commands asking the same question — and
+  then stop an old sidecar, write its flags, stage its configuration and
+  launch it in as many more. The bundle is now checked, and uploaded if
+  needed, once per host, and each agent is brought up in one command after
+  its configuration is staged: about two round trips instead of thirteen.
+  Agents are still brought up one after another, so their reconnects to
+  Switch stay spread out.
+- **Every agent starts a session when it is addressed; the "Auto-create a
+  session on notify" setting is gone.** Its switch is removed from the agent
+  page and the create form, and new agents register as `auto_session`.
+- **Opening an agent's page only reads.** Reading the auto-session setting used
+  to re-launch the agent's controller as a side effect, which on a remote host
+  uploaded the sidecar bundle and replaced an outdated sidecar, and checking a
+  provider's sign-in or models uploaded the bundle too. The provider check now
+  uses the bundle already on the host, and says so when there is none. The
+  bundle is uploaded only when an agent is started, restarted or updated.
+
+#### Fixed
+- **A remote agent's status can no longer go stale.** Console used to learn
+  whether a remote agent was connected only from what its sidecar pushed down a
+  long-lived connection, and trusted that connection until it said it had
+  closed. One that died without saying so, as when every sidecar is replaced
+  while its host's SSH connection is rebuilt, left the last thing it carried
+  on screen for good: agents that were answering in Slack showed "Connection
+  failed" and "The agent's room watcher is not running". Console now reads each
+  host every five seconds, in one command for every agent on it, and the
+  sidebar and the agent's page are both built from that one read.
+- **Agents come up after Console starts without their page being opened.**
+  Console now brings each host's agents up side by side, so a slow or wedged
+  SSH connection holds back only that host, never local agents or other hosts,
+  and it keeps retrying an agent whose controller could not start, backing off
+  from 30 seconds to 5 minutes. Before, an agent that failed once stayed off
+  until its host reconnected or its page was opened.
+
+### [0.37.3] - 2026-09-29
+
+#### Changed
+- **The bundled Switch skill now documents the workspace-template tools** an
+  agent can use — finding, reading, running and saving templates (#554).
+- **The bundled local Switch server moves to switch-core 0.29.0**, so
+  local-server mode ships the workspace-template feature those tools rely on.
+
+### [0.37.2] - 2026-09-27
+
+#### Changed
+- **Checking a remote agent's watcher reads only that agent's own state.** The
+  watcher panel, session start and the sidecar connection used to read every
+  agent's watcher configuration on the host to find one, so any other agent's
+  broken or duplicated state could fail them. The agent's directory is named
+  from its identity, so it is now read directly; the others are only looked at
+  when it has none, to adopt a watcher saved under an earlier name.
+
+#### Fixed
+- **A remote agent's room watcher no longer fails with "Competing saved
+  watchers require explicit cleanup" or an unreadable-config error after a
+  launch was interrupted.** Each launch staged the agent's configuration in a
+  scratch directory beside every agent's watcher state, and the watcher status
+  check, session start and session listing all read that directory in full. A
+  scratch directory left behind by a dropped SSH connection held either a
+  half-written file, which broke the check for every agent on the host, or a
+  complete copy of one agent's configuration, which made that agent look like
+  it had two watchers. Launches now stage in a separate `sdk-launch` directory,
+  the readers skip any scratch directory an earlier version left, and each
+  launch removes staged configurations abandoned more than an hour ago, since
+  they carry the agent's credentials.
+- **Agent discovery failures no longer dump a raw error into the sidebar.** A
+  failed discovery now shows a compact discovery-failure indicator instead of
+  the raw error text (#565).
+
+### [0.37.1] - 2026-09-26
+
+#### Fixed
+- **An agent's instructions and settings can no longer be blanked or reverted
+  by the Console itself.** The agent's config file (`.switch/config/<name>.json`)
+  is now the only record: opening an agent's page never writes anything, Claude
+  Code sessions get their agent definition from the config file directly instead
+  of from `.claude/agents/<name>.md`, and that file is no longer written or read
+  back. A missing config file is reported as an error rather than treated as an
+  agent with no instructions. A one-time migration gives every existing agent a
+  config file, taking over its description and any hand edits from the old
+  definition file; attaching to an agent, or adopting a subagent, creates one
+  when it is missing. Deleting an agent's provisioned files now removes its
+  config file too, so an agent re-created under the same name starts clean.
+
+### [0.37.0] - 2026-09-25
+
+#### Added
+- **Codex sessions get the Switch skill (and the agent's own instructions) as
+  developer instructions**, like Claude/Cursor/Antigravity — no skill file is
+  written, so a session no longer needs shell approval to read it, and a failed
+  turn now shows its reason (#547).
+- **Providers report per-turn token usage** — prompt/completion plus cache reads
+  and writes — on the session activity stream, feeding server-side usage
+  metering.
+
+#### Changed
+- Sidecar session handling refined: shared-agent-runtime initial prompt,
+  session-command and stop-shared-session paths, and transcript handling.
+
+_Supersedes the never-tagged 0.36.0; that release's changes (below) ship to
+users for the first time here._
+
+### [0.36.0] - 2026-09-25
+
+#### Added
+- **Sessions live with the host.** Console and its sidecar now own agent
+  sessions and their lifecycle; switch-core only relays the connection (#543).
+- **Capture, publish, share and search room templates.** Capture a live room as
+  a shareable, parameterized template (values become `{key}` placeholders), and
+  publish, edit, share and search templates from the Console (#501).
+- **Templates.** Create a new agent from a template, with a dedicated
+  create-from-template view (#405).
+- **Load and manage agents on a remote host** (#364).
+
+#### Changed
+- Connector telemetry events now carry a failure reason and a `duration_ms`
+  (#488).
+- **Managed servers behind the app's switch-core pin are upgraded
+  automatically**, and sessions wait for it. The local server is upgraded at
+  startup and a remote managed server when its host is reconciled (at startup
+  and whenever the host becomes reachable); a stopped one is upgraded at its
+  next start rather than started at the old version. Every database is backed up
+  with `pg_dumpall` into a timestamped `backups/` directory next to the stack
+  first, and an `upgrade.json` journal resumes an interrupted upgrade or refuses
+  it loudly. Sessions and room watchers for agents on the server wait while it
+  updates and are refused with the error if it fails. The server page shows the
+  update's progress, or its error and a Retry button, in place of the optional
+  "Restart to update" banner.
+- **Usage telemetry is now opt-out.** The setting defaults to on and the
+  first-run dialog is a notice rather than a question — it still states what is
+  shared, is not dismissible, and carries the off switch (pre-set to on).
+  Consent is re-read before every event, so turning it off stops the next event.
+  A migration preserves anyone who had already opted out (#490). The managed
+  server honours the same single telemetry answer (#529).
+- **Watchers are console-parented locally and sidecar-parented remotely**, so a
+  watcher's lifecycle follows the process that should own it (#507).
+- Local-server mode now bundles **switch-core 0.28.0** (was 0.25.0), and the
+  refreshed agent-runtime 0.7.0 and sidecar 1.9.9.
+
+#### Removed
+- **Dead UI and RPC surface removed** from the Console (#526, CHOO-2323).
+- The bundled connector plugins are retired: every session now gets the Switch
+  tools from its own host and the Switch skill pushed by Console. The plugin
+  files remain only so Consoles that have not updated can still install and
+  update the plugin they expect (see `connectors/DEPRECATED.md`).
+
+#### Fixed
+- An unusable remote working directory is reported before an identity is minted,
+  rather than failing later (#373).
+- The managed stack provisions the database roles it now needs and records why
+  it sets no messaging-app variables; the bundled standalone compose is
+  re-synced.
+
+#### Security
+- Untrusted room-message bodies are fenced in the prompt delivered to a session,
+  matching the switch-core hardening (#527).
+
+### [0.34.0] - 2026-09-06
+
+#### Changed
+- **Local-server mode drops Matrix.** The bundled standalone stack no longer
+  runs a Tuwunel service or sets `MATRIX_*` environment, matching switch-core
+  0.25.0; an existing local stack is migrated off Matrix on start. Bundles
+  **switch-core 0.25.0** (was 0.24.x) (#380).
+
+### [0.33.0] - 2026-09-06
+
+#### Added
+- **Local control API for programmatic agent management.** A localhost-only,
+  token-gated HTTP server in the main process (127.0.0.1 on an OS-assigned port,
+  credentials in a 0600 file in the app data dir) exposes the same
+  agent-management operations as the UI — list/read agents, list an agent's
+  sessions, and start a session (#362).
+
+#### Changed
+- Agent names are auto-lowercased as you type in the New Agent dialog, matching
+  the identifier rules (rather than rejecting after the fact).
+- Local-server mode now bundles **switch-core 0.24.0** (was 0.23.0), and picks
+  up the internal Postgres LISTEN/NOTIFY transport client-side (#363).
+- Refreshes the connectors so installs pick up the display-name skill updates
+  (Claude Code 0.9.13, Codex 0.3.14, OpenCode 0.1.9).
+
+### [0.32.0] - 2026-09-03
+
+#### Added
+- **A session that dies on an API error now says so.** A Claude Code turn that
+  fails on expired credentials, quota or a provider outage fires `StopFailure`,
+  which nothing listened for — the channel just went quiet and the operator had
+  to open the TUI to find out why. It now maps onto the `error` status and
+  carries the reason through, so the deeplink ping names what broke instead of a
+  bare "needs your input" (#356).
+
+#### Changed
+- **Sidecar upgrades are taken under live sessions now, except a major.** A
+  sidecar whose build differed from the client's used to be left alone whenever
+  it owned a session and upgraded only once idle, so a busy host could sit on a
+  stale sidecar indefinitely. The upgrade (a few seconds of room injection) is
+  now taken while sessions run; a major bump still waits for idle (#356).
+- Registering an agent with a name that isn't accepted now offers a valid slug
+  instead of rejecting it, and shows the rejected-name message as an error
+  banner (#325).
+- Bundles agent-runtime 0.4.1 (deleted-room / heartbeat backoff fixes), sidecar
+  1.9.7 (reaps dead tmux targets), and the updated connectors (Claude Code
+  0.9.12, Codex 0.3.13, OpenCode 0.1.8).
+- **Local-server mode now bundles switch-core 0.23.0** (was 0.21.0) — the pinned
+  images and standalone compose it pulls move up to the current release.
+
+#### Fixed
+- An errored turn no longer reads as a fresh request for input: the stalled
+  prompt that follows a failure is suppressed so it doesn't bury the reason, and
+  on the Slack card the reason is marked as a stall rather than streamed under a
+  spinner as if it were progress (#356).
+
+### [0.31.3] - 2026-09-01
+
+#### Added
+- The disabled "Add agent" button now explains why on hover, splitting the
+  not-ready tooltip into distinct checking and blocked messages (#314).
+
+#### Changed
+- Bundles agent-runtime 0.3.4 (reaps orphaned agent runtimes at boot) and the
+  updated connectors (Claude Code 0.9.11, Codex 0.3.12, OpenCode 0.1.7) and
+  sidecar 1.9.6.
+
+### [0.31.2] - 2026-08-27
+
+#### Added
+- Orphaned agent runtimes are reaped at boot: a runtime whose host has gone —
+  left behind because a user updated the app but never revisited the connector —
+  is cleared on startup, using the same "is this runtime abandoned?" predicate
+  the runtime itself uses, so a live session is never touched (#309).
+- A one-shot catch-up brings already-installed Switch connectors up to date once,
+  so an install that never revisits Settings → Agents stops drifting several
+  runtime versions behind. It runs once, latches, and leaves the Update button
+  as the normal path; it never installs a connector that isn't already there
+  (#309).
+
+#### Changed
+- The bundled sidecar (`1.9.5`) and the OpenCode connector (`0.1.6`) this build
+  writes now run agent-runtime `0.3.3`, which exits with its host instead of
+  leaving stale processes behind.
+
+### [0.31.1] - 2026-08-26
+
+#### Fixed
+- The setup checklist's ✕ now actually dismisses it. The button did nothing, so
+  a checklist a user had finished with stayed on screen.
+
+### [0.31.0] - 2026-08-25
+#### Added
+- Creating an agent, starting a session and adding a server now report whether
+  they worked, and an enumerated reason when they did not. Previously only the
+  ones that succeeded were counted, so nothing showed where people got stuck.
+  A session start also records which button it came from, whether a room and an
+  opening prompt were chosen, and whether a person started the session, the app
+  started it on their behalf, or it was found already running on a remote host —
+  never the room, the prompt or the host.
+- Removing an agent, resetting a remote agent, removing a server, attaching a
+  remote session's terminal and retrying a session that failed to set up are all
+  reported now, each with whether it worked. Removing an agent distinguishes a
+  person doing it from a server teardown sweeping every agent up with it.
+- Installing, updating and removing an agent's CLI is reported — the app's main
+  first-run wall, and previously invisible. So are creating and deleting rooms,
+  signing in and out, connecting and disconnecting a messaging app, setting up a
+  remote host, starting and stopping a managed server, and the update check,
+  download and install.
+- Where people stop is now visible: the first-run checklist, the add-a-server
+  wizard, which screens get opened and which commands get run. Opening a link
+  from a message reports whether this copy of the app could find what the link
+  pointed at.
+- Turning usage sharing **on** is reported. Turning it off is not, and cannot
+  be: the check happens immediately before anything is sent, so the moment
+  someone declines is the moment nothing more is sent. The opt-out rate stays
+  unknown rather than being obtained that way.
+
+#### Fixed
+- Retrying a session that failed to set up now says whether it worked. The retry
+  reported failure by throwing, which nothing was listening for, so a second
+  attempt that failed left the session sitting on "setting up" with no error and
+  no explanation.
+- Deleting an agent left its sessions counted as still running. The sessions were
+  removed by the database itself, so nothing in the app was told they had ended.
+- A session that is un-archived can end again. Its first ending was remembered
+  for good, so the second one — and every one after it — went unrecorded.
+- A remote agent whose host refuses the connection now says so, rather than
+  reporting the generic failure every other fault shares.
+- Installing an update no longer reports that it both worked and failed. The
+  success was sent before handing over to the installer, so an install that then
+  failed to take was counted twice, in both directions.
+
+#### Changed
+- Local-server mode now bundles and pulls **switch-core `0.21.0`** (was
+  `0.19.0`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+- Third-party dependency updates (#193).
+
+### [0.30.0] - 2026-08-24
+
+#### Changed
+- **Windows in-app updates now verify the installer's Authenticode signature**
+  before installing it, against SandboxAQ's certificate. The check was held off
+  until a signed release confirmed the certificate's subject verbatim; a
+  mismatched name would have blocked updates for every existing install rather
+  than warning. The release build now fails if the signature and the name it
+  ships for the updater ever diverge (CHOO-1468).
+
+#### Fixed
+- The first-run **Share usage data** prompt no longer opens with focus on the
+  consent toggle. Base UI focused the dialog's first tabbable element, which drew
+  a highlighted band around the row that read as a pre-selected answer and
+  vanished on the first click; focus now goes to the dialog itself, so nothing is
+  pre-selected (CHOO-2344).
+- Error toasts no longer pile up or repeat on every refresh. The agent-icon
+  backfill is reported once per server keyed by outcome — a signed-out or too-old
+  server that could not store icons was raising a toast every few seconds for one
+  standing condition — and `toast` now replaces a toast it already shows rather
+  than stacking another copy (CHOO-2344).
+
+### [0.29.0] - 2026-08-22
+#### Added
+- Switch Console now sends a small, fixed set of product events — the app
+  launching, an agent being created, a session starting and ending, a server
+  being added, a connector being installed — so we can see which features get
+  used and where the app runs into trouble. Nothing is sent unless you agree to
+  it, and the first-run prompt now defaults to **off**, because each event
+  carries a random id for your installation.
+- Events go to a relay we run, which forwards them on. The analytics services
+  therefore never see your network address, and the app itself ships no
+  credential — there is nothing in it to leak.
+
+#### Fixed
+- The OpenCode connector the app writes carries its own copy of the
+  room-workflow skill, so it picked up the same wrong claim that a Telegram DM
+  is adopted like Mattermost's. Corrected alongside the connector directory
+  (CHOO-2314).
+
+#### Changed
+- Local-server mode now bundles and pulls **switch-core `0.19.0`** (was
+  `0.18.0`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+- Every **Docs** affordance opens the published documentation at
+  `docs.flintai.dev` instead of the GitHub repository, deep-linked to the page
+  that answers the question: the sidebar and app-menu Docs entries and the
+  Settings Docs tab go to getting-started, the remote-hosts hint and the
+  hosting cards to *Host remotely*, the messaging-app cards to *Messaging
+  apps*, and the Rooms card to *Rooms and agents*. The welcome footer's GitHub
+  link keeps pointing at the repository (CHOO-2313).
+- The "How to set up {Platform}" link on the connect-messaging-app form opens
+  the platform's published setup page — Slack, Mattermost, Discord, Microsoft
+  Teams or Telegram — rather than the repository's markdown, with the
+  messaging-apps index as the fallback for an unrecognised platform
+  (CHOO-2313, unblocking CHOO-2269).
+- The **Share usage data** prompt and its Settings row default to off, and say
+  plainly that a random id for the installation is part of what is sent. The
+  0.27.2 entry below describes a payload of anonymous counters carrying no
+  identifier of any kind; that was the shape of a feature that sent nothing, and
+  this replaces it. Anyone who had already agreed under the old default keeps
+  that answer — it is not silently reset to a refusal.
+
+### [0.28.0] - 2026-08-21
+
+#### Added
+- Connecting a Slack app can enable per-agent **user groups** — the mentionable
+  `@name` handles Switch mints for each agent — from the Connect-messaging-app
+  dialog (CHOO-2277).
+
+#### Changed
+- Local-server mode now bundles and pulls **switch-core `0.18.0`** (was
+  `0.17.3`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+
+#### Fixed
+- The New-agent modal's Cancel / Add-agent footer no longer overlaps the "you
+  have not linked a messaging account" callout at the bottom of the form, which
+  had half-hidden its Open-Messaging-apps link (CHOO-2243).
+
+### [0.27.4] - 2026-08-20
+
+#### Fixed
+- Search results show an agent's own icon rather than its provider logo, so two
+  agents on the same provider are no longer the same picture; the provider mark
+  now follows the "Agent type mark" toggle in both the sidebar and the palette
+  (CHOO-2203).
+- A long instruction no longer takes over the agent page. Multi-line boxes cap
+  at roughly a dozen lines and scroll inside themselves, and the agent's
+  instructions field gains an Expand control for when you want the ceiling
+  lifted (CHOO-2203).
+
+### [0.27.3] - 2026-08-19
+
+#### Added
+
+- Set an agent's **instructions** — what it is for, addressed to the agent
+  itself — as a first-class field edited from its page, applied to whichever
+  mechanism its provider uses (a Claude repo-agent, a Codex or OpenCode launch
+  profile) rather than being a per-provider setting only (CHOO-2228).
+- **Build switch-core from your checkout** for the managed local stack. A dev
+  build launched from a Switch checkout can run switch/gateway/setup from the
+  working tree (`up -d --build`) instead of this build's pinned GHCR images, via
+  a toggle on the local server's page. Dev builds only, and only when an ancestor
+  of the app's directory carries the Dockerfiles and `core/pyproject.toml` (#258).
+
+#### Changed
+
+- Local-server mode now bundles and pulls **switch-core `0.17.3`** (was
+  `0.17.2`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+
+#### Fixed
+
+- CLI first-run prompts that leave a spawned session alive but never answering
+  are now cleared or detected before the session starts — Claude Code auto-trust
+  (silently broken since a config-key rename), its first-run setup wizard, and
+  the bypass-permissions warning (CHOO-2213).
+- @mentions in the embedded Mattermost view are readable in the light theme
+  again — the link/mention colour pointed at the text-selection-highlight
+  background and rendered at ~1.4:1 on the white channel (CHOO-2203).
+- A newly onboarded agent's default Mattermost rooms show in the sidebar without
+  waiting for a background reconcile to happen to fire (CHOO-2203).
+- **Sign-in details** for a managed server's bundled chat now stays open. The
+  dialog was rendered inside the messaging app's dropdown menu, so the same
+  click that opened it closed the menu — and the menu took the dialog with it,
+  before anyone could read a credential off it.
+- Deleting a Switch server no longer leaves the app pointed at it. The deleted
+  server's id survived in the saved page state, so the app could return to a
+  page for a server that no longer exists and keep asking its gateway for a
+  sign-in configuration nothing could answer. The page now falls back to home
+  and the dead id is discarded.
+
+### [0.27.2] - 2026-08-18
+
+#### Added
+
+- Switch Console now asks, the first time you open it, whether you are happy to
+  share anonymous usage data, and states plainly what that would and would not
+  include. The choice is saved per install and can be changed at any time from
+  **Settings → General** (CHOO-1955).
+- The app still sends nothing: there is no telemetry to consent to yet. What
+  this adds is the control and the contract — a single gate that any future
+  collection must ask before sending, which fails closed, so a fresh install
+  that has not reached the prompt sends nothing regardless of how the toggle
+  reads. Because the toggle defaults to on, `console/AGENTS.md` now pins what a
+  payload may ever contain: anonymous counters, and no identifier of any kind.
+- A signed, notarized **Intel (x86_64) macOS build**. macOS now builds per-arch
+  on native runners, so an Intel Mac has an installer again after the app went
+  Apple-silicon-only; the auto-update channel manifest is written per arch so
+  the two builds no longer overwrite each other's update feed (CHOO-2195).
+
+#### Changed
+
+- **Windows builds are now signed** with Azure Trusted Signing, so the installer
+  and app no longer trip SmartScreen's unknown-publisher warning (CHOO-1468).
+- Local-server mode now bundles and pulls **switch-core `0.17.2`** (was
+  `0.17.1`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+- The add-agent addressing control is renamed **"Who can talk to your agent"**,
+  and its Settings section now unfolds itself when the owner-only default would
+  reach nobody, so the warning that the agent will answer no one on that
+  messaging app is visible instead of hidden in the fold (CHOO-2173).
+
+#### Fixed
+
+- A directory configured by the connector's `configure` skill is recognised as
+  an agent again. Detection read the identity only out of
+  `.claude/settings.local.json`, which the skill deliberately no longer writes
+  into — writing two of the three `SWITCH_*` values there is what broke
+  standalone sessions. It now falls back to the credentials store, and names no
+  agent when the store holds several, since choosing between them is
+  `select_agent`'s job and not detection's.
+- An auto-started session now receives the message it was started for. Its room
+  connection opens before the terminal is spawned, so the replayed trigger had
+  nowhere to go and — unlike the other wait paths — never retried: the agent
+  booted, greeted, and never answered. It now retries until the connection
+  closes, and a pty accepts injected input only once the runtime has delivered
+  the session's opening prompt, so the trigger can't be appended to that prompt
+  and sent as one (CHOO-2173).
+- The agent tree no longer highlights every copy of an open room, and the
+  titlebar breadcrumb shows the agent's own icon rather than its provider logo
+  (CHOO-2173).
+- User-facing error messages across the app were audited and rewritten to say
+  what happened and what to do, rather than surfacing raw internal errors
+  (CHOO-2060).
+- Two Switch Console installs sharing a host no longer destroy each other's
+  agents. Per-agent credentials live at `.switch/agents/<name>.json`, keyed by
+  name alone, and each install's uniqueness check only sees its own database —
+  so an agent created with a name another install had already used in that
+  directory overwrote its credentials file. Because the write merged into what
+  was there, the result was one file carrying the new agent's identity and the
+  old one's remaining keys: the displaced agent's sessions authenticated as the
+  new agent rather than failing, and its API token, issued once, was gone.
+  Creating, provisioning and renaming an agent now refuse a name whose
+  credentials in that directory belong to a different Switch server, and say
+  which one. Refusal happens before the identity is minted, so nothing is left
+  stranded on the server.
+
+### [0.27.1] - 2026-08-17
+
+#### Changed
+
+- Local-server mode now bundles and pulls **switch-core `0.17.1`** (was
+  `0.17.0`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release, so a managed stack picks up the Slack avatar-background
+  fix (#239).
+
+### [0.27.0] - 2026-08-16
+
+#### Added
+
+- Give an agent a custom icon. The add-agent dialog and an agent's settings
+  carry an icon picker — set, change, or clear it; cleared means an icon
+  generated from the agent's name. Icons render in the sidebar, the agent pages
+  and dialogs, and existing agents are backfilled on first run (CHOO-2171).
+
+#### Changed
+
+- Local-server mode now bundles and pulls **switch-core `0.17.0`** (was
+  `0.16.0`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+
+#### Fixed
+
+- **Collapse all** collapses again. It cleared state the redesigned sidebar no
+  longer reads, so nothing moved; it now names the rows to collapse. Clearing
+  that state had also been dropping Next/Previous Session's list of visible
+  sessions, which stops (CHOO-2173).
+- A sidebar session row's **actions menu acts** — Delete and Archive ran but the
+  row's own click handler reopened the session on top of them, so they looked
+  inert (right-click was unaffected because it is a sibling of the row). The
+  guard now lives in the shared popup (CHOO-2173).
+
+### [0.26.0] - 2026-08-16
+
+#### Changed
+
+- **A visual design pass across the shell.** The window is now one graded
+  material surface with the sidebar sitting on it and the main panel floating
+  above as an inset card with a hairline and a soft shadow, using the design
+  spec's surface/material tokens and corner radii. Home is deliberately left for
+  a later pass (CHOO-2164).
+- **A server is now a workspace, and you switch between them.** The list of
+  servers that sat in the sidebar has been replaced by a switcher at the top,
+  showing the one you are in and opening onto the rest — each with where it
+  runs and whether it is reachable. Everything below it already belonged to
+  that server; now the sidebar says so. Under the switcher is that server's
+  Home, which is the page you used to reach by clicking the server in the
+  list, and the titlebar names the path to it (CHOO-2158).
+- The session list is a section of its own, headed **Sessions**, with the
+  grouping control labelled as what it is — group by **By Agent** or **By
+  Room** — rather than sitting alone at the top of the tree where it read as
+  the sidebar's whole navigation (CHOO-2158).
+- The welcome screen is reachable from the switcher as **About Switch**, as
+  well as from the Switch mark at the bottom of the sidebar. With no servers
+  added, the sidebar is just **Add a server** over the setup checklist
+  (CHOO-2158).
+- **A server's Home page reads as a dashboard rather than a stack of cards.**
+  It opens with the server, where it runs and who you are signed in as, then
+  how many agents, rooms and messaging apps are on it, and gives the rest of
+  the page over to the things you act on (CHOO-2158).
+- **Messaging apps are a table.** Which account is you, whether Switch may
+  create channels there, and the app's actions are columns you can read down
+  rather than facts to be opened one row at a time. Turning channel creation on
+  or off is now in the row instead of behind its menu, and a platform that
+  cannot create channels at all says so rather than showing the switch off.
+  Unlinking stays in the menu — it is irreversible, and the row is where you
+  press to *change* an account (CHOO-2158).
+- The managed stack has a section of its own with a **Restart**, and shows its
+  live output, which until now was only visible while adding a server. An
+  available switch-core update is announced at the top of the page rather than
+  inside that section, and **Reset** sits alone at the bottom, away from Start
+  and Stop (CHOO-2158).
+- The Mattermost sign-in details Switch Console generates open in a dialog from
+  the app's row, rather than expanding underneath it (CHOO-2158).
+- **A server's agents and rooms each have a page.** Under the switcher, next to
+  Home, **Your Agents** lists every agent registered on the server with the
+  provider it runs, where that is, and how many of the server's rooms it is in;
+  **Your Rooms** lists the rooms with the messaging app each is bridged to and
+  how many agents are in it. Both start a session or add a member from the row,
+  and carry the same actions the sidebar rows do. Until now the only way to see
+  either as a list was to scroll the sidebar tree (CHOO-2158).
+- **An agent's page opens with the agent.** Its mark, its name, the server it is
+  registered on and what it runs, with **Create Session** alongside — where the
+  page used to begin at a list of sessions, with the agent named only in the
+  titlebar. Sessions are framed as a list, each saying which room it is talking
+  in, or that it is in none (CHOO-2158).
+- **The titlebar says where you are, in full.** A session now reads
+  agent / room / session rather than naming its directory and itself, and a room
+  is its own heading with its messaging app's mark. An agent's page carries the
+  same connection status and actions menu its server's pages do (CHOO-2158).
+- Agents are described by their provider's name — **Claude Code**, **Codex** —
+  rather than the `claude` and `codex` they are keyed by (CHOO-2158).
+- **Every session in the sidebar has an actions button.** Pin, rename, archive
+  and delete were reachable only by right-clicking, which nothing in the
+  interface said you could do; they are now on a menu in the row as well. Both
+  menus are built from one list, so an action cannot arrive on one and be
+  missing from the other (CHOO-2158).
+- **Expanding a row in the sidebar is now the chevron's job alone**, and the
+  chevron has moved to the end of the row, appearing on hover with that row's
+  other actions. Opening an agent or a room no longer unfolds it, so reading one
+  thing does not rearrange the tree around it, and the agent's provider mark
+  stays visible instead of turning into a chevron under the pointer. A row with
+  nothing beneath it has no chevron at all (CHOO-2158).
+- **A room in the sidebar no longer counts its agents.** The pair of numbers on
+  the row — agents this computer runs, agents it does not — sat where the expand
+  control now goes and told you little. The sidebar lists the agents it can
+  actually open; a room's full membership is a column on **Your Rooms**, which
+  is the page for reading rooms as a list (CHOO-2158).
+- **Anything you can click now says so under the pointer.** Buttons, sidebar
+  rows, menu entries and tabs show the hand cursor; Tailwind's reset had left
+  them all on the arrow (CHOO-2158).
+
+#### Fixed
+
+- **Adding your first server left the app with no workspace selected.** Nothing
+  chose it, so the sidebar stayed on "Add a server" until the next launch
+  (CHOO-2158).
+- **Removing the server you were in could leave the app with no workspace at
+  all** — no switcher, no destinations, no sidebar tree — because the remembered
+  server was still named as the active one. A remembered server that no longer
+  exists now counts as no choice, and the app picks one (CHOO-2158).
+- Removing an agent from its own page removed the first agent in that directory,
+  which is a different agent whenever a directory holds more than one
+  (CHOO-2158).
+- The empty session list offered to "spawn a claude session" whatever the agent
+  actually runs (CHOO-2158).
+
+### [0.25.0] - 2026-08-15
+
+#### Added
+
+- **You can tell Switch which messaging-app account is yours.** A new dialog
+  searches the workspace's own user directory — Slack, Mattermost — and links
+  the account you pick to your Switch login. It searches the platform rather
+  than Switch's record of who has spoken, so you can find yourself in a
+  workspace you have never posted in, and it shows the display name, handle and
+  email so you can tell two similar accounts apart. An account someone else has
+  already linked says who — linking is not exclusive, so that is information
+  about who else is recognised on it rather than a lock — and one you have
+  linked yourself offers to unlink instead of linking it twice. A platform with
+  no searchable directory says so — and says a message has to arrive first —
+  instead of showing an empty list (CHOO-2137).
+- The dialog is offered as step 2 of connecting a messaging app, straight after
+  the connection succeeds, because that is the one moment the workspace is on
+  your mind — **except on an app whose directory cannot be searched**, where it
+  is not offered at all. On Telegram, Switch can only name people who have
+  messaged it, and nobody has messaged a connection made a second ago: the
+  search was guaranteed to come back empty, which reads as "you are not in your
+  own workspace" rather than "not yet". Linking waits for the server page,
+  where the warning that you own an agent nobody can reach is what prompts it,
+  and by then someone has messaged the app and there is a name to pick. The
+  search prompt no longer promises a "workspace directory" on a platform that
+  has neither. It is skippable, and linking lives on the server page for later:
+  **Messaging apps** lists one row per app — the app, the account on it that is
+  you, and what you can do with it — where your handle is the button that
+  changes it and a Link button stands in when there is none, opening the
+  dialog already pointed at that app. So you can see at a glance where you
+  are recognised and where you are not, without a separate list to reconcile
+  against. Linking is not an admin action: a member of the server sees the same
+  card and can link on any app in it, and only the Connect button is withheld.
+- **Each messaging app carries its own menu**, holding the actions that are rare
+  or destructive: unlinking your account, whether the app may create channels,
+  and disconnecting it. The row itself is left saying one thing — which account
+  here is you — in one control whether or not there is one. Unlinking in
+  particular is off the row: it used to be a bare cross sitting beside the
+  handle, one mis-click from the button you press to *change* an account, with
+  no confirmation between. The **Default** badge also sits against the app's
+  name now rather than drifting into the middle of a wide row.
+- **The server page warns when an owner-only agent cannot recognise you**, and
+  only then. One line at the top of **Messaging apps** names the apps you have
+  not linked — shown when you own an agent on that server whose rule admits its
+  owner, and never otherwise. Link everywhere, or own no such agent, and there
+  is nothing to see: a warning shown to everybody teaches people to ignore it.
+- **A new agent now answers only its owner.** Agents used to be created open to
+  everyone in every room; the add-agent dialog now defaults to *Only me*. The
+  rule names the owner rather than a list of identities, so it survives
+  connecting a new workspace or the agent changing hands. *Only me and my
+  agents* is one step away when an agent of yours has to hand this one work.
+  Existing agents are untouched.
+- **A messaging app can be disconnected from the server page**, by an admin, on
+  the same **Messaging apps** row that connects one. It is not a pause: the
+  server deletes every Switch room on that app before removing it, so the rooms
+  and their conversations go with it, and an app another admin has already
+  removed says so rather than reporting a disconnect that never happened
+  (CHOO-2137).
+
+#### Changed
+
+- **Who can send instructions to an agent is one question with four answers** —
+  *Only me (default)*, *Only me and my agents*, *Anyone*, or *Custom rules* —
+  rather than an open / restricted switch above a rule builder. The two
+  owner-scoped answers differ in one thing: whether agents you own may hand this
+  one work. Anyone drops the policy entirely; Custom rules opens the rule
+  editor, seeded from whichever answer the agent was on, so nothing has to be
+  rebuilt to add one exception. Rules built by hand are kept while the chooser
+  is on a shortcut, and a policy too specific for any of them reads back as
+  Custom rules rather than being flattened into one. The same control is on the
+  add-agent dialog and on the agent's Settings tab, so a policy is changed the
+  way it was set. The box shows the answer that was picked, rather than the
+  word stored behind it.
+- **The add-agent dialog offered "Advanced configuration" twice** for Claude
+  Code. A provider keeps its per-agent settings in one place — a repo-agent
+  definition or a launch profile — and the agent's Settings tab picks between
+  them by asking which; the creation form rendered both sections instead, and
+  the launch-profile one reads a "the fields, from wherever they live" call
+  that falls back to the definition fields. So the same settings appeared in
+  two identical boxes writing to two different places. It now picks the same
+  way the Settings tab does.
+- An agent's Settings tab no longer boxes **Advanced configuration** and **Who
+  can send instructions** in borders of their own. Every section on the page is
+  already a section; drawing two of them again was one frame too many.
+
+- **You and your agents appear in the rule editor's own pickers**, as *Me* in
+  the Users list and *My agents* in the Agents list, rather than as a checkbox
+  off to the side. They read as what they are — two more senders to admit —
+  and they compose: "me and Alice" is one rule. Setting either list to *Any* or
+  *None* clears the matching entry, so a rule cannot say "no humans" and "the
+  owner may" at once.
+- An owner rule can only recognise an owner who has linked their messaging
+  account, so the addressing editor warns — with a button into the linking
+  dialog — when the signed-in user has linked none. A privacy control that
+  silently admits nobody is the failure this exists to prevent.
+- The linking dialog is opened on one workspace rather than asking which. It is
+  titled for the platform it is linking on — "Link your Discord user account" —
+  and its search names the workspace, not the platform, since two workspaces on
+  the same platform can be connected and only the name tells them apart.
+
+#### Removed
+
+- The "Give Feedback" feature — modal, Help menu entry, command-palette command
+  and its event — along with the hardcoded third-party Discord webhook it posted
+  to. The webhook arrived with the initial emdash import and is already revoked
+  upstream. **Help → Report Issue** remains the way to send us something; it
+  opens an issue on this repository (CHOO-2040).
+
+#### Fixed
+
+- **A session on a remote agent now opens at the size of the pane it opens
+  into**, instead of a fraction of it that only corrected itself when the window
+  was resized or the session was switched away from and back (CHOO-2066). A
+  remote session opens its terminal over SSH, and the renderer mounts and
+  measures its pane partway through that: the measurement arrived after the
+  spawn size had been read and before there was a PTY to resize, so it was
+  discarded and the session kept the 80x24 it was spawned with. Measured
+  dimensions are now kept whether or not a PTY is live yet, and applied to the
+  PTY when it registers.
+
+### [0.24.0] - 2026-08-14
+
+#### Added
+
+- **An OpenCode agent can be configured like a Codex one.** Its model,
+  reasoning variant, temperature, top-p, step limit, web search and
+  instructions can be set when the agent is created and changed afterwards from
+  its Settings tab, and a change applies to the next session — or to a running
+  one with Restart, which resumes the conversation.
+
+  OpenCode's settings are not Codex's, so the per-agent configuration an agent
+  stores is now keyed by what its own provider offers rather than by a fixed
+  list. Existing Codex agents keep their settings; nothing needs re-entering.
+
+  Its instructions are added to OpenCode's own, the way an `AGENTS.md` is,
+  rather than replacing them.
+
+- **You can pick a model instead of remembering it.** Switch Console asks the
+  machine an OpenCode agent runs on which models it offers and lists them as you
+  type, grouped by provider and annotated with the reasoning variants each
+  accepts. Typing something not on the list still works — it is a shortcut, not
+  a restriction.
+
+- **The model and reasoning fields check themselves against the agent's own
+  host.** A model name that host does not have is flagged as you type, and
+  the reasoning variant becomes a menu of what the chosen model actually
+  accepts — greyed out, with a reason, for a model that has none, as local
+  models generally do. Both were places OpenCode would otherwise accept a value
+  and silently never apply it.
+
+  The check warns rather than blocks, since the list is a snapshot and a model
+  can appear a moment later. If the host cannot be reached, or OpenCode is not
+  installed on it, the fields say so and go back to plain text rather than
+  flagging everything as wrong.
+
+  An OpenCode agent can also be pointed at a **local model** — define the
+  provider once in your OpenCode config and set the agent's model to it. The new
+  utility-model setting is worth setting too if the point is to keep everything
+  on one machine: it is what OpenCode uses for background work like naming a
+  conversation, which otherwise goes wherever your own config sends it.
+- Telegram brand icon, platform label and setup-guide link, so Telegram-bridged
+  rooms show the "open channel" button and the attach form links the right guide
+  (CHOO-1686). Telegram bot tokens are also redacted from the diagnostic logs.
+
+#### Fixed
+- Opening a room from a deeplink expands the sidebar groups hiding it
+  (CHOO-1686). The reveal ran once, before the room a session belongs to had
+  loaded, and never again — so the view routed correctly to a row that stayed
+  collapsed. Affects any bridge, not only Telegram.
+- Two Switch Console installs sharing an agent host no longer trade the sidecar
+  back and forth when they are on the *same* release but carry different builds
+  — the everyday case for dev builds, and the half of the shared-host problem
+  that version ordering could not reach. Each install now mints a deployer
+  identity and stamps it on whatever sidecar it deploys, so an install can tell
+  its own build from another's without relying on the version string. When the
+  versions are equal and the builds differ, the install that got there first
+  keeps the sidecar.
+- The agent's Settings tab says so: the sidecar reads **Another install's
+  build**, names who deployed the running one, and offers Restart — a
+  deliberate takeover — instead of an Update that both sides would keep
+  clicking at each other. Replacement is otherwise unchanged: an older sidecar
+  is still replaced whoever deployed it, and a rebuild of your own is still
+  picked up.
+- Search results no longer read as though agents, sessions and commands were
+  servers. Those three had no heading of their own, so they were drawn after the
+  last group on screen — usually "Servers" — and appeared to belong to it. Every
+  result now sits under a heading that names it.
+- The server running on this computer shows a laptop everywhere — the sidebar
+  and search as well as the dialog that adds it. The sidebar and search each
+  chose the icon themselves; they now share one rule, so the next change lands
+  in all three at once.
+- The local server's setup log now fills as the work happens rather than all at
+  once at the end. Every line Docker printed was applied to the screen on its
+  own, and a pull narrates faster than the UI can redraw — so the renderer spent
+  the whole install rebuilding the list instead of painting it. Lines are
+  applied in batches now. The same fix covers a remote host's setup.
+- Setting up the local server no longer looks stalled before Docker says
+  anything. The output panel appeared only once the first line arrived, so the
+  seconds Docker spends resolving the registry showed as an empty dialog; the
+  panel is now there from the start and says what it is waiting for.
+- The command palette no longer opens onto a "Notifications" list of sessions
+  and rooms. It is a search field; the first thing under it should be what you
+  searched for.
+- Creating a room offers only the agents this Switch Console registered. The
+  server answers with everyone on it, including agents belonging to another
+  install — which this app cannot show under a room or drive.
+- Creating a room switches the sidebar to its Rooms list and selects the new
+  room. It was already opened in the main panel, but the sidebar stayed on
+  Agents, which does not list rooms — so the room you had just made was nowhere
+  in it.
+- Installing a Switch connector now finishes the onboarding step it belongs to.
+  The list of agent types you can onboard is cached separately from the agent's
+  own status, and the install refreshed everything but that — so the step stayed
+  unticked, and because the checklist locks each step behind the one above it,
+  the rest of onboarding stayed greyed out with nothing explaining why.
+
+#### Changed
+- An update to an agent's own CLI is no longer reported as though something were
+  wrong. It never gated anything, but an amber badge ahead of "Installed" read
+  like a fault on an agent that worked, and it was the nearest explanation for
+  onboarding appearing stuck. A newer CLI is now mentioned only on the agent's
+  own page, in plain text with the command that installs it.
+- The Switch connector's own updates keep their badge and gain a name —
+  "Connector update" rather than "Update available". That one is worth acting
+  on, and the two used to share a badge that could not say which was behind.
+
+### [0.23.0] - 2026-08-14
+
+#### Added
+- **OpenCode is now a supported Switch agent type**, locally and on remote
+  hosts. An OpenCode session can be onboarded as a Switch agent, join rooms,
+  take injected prompts, and be reset, compacted or interrupted from a room.
+  It reports working and completed rather than sitting on "awaiting input" for
+  its whole life, and names the tool it is running on the bridged message.
+
+  OpenCode has no plugin marketplace to install a connector from, so Switch
+  Console writes one: the Switch MCP server is registered in OpenCode's global
+  config as a local server, which lets the runtime inherit its credentials from
+  the session environment rather than having a token written to disk, and the
+  room-workflow skill is written to OpenCode's global skill directory beside
+  it, so a session gets the instructions along with the tools. Install,
+  update and uninstall are on the agent's card in Settings → Agents, and on a
+  remote host in that host's setup, exactly as for the other agent types.
+
+  OpenCode agents previously registered as Claude Code, so an operator asked to
+  start one by hand was told to run `claude`. They now register as themselves.
+- A Codex agent's configuration can now be changed after the agent is created,
+  from the **Advanced configuration** section in its Settings tab — the same
+  section Claude agents already had. Model, reasoning effort and instructions
+  were previously write-once in the add-agent dialog, with no way to edit them
+  (CHOO-1985); **verbosity**, **reasoning summary** and **web search** are newly
+  exposed, and reasoning effort gains `none`. Each option was checked against the
+  Codex binary's own config validation rather than assumed.
+- Leaving one of those fields blank is not the same as choosing its default:
+  blank omits the setting entirely, so your own `~/.codex/config.toml` still
+  decides. That is why the on/off settings offer Default/On/Off rather than a
+  checkbox, which has no way to say "leave it alone".
+- Codex reads these values only when a session starts, so a save applies to the
+  next session. A session already running is named in the section, with a
+  Restart that resumes it on the new configuration. Clearing every field removes
+  the agent's launch profile rather than leaving it orphaned.
+
+#### Changed
+- Advanced configuration is one editor for every provider rather than one per
+  storage mechanism. Providers keep these settings in different places — a
+  repo-agent definition for Claude Code, the launch profile for Codex — and the
+  main process now routes the read and the write, so the difference is no longer
+  visible as the shape of the Settings page.
+- **Remote hosts** are a tab of Settings again rather than an entry in the left
+  sidebar. Older saved navigation state, and the host page's way back, both land
+  on the tab.
+- The setup checklist on the welcome screen can now be dismissed. It shares the
+  sidebar checklist's setting, so it goes away in both places at once and comes
+  back from Settings → General.
+- Settings descriptions for an agent's own options are cut back to a line, with
+  the detail behind the ⓘ beside each one.
+- The agent providers list no longer separates out a "recommended" group; each
+  filter is a single list.
+- The sidebar's ＋ opens a menu offering both "Add an agent" and "Create a
+  room", instead of the single action matching the list you were looking at.
+- The remote hosts page explains what a host is for, and links out to the
+  cloud-hosting documentation.
+
+#### Removed
+- A batch of interface settings, along with the toggles for creating a branch
+  and worktree, including issue context, and OS notifications. Each was already
+  on by default and is now simply always on, so nothing changes for anyone who
+  had not turned one off. Several of them — the left-sidebar line-change and
+  PR-status toggles, the context bar, and confirm-on-tab-close — turned out to
+  control nothing at all: no code read them.
+- Keyboard shortcuts are no longer rebindable from Settings, and open-in tools
+  can no longer be hidden. The shortcuts themselves are unchanged.
+
+#### Fixed
+- Add Agent no longer stalls with an unset agent type once more than one Switch
+  connector is installed. The form auto-selected a type only when exactly one
+  was available, so a second connector left it blank — and since the directory
+  scan, the onboard-existing list and every submit button are gated on a chosen
+  type, the rest of the dialog stayed inert behind a control that did not read
+  as required. It now selects the only usable type, or the configured default
+  agent when that is usable on the machine being targeted, and otherwise leaves
+  the choice explicit. The rule no longer depends on how many agent types exist.
+- The unread tally injected into a session no longer claims to count "since
+  your last read_context". Nothing here can observe a session reading, so the
+  tally is cleared per delivered line; it now says so, rather than inviting an
+  agent to read its absence as proof it is caught up.
+- The OpenCode icon no longer dwarfs the other agent icons. Its artwork is
+  full-bleed and 4:5 where the others are glyphs on a square, and it carried its
+  own `width`/`height` — which an inline SVG applies in preference to the size
+  of the box it sits in. It is now square, unsized, and inset to the margin the
+  others have.
+- A file-based Switch connector reports the version its own directory declares
+  rather than the app's. The OpenCode connector is versioned and released as its
+  own artifact, so a card reading `0.22.0` beside two connectors reading `0.9.1`
+  and `0.3.1` named nothing the connector declares. It also means an app release
+  that leaves the connector alone no longer offers an update that would rewrite
+  identical bytes.
+- A session that fails to be created no longer marks its agent with a failure
+  badge that cannot be cleared. The failed session exists only in the app — the
+  server rejected the create — and nothing removed it: reloading only adds
+  sessions, deleting one asks the server first and restores it when that fails,
+  and the sidebar never listed it in the first place, so the badge pointed at a
+  session there was no way to reach. It is now dismissed by clicking the badge.
+
+### [0.22.1] - 2026-08-12
+
+#### Changed
+- Local-server mode now bundles and pulls **switch-core `0.13.2`** (was
+  `0.13.1`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+
+#### Fixed
+- Windows builds now actually work — path handling, process spawning, the PTY,
+  executable resolution, and Docker / managed-server invocation are corrected for
+  Windows, so the x64 build introduced in `0.22.0` is functional rather than
+  nominal (#207).
+- Settings is reachable again. A retired Settings tab left in the view registry
+  could be selected and then render nothing, stranding the whole Settings page;
+  the retired tab is now handled and navigation falls back to a valid tab
+  (CHOO-2106).
+
+### [0.22.0] - 2026-08-12
+
+#### Added
+- Linux **arm64** desktop artifacts are now built and published alongside x64 —
+  AppImage, deb, and rpm (#202).
+- **Windows x64** releases are now built and published (unsigned) (CHOO-1468).
+
+#### Changed
+- The Codex session runtime version is now derived from the artifact registry
+  rather than a hand-maintained `SWITCH_AGENT_RUNTIME_VERSION` constant; the
+  constant and its parity test are removed (#198).
+
+### [0.21.0] - 2026-08-11
+
+#### Changed
+- The private-repo machinery is gone now that the repository and its packages are
+  public (CHOO-2023). The updater no longer gates on a `gh` token or a private
+  feed, so every user receives updates and the `auth-required` state is removed;
+  managed-server image pulls drop `docker login ghcr.io` and the remote
+  `.ghcr-token` forwarding; remote-host setup drops its interactive `gh:auth`
+  step (a persisted plan still carrying a `gh-auth` step drops it on read); agent
+  onboarding no longer withholds every agent type when `gh` cannot reach a
+  registry; and Switch no longer installs, probes, or forwards credentials to
+  `gh` on a remote host at all.
+- Local-server mode now bundles and pulls **switch-core `0.13.1`** (was
+  `0.13.0`): the bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised to the
+  current core release.
+- Codex sessions launched by Switch Console now run
+  `@sandboxaq/switch-agent-runtime@0.3.0` (`SWITCH_AGENT_RUNTIME_VERSION`, was
+  `0.1.6`), matching the runtime's move to public npmjs.
+
+### [0.20.0] - 2026-08-10
+
+#### Added
+- The bundled Mattermost row on the server page now has a "Sign-in details"
+  disclosure — server URL, username and password, each with copy-to-clipboard —
+  so signing in to a managed deployment's bundled chat no longer means finding the
+  generated `.env` on disk. The password is masked until revealed, and can be
+  copied without revealing it. Values are read from what the deployment actually
+  runs (the host port Switch Console chose and the password from the encrypted
+  app-secrets store), fetched only on expand so the secret does not cross into the
+  renderer for everyone who opens the page. When a value cannot be read the card
+  names which one is missing rather than showing a placeholder that could be
+  mistaken for a real password.
+- A per-host cap on how many remote terminals stay attached at once
+  (`remote.maxAttachedSessionsPerHost`, default 4), exposed as an Interface
+  setting. Beyond the cap the least-recently-viewed session on that host is
+  detached — its agent keeps running in its tmux pane and still reports status,
+  so only the on-screen terminal goes away.
+
+#### Changed
+- The app is now called **Switch Console** (formerly "switchdash") everywhere a
+  user reads it: the window and menus, the home-screen wordmark, the server/agent
+  dialogs, the auto-session / auto-approve / sidecar settings, the version-drift
+  warning, the command palette, remote-host setup, and the "Open in Switch
+  Console" deeplink the bridges post into Slack and Mattermost. Storage and OS
+  identity deliberately keep the `switchdash` name (app id, userData directory,
+  `switchdash://` scheme, npm packages, `SWITCHDASH_*` env vars) so an existing
+  install updates in place rather than being stranded. The source tree moved from
+  `dash/` to `console/` and the release tag prefix is now `switch-console-v*`
+.
+- Local-server mode now bundles and pulls **switch-core `0.13.0`** (was
+  `0.12.3`): the app's bundle pin / `COMPATIBLE_SWITCH_VERSION` is raised so a
+  managed local stack runs the current core release.
+- Bump the Codex session runtime pin (`SWITCH_AGENT_RUNTIME_VERSION`) to `0.1.6`
+  so Switch Console-launched Codex sessions run the published runtime.
+- Remote terminals now attach on demand instead of on provision. Opening a
+  session on a remote host is what brings up its terminal, driven by which session
+  is in focus (debounced so arrowing through the sidebar doesn't ask a slow host
+  for a terminal at every step), with least-recently-viewed eviction under the
+  per-host cap. Previously every known session on a host wanted a terminal the
+  moment it was provisioned — on one host that was 51 terminals opened at launch.
+  The agent runs on its VM regardless; sidebar status, room badges and deep links
+  are unaffected because they come from hook events and the session poll, not from
+  a PTY.
+- Search no longer returns filesystem results, and the per-location file indexer
+  behind them is removed. File hits were appended after the relevance
+  cut and the 30-item slice, so up to 20 irrelevant rows survived regardless of
+  ranking; the row navigated to the session, not a file. Removing search's only
+  reader of the index also drops the crawl it ran on every location and the
+  debounced re-crawl on every file-watch event; an existing database sheds the
+  now-unused index tables.
+
+#### Fixed
+- Clicking a session on a busy remote host no longer freezes, and opening a remote
+  session no longer lands on an empty pane or a "Terminal not attached" message
+  that Attach could not clear. On one host, 51 sessions sharing a single SSH
+  transport re-attached in the same instant whenever the transport recovered,
+  re-saturating the tunnel on a ~16-minute wedge cycle; separately, a runtime
+  reaching the attachment path at provision time knew neither its session nor that
+  it was attachable, so every attach quietly did nothing. Remote attachment is now
+  serialised per host, sidecar event relays are shared one-per-sidecar instead of
+  one-per-session, provisioned sessions are made attachable, and a failed attach
+  throws a real error instead of leaving a silent empty pane. A detached remote
+  session now shows that its agent is still running rather than an indefinite
+  spinner.
+- The sidebar's staleness banner no longer warns about servers you are not looking
+  at. Room state was loaded and reported across every server at once while the
+  sidebar only ever shows one, so a healthy selected server could be buried under
+  warnings about unrelated ones. Room state is now scoped to the server on screen
+  (cross-server search still loads every server, but only when opened).
+- The sidebar no longer presents unknown room state as fact. A server that could
+  not be read kept its last-known rooms with no hint they were stale; a room whose
+  name had not loaded showed a short id styled like a name; an agent whose
+  membership lookup failed vanished from its rooms. These are now disclosed
+  distinctly ("asked and failed" vs "not connected, never asked"), an unloaded name
+  renders as provisional, and a retry is offered. A room's member count, list and
+  invite picker are now one read so they can't disagree.
+- A server you are not signed into now prompts you to sign in instead of reporting
+  "couldn't reach" it with a Retry that cannot work. Signed-out, dormant, and
+  genuinely-unreachable are now distinguished, and only a real failure offers
+  Retry. Agent names are also read from the local database instead of fetched
+  per-row from the gateway, which could silently render a plausible wrong name on
+  failure.
+- Selecting a session, agent or room from outside the sidebar (keyboard, command
+  palette, notifications, menu, modals, deep links, or the view restored at
+  startup) now scrolls the highlighted row into view, expanding whatever group
+  hides it. Previously only the deeplink handler scrolled, and only for session
+  rows. It scrolls only when the row is off-screen, never while dragging, and keys
+  on the selection so a reorder can't yank the viewport.
+- The per-room channel icon, the room pane's "Open in …" button and the Slack
+  bridge card's Open button now open bridged channels even without the native
+  desktop app installed. They handed the OS a native
+  `mattermost://` / `slack://` deeplink, which nothing answers when no desktop app
+  is registered, so the click did nothing. Links are now translated to the
+  channel's web address, which works either way. Opens now also report a failure
+  to the person who clicked instead of discarding it.
+- The bundled chat's sign-in prompt no longer offers to sign in "on your phone".
+  The managed stack publishes onto `127.0.0.1` and the URL shown is a `localhost`
+  one, which no other device can reach, so it now says "on this computer"
+.
+- The server page no longer sits on _"Checking sign-in options…"_ forever after
+  connectivity returns. Which login methods a server offers was read once when
+  the page mounted, and a read that failed was never retried, so a blip left the
+  sign-in form unrendered until you navigated away or restarted. It now recovers
+  on the signals connection status already used — the page's Refresh button,
+  returning to the app window, and a remote host becoming reachable again. The
+  Refresh button in particular re-checked only the connection status, so the one
+  control a user would reach for did nothing visible.
+- A server whose gateway cannot be reached now says so in one line and retries
+  on its own, instead of stacking three surfaces that each described the same
+  failure differently: a red banner quoting a raw internal error
+  (`Error invoking remote method 'switchServers.getAuthConfig': …`), a
+  "Not signed in" row, and a sign-in panel that claimed to be checking options
+  it would never receive. There is nothing to sign into while the gateway is
+  down, so the sign-in form no longer appears at all. The underlying error goes
+  to the console.
+- The sidebar no longer offers "Sign in" on a server it cannot reach, which was
+  an action that could not work. Unreachable is now modelled apart from
+  signed-out, so the rooms list also stops reporting an unreachable server as
+  merely needing sign-in. A server whose data is unavailable shows a red dot
+  rather than amber, for both causes: neither is a transitional state
+.
+- A directory that already holds agents for one Switch server can now onboard its
+  agents to another. "Already onboarded" was judged per directory rather than per
+  server, so every candidate was filtered out as a duplicate and the modal offered
+  an empty list — of agents that existed, on a server that did not have them
+.
+- The sidebar no longer draws a directory's agents under a server they do not
+  belong to. A directory resolved to a single server — whichever of its agents was
+  returned first — and then every agent in it was rendered under that one, so
+  onboarding a single agent to a second server appeared to drag the rest across
+  with it. Nothing had been onboarded; each agent is now drawn under its own
+  server, and a shared directory shows under all of them.
+- Onboarding an agent whose credentials belong to **another** Switch server no
+  longer overwrites those credentials. The import path looked the existing
+  identity up on the target server, did not find it, and fell back to minting a
+  fresh one — writing it back over the same `.switch/agents/<name>.json` and
+  silently breaking the agent the other server was still running. It now refuses
+  and names the server the identity belongs to. Such agents are listed in the
+  Add Agent modal but not selectable, with the reason shown; a plain definition
+  carrying no Switch identity is still adopted as before.
+- The Add Agent modal no longer offers a permanently disabled button over a list
+  it will not submit. A directory carrying another server's leftover
+  `.claude/settings.local.json` took the detected-agent branch, verified that
+  foreign agent against the current server, failed, and disabled the only button
+  on screen — with the onboardable agents listed above it. The onboard action now
+  takes precedence, and a detected agent belonging to another server says so
+.
+- The Add Agent modal no longer shows the create form, or the existing-agents
+  list, before an agent type is picked. Both depend on the type — it decides
+  which agents can be brought in and how a new one runs — so the form asked for a
+  name, a description and a config, then ended at a button that could not be
+  pressed. Everything below the directory now waits for the type, and the modal
+  asks for it instead.
+
+### [0.19.3] - 2026-08-09
+
+#### Added
+- Declares its `sidecar-control` range in the sidecar's ready file, and reads
+  back whatever a running sidecar declares. A sidecar that declares nothing
+  records as unknown, never as agreement.
+
+#### Fixed
+- A gateway call to a managed server whose stack is **stopped** now fails with
+  the lifecycle state, naming the server, instead of timing out and reporting
+  `Could not reach http://localhost:<port>` — a local address that was never
+  the problem. It is logged as the modeled state it is rather than as an RPC
+  error, and the proactive session renewal no longer warns about the same
+  absence a second time.
+- A managed server whose deployed switch-core version **cannot be read** is now
+  surfaced as such, in the banner and the sidebar. It previously reported "no
+  drift" — the identical result a healthy, in-step stack gives — so a failed
+  probe rendered as a green server and the user was told nothing.
+- Starting a stack whose version cannot be compared to this build's pin now says
+  so loudly. It passed in complete silence, in the same branch as a clean match,
+  while carrying the same risk as a downgrade.
+- CI verifies the bundled standalone compose is in step with the repo's copy.
+  Nothing checked before — the two could drift with only a comment asking
+  nicely, which is how the sync script once silently stopped running
+.
+- The host-unreachable panel now also shows on a location that mounted while its
+  host was up, not only one that never mounted. Such a location stayed `ready`
+  and kept every control live over a dead SSH transport — the sidebar showed the
+  trouble icon, the main pane did not; it restores itself when the host returns
+.
+
+#### Security
+- Bump bundled dependencies for two advisories — DOMPurify `SAFE_FOR_TEMPLATES`
+  bypass in `RETURN_DOM` mode (GHSA-crv5-9vww-q3g8), and brace-expansion
+  denial-of-service via exponential expansion (GHSA-3jxr-9vmj-r5cp).
+
+### [0.19.2] - 2026-08-07
+
+#### Added
+- Connect a messaging app (Slack/Mattermost/Discord/Teams) to a server from
+  within switchdash — per-platform setup-guide links and a Teams icon; open a
+  messaging app's workspace from the server page.
+
+#### Changed
+- New macOS app icon (max.tam's mark); a dark mark for non-release (canary/dev)
+  channels; dropped the leftover emdash DMG art/wordmark.
+- Bump the bundled switch-core for local managed servers to `0.12.3`
+  (`COMPATIBLE_SWITCH_VERSION`).
+
+#### Fixed
+- Restore sidebar drag-to-reorder for agents and rooms.
+- Set `GATEWAY_PUBLIC_URL` so "Open in SwitchDash" links work; redact the
+  credential key names configs actually use; vendor the real Teams logo
+.
+
+### [0.19.1] - 2026-08-07
+
+#### Changed
+- switchdash sessions report their latest-message anchor so the
+  collaboration-bridge runtime indicator can follow the agent to the foot of the
+  conversation.
+- Bump the bundled switch-core for local managed servers to `0.12.2`
+  (`COMPATIBLE_SWITCH_VERSION`), so a fresh local stack pulls the latest
+  switch-core and existing stacks flag the drift for a one-click update.
+
+#### Fixed
+- Fix an import cycle that could leave the view registry half-built — a renderer
+  crash ("Cannot access 'remoteHostsView' before initialization"), deterministic
+  in CI and load-order-dependent locally.
+
+### [0.19.0] - 2026-08-07
+
+#### Added
+- Remote-host onboarding rewritten as per-host pages with a staged,
+  one-click-per-prerequisite setup: install each prerequisite individually with
+  live progress, inline GitHub CLI sign-in, and agent creation gated on host
+  readiness.
+- Surface and act on available updates on a remote host — detect Codex/CLI
+  updates remotely, re-check one dependency at a time, and show which version an
+  update brings, flagged in the sidebar.
+- Discover and onboard already-configured agents on a shared remote host
+ (#130).
+- Detect switch-core drift on a managed stack and update it; flag drift on the
+  sidebar server rows.
+- Command palette now searches across your agents and rooms — not just
+  navigation — labelling what each result is, jumping into another server's
+  scope, and adding an "Add Switch Server" command (#140).
+
+#### Changed
+- Split an agent type into separate CLI and connector rows; drop the
+  servers-sidebar text actions.
+- Pin switch-core `0.12.1` for the managed stack.
+
+#### Fixed
+- Remote-host setup hardening: a host without the GitHub CLI no longer reports
+  itself Ready; the readiness probe no longer races itself; host vs agent-type
+  readiness are judged separately; stale plans rebuild; a failed update is no
+  longer treated as a broken dependency; only CLI updates switchdash can
+  actually perform are offered; agent creation refuses an unchecked type; the
+  agent type clears when the run location changes; remote-host pages scroll; and
+  a remote install no longer hangs on an unanswerable prompt.
+- Dialogs opt out of the window drag region; the alert action no longer overlaps
+  its text.
+- Migration safety: register migration 0046 in the drizzle journal, fail loud
+  when a migration isn't registered, and assert the migration runner's timestamp
+  precondition.
+- Command-palette matching: a hyphenated query is no longer split into separate
+  terms, matches no longer land mid-word, results rank like the sidebar, and the
+  search index no longer treats `item_type` as content (#140).
+
+### [0.18.3] - 2026-08-06
+
+#### Added
+- The Codex connector plugin now ships the Switch MCP server itself
+  (`mcpServers` + `env_vars` name-forwarding), so Codex can be used with Switch
+  **outside switchdash** — previously the server was registered only by a
+  switchdash-written profile, and a hand-run Codex session had the room-workflow
+  skill but none of the tools it describes. The plugin also auto-approves the
+  Switch tools, which no `approval_policy` setting could do: measured against
+  codex-cli 0.146.0, that setting does not govern MCP tool calls at all
+.
+
+  ⚠️ Codex upgrades a plugin only when a user clicks Update in Settings and
+  caches each version separately, so an install still on an older connector has
+  no Switch tools until it is upgraded.
+
+#### Fixed
+- Bypass permissions is applied to sessions again: the toggle is stored on the
+  agent but every launch read a copy frozen into the session at creation, so
+  changing it never affected an existing session — on restart or resume — while
+  the settings copy promised the opposite.
+- Codex runtime status reports tool calls ("Running tool …") instead of sitting
+  on "Working on it…" for a whole turn; no tool hook was registered for Codex,
+  so nothing could ever produce an activity update.
+- In-app release links resolve again: the sidebar update indicator and the
+  Settings Update card pointed at `.../releases/tag/v<version>`, which is not a
+  real tag (the app is tagged `switch-console-v<version>`), so the user hit a 404;
+  the release-notes fetch had the same broken tag and now also authenticates
+  with the gh CLI token so it can read the private release feed instead of
+  silently returning nothing (#134).
+
+#### Changed
+- The per-agent Codex profile carries only model, reasoning effort and
+  instructions. An agent that sets none of them no longer gets a profile at all
+.
+
+### [0.18.2] - 2026-08-05
+
+#### Fixed
+- Client side of one-session-per-room enforcement: a session whose room the
+  server takes away (or refuses with HTTP 409 because another session of the
+  agent holds it) is now reported as roomless and is not reconnected under a
+  room it no longer attends — the remote-session reconciler and sidecar no
+  longer strand two sessions in one room (#109).
+
+### [0.18.1] - 2026-08-05
+
+#### Changed
+- Bundled Switch agent runtime bumped to 0.1.5 (#127).
+
+#### Fixed
+- A session's Switch connection id is now derived deterministically, so a
+  supervisor/sidecar restart no longer strands a remote session with a stale
+  connection id (#125).
+
+### [0.18.0] - 2026-08-04
+
+#### Added
+- Codex is now a supported agent provider. Add a Codex agent from the add-agent
+  modal (with a dedicated Codex config), connected to Switch via a new Codex
+  connector plugin registered in the marketplace, running locally or on a remote
+  host. `CODEX_SANDBOX_MODE` / `CODEX_APPROVAL_POLICY` drive Codex's sandbox and
+  approval (validated — an unknown value fails rather than silently widening the
+  sandbox); a Codex agent defaults to a `codex.<repo>.<user>` identity; and
+  switchdash registers the Switch MCP runtime for Codex itself via a per-agent
+  Codex profile (#91, #79).
+
+#### Fixed
+- Codex session correctness: per-agent Switch credentials are written to disk for
+  providers without repo-agents (so Codex sessions actually receive `SWITCH_*`);
+  Codex room tracking follows `connect_to_room` mid-session; and Codex hook
+  payloads post correctly (local Codex sessions had been posting empty bodies to
+  a portless URL) (#79).
+
+### [0.17.2] - 2026-08-04
+
+#### Added
+- Status-aware "update available" UX: the sidebar indicator shows the target
+  version when an update is available, live percentage + transfer rate while
+  downloading, a restart prompt once ready, and a warning tint on failure — and
+  opens a panel (current → new version, the right action, a link to the GitHub
+  release) instead of just jumping to Settings. User-triggered failures are
+  toasted and the real error message is shown (#107).
+
+#### Fixed
+- The onboarding/home page can drag the window again: the empty home surface is
+  now a drag region (action buttons opted out), so the window is no longer stuck
+  when Home is the active view (#106).
+
+### [0.17.1] - 2026-08-04
+
+#### Added
+- Linux x64 desktop builds are shipped again (AppImage, deb, rpm), with a stable
+  desktop-entry name so the launcher, icon and pinning behave; INSTALL docs and
+  release notes now cover Linux (#104).
+
+#### Changed
+- Release builds macOS and Linux artifacts in parallel (the GitHub Release is
+  created in its own job), cutting ~5 minutes off a release (#104).
+
+#### Fixed
+- A dropped-events "gap" no longer wakes an agent and spends a turn: switchdash
+  defers the warning onto the next event it was already going to surface, instead
+  of injecting an addressed prompt (#105).
+
+### [0.17.0] - 2026-08-04
+
+#### Added
+- In-app Switch room creation: create a room from switchdash (name, description,
+  messaging app, agents, optional instructions) instead of the operator web app —
+  the picker offers only running bridges and every created room is bridged
+ (#103).
+- Room-centric sidebar: a room tree listing rooms by membership and ownership
+  (not only rooms with a live session), showing each room's members, managing
+  membership (add/remove agents), starting a session in a room with the agent
+  pre-chosen, and opening the room in its messaging app when the gateway supplies
+  a deeplink; rooms sort and filter on their own properties (#103).
+
+#### Fixed
+- Sessions launched for a room now declare that room when their connection opens
+  — both sidebar-started and auto-spawned (messaging-app-addressed) sessions
+  appear under the correct room immediately instead of sitting under
+  "Unassigned" until the agent calls `connect_to_room` (#103).
+
+### [0.16.1] - 2026-08-03
+
+#### Added
+- Local GitHub-auth detection in Switch setup: a requirement row reporting `gh`
+  missing / not logged in / missing `read:packages`, with an inline device-flow
+  login that requests the scope. Sessions that can't fetch the runtime now toast
+  the reason instead of starting silently broken (#102).
+
+#### Fixed
+- GitHub auth changes now take effect without restarting: the updater no longer
+  leaves a boot-time token in `GH_TOKEN` (which shadowed the keyring for `gh`),
+  and the scope check judges the active account only (`gh auth status --active`)
+  rather than any known account (#102).
+- A dialog's own terminal now receives keystrokes (the `gh auth` prompt was
+  silenced inside the Agent Settings modal); agent usage — not just install — is
+  gated on GitHub access; managed servers pinned to switch-core `0.11.0` (was
+  `0.8.1`) (#102).
+
+### [0.16.0] - 2026-08-03
+
+#### Added
+- Move switchdash and the remote sidecar onto the agent-bridge push stream: one
+  shared connection per session claims its room server-side instead of scraping
+  it from a hook, backed by the new `@sandbox-quantum/switch-agent-runtime`
+  shared protocol client used by both switchdash and the connector plugin
+ (#100).
+
+#### Removed
+- First-run welcome page and residual Emdash artwork; first run now lands on the
+  existing home empty state with an "Add Switch agent" action (#96).
+
+### [0.15.3] - 2026-07-31
+
+#### Fixed
+- Unbreak remote hosts with `IdentitiesOnly` or restricted agent forwarding: the
+  `IdentitiesOnly` key-filter now extends ssh2's `BaseAgent` so it's no longer
+  silently discarded (which had broken auth for keychain-only keys and failed
+  connects under `ForwardAgent yes`), and a host that refuses agent forwarding
+  now degrades to "everything except forwarding" — with a warning — instead of
+  failing every command (#98).
+
+### [0.15.2] - 2026-07-30
+
+#### Added
+- Logging & diagnostics foundation across main, renderer, and the remote
+  sidecar: structured, session-scoped entries with a per-launch run id; file
+  logging defaulting to `info` (was `warn`); PII redacted only on export (not in
+  the local log) so local logs are debuggable while exported logs stay as safe
+  as before; on-demand sidecar log capture folded into bug reports; and
+  boot/exit + enumerated error markers to pinpoint crashes and launch failures
+ (#83).
+
+#### Fixed
+- Stop a destroyed managed server's agents from polling forever: resetting a
+  managed server now deletes its agents (the cascade lives behind the reset in
+  the main process), room connections are keyed per session with
+  `ON DELETE CASCADE` so orphaned entries are unrepresentable, and the boot
+  sweep refuses to restore sessions for orphaned agents instead of hammering a
+  dead endpoint (#95).
+
+### [0.15.1] - 2026-07-30
+
+#### Fixed
+- Surface non-image attachments to dash-managed sessions: switchdash's own
+  session-notification builder now downloads and annotates any file type (not
+  just images) and names failed downloads, so agents running under switchdash
+  are actually told about files posted in a room (#94).
+
+### [0.15.0] - 2026-07-29
+
+#### Added
+- Built-in chat: switchdash renders each room's default bridge conversation
+  inline (Mattermost) with per-room embed resolution, a chromeless guest view,
+  theming, and link/deeplink routing; Slack rooms get a deeplink and agent-only
+  rooms a stated reason (#84).
+
+#### Fixed
+- Gate remote managed servers on host reachability, so an unreachable host no
+  longer shows a stale green "Running" card or a spinning sign-in — the server
+  page shows a "host unreachable" state and disables actions until it recovers
+ (#85).
+
+### [0.14.3] - 2026-07-28
+
+#### Fixed
+- Model remote-host reachability as a first-class per-host state machine, so
+  switchdash stops the unbounded reconnect/reconcile retries against an
+  unreachable host (one bounded backoff probe per host), persists the state
+  across restarts, and surfaces a clear "host unreachable — work paused" panel
+  with a global Retry instead of raw SSH errors (#82).
+
+### [0.14.2] - 2026-07-28
+
+#### Fixed
+- Key the remote session reconciler per-sidecar instead of per-location, so
+  sessions from multiple agents sharing one working directory all get adopted
+  into the sidebar (#81).
+
+### [0.14.1] - 2026-07-27
+
+#### Fixed
+- Reap sidecars orphaned when their tmux session name changes across upgrades,
+  instead of leaving duplicates running for the same agent directory.
+
+### [0.14.0] - 2026-07-27
+
+#### Added
+- Remote sidecar now persists durable state and versioning, so running sessions
+  survive sidecar restarts, upgrades, and token rotation.
+
+#### Fixed
+- Client no longer deletes healthy sessions when it briefly can't reach the
+  sidecar; fixes cross-build kill loops and deaf clients after a sidecar restart
+.
+
+### [0.13.1] - 2026-07-26
+
+#### Fixed
+- Fix slow boot caused by the agent-storage migration, and restore sessions that
+  vanished after the 0.13.0 upgrade.
+
+### [0.13.0] - 2026-07-26
+
+#### Changed
+- Removed the subagent concept — agents are now flat and repository-defined;
+  existing subagents migrate forward automatically on first launch.
+
+#### Fixed
+- Honor the bypass-permissions toggle for remote agents and clear a stale
+  session guard.
+- Skip the connection-status probe for a stopped managed server.
+
+### [0.12.0] - 2026-07-24
+
+#### Added
+- Configure per-agent addressing policy from the app and gateway.
+
+#### Fixed
+- Data-entry modals no longer dismiss on outside-click, so in-progress input
+  isn't lost.
+
+### [0.11.4] - 2026-07-24
+
+#### Added
+- Reset a remote agent — kill and reset all of its tmux sessions.
+
+### [0.11.3] - 2026-07-24
+
+#### Changed
+- Sidebar and session UX polish.
+
+### [0.11.2] - 2026-07-24
+
+#### Added
+- Delete and rename connected Switch servers.
+- Per-agent bypass-permissions setting — defaults off, on for remote agents
+  (#57).
+
+### [0.11.1] - 2026-07-24
+
+#### Added
+- Agent delete now tears down its credentials and optionally deletes the agent
+  from Switch.
+- Agent error indicator with a retry button.
+
+#### Changed
+- Discord bridge polish: deeplink redirect, room icon, and outbound image relay
+.
+- Relicensed to Apache-2.0 + Commons Clause, with a CLA gate for contributions
+.
+
+### [0.11.0] - 2026-07-20
+
+#### Added
+- Managed Switch servers can now run on a remote host over SSH — the app
+  provisions the Docker stack remotely, with port-forwarded access, alongside
+  the existing local mode.
+
+### [0.10.1] - 2026-07-20
+
+#### Added
+- Silent session token refresh — sessions renew before the 24h expiry instead
+  of bouncing to sign-in; the managed local server is always-signed-in, and
+  its gateway web page opens pre-authenticated in-app.
+- Editing a server's API URL cascades to its member agents' configs
+.
+
+#### Fixed
+- Remote sessions recover their room connection after an app restart or
+  machine sleep.
+
+### [0.10.0] - 2026-07-20
+
+#### Added
+- Local-server mode: run a managed Switch stack via Docker straight from the
+  app — pulls the versioned standalone compose artifact, provisions
+  env/secrets/ports, and monitors health.
+
+#### Fixed
+- Injected prompts are always bracketed-pasted, so prompts containing @ no
+  longer swallow the submit.
+
+### [0.9.2] - 2026-07-19
+
+#### Added
+- Sidebar agents are labelled by their registered Switch name.
+
+### [0.9.1] - 2026-07-19
+
+#### Changed
+- Replaced the workspace/project abstraction with first-class Locations —
+  agents attach directly to a location (working directory).
+- Collapsed sessions to a single conversation each and simplified
+  session/conversation management throughout.
+
+Existing databases migrate forward automatically on first launch (schema
+migrations 0031–0036, including a locations backfill).
+
+### [0.9.0] - 2026-07-17
+
+#### Added
+- Newly created subagents default to auto-session on.
+
+#### Removed
+- Removed the telemetry/analytics stack entirely — the app ships no tracking
+  or phone-home behavior.
+
+#### Fixed
+- tmux mouse scroll works again (set-option target parsing).
+- Switch setup re-points stale plugin-marketplace sources after the repo move
+  and surfaces failed refreshes instead of silently skipping.
+
+### [0.8.8] - 2026-07-15
+
+#### Changed
+- Updated Electron to 40.8.5 and drizzle-orm to 0.45.2.
+
+#### Fixed
+- Switch settings writers no longer clobber `settings.local.json` when reading
+  the existing file fails (local, remote-SSH, and plugin-fs providers).
+
+Desktop-app releases predating this changelog live in the git log and in the
+per-release notes on their GitHub Releases (`switch-console-v*` tags).
+
+---
+
+## agent-controller
+
+The headless agents controller, `switch-agent-controller`
+(`console/packages/agent-controller/`), released on `switch-agent-controller-v*`
+tags; see RELEASING.md.
+
+### [Unreleased]
+
+#### Added
+- **Waits its turn when Switch is busy opening connections.** An open or an
+  attach refused as `busy` comes with when to try again, the controller's
+  place in the server's queue, and the controller now waits that long
+  instead of its own backoff.
+- **A provider report says when signing in would not help.** A provider
+  whose check says its login command would not fix the problem is reported
+  with `login_helps: false` beside `auth_problem`, so Console does not offer
+  the command. Absent otherwise, as before.
+- **Provider logins given to the machine, on demand.** The controller makes an
+  X25519 keypair at enrollment (or on its next run, for one enrolled before)
+  and registers the public half. When its owner gives the machine a login
+  sealed to it, a `provider.login` operation has the controller open it, check
+  the provider signs in with it, and report whether it does. The machine's own
+  login still comes first; agents of a provider it has none for get the given
+  one, run in a process of their own, and restart when it changes or is
+  withdrawn. Status reports `auth_source: "sealed"` for it.
+
+- **Each agent as a Linux user of its own.** On Linux with systemd and polkit,
+  `sudo switch-agent-controller install-service --separate-users` sets up, once,
+  a pool of agent users, a unit template that runs an agent as one of them, a
+  polkit rule that lets the controller start only those units, and the
+  controller as a system service. Each agent then runs as its own user and sees
+  only its own directory. It cannot see the home directories, the controller's
+  data, the other agents or the cloud instance metadata, and the rest of the
+  system is read-only to it. Agents get provider keys from the controller's
+  `--env-file`, not its user's own logins. `--agent-users` sets how many agents
+  can run (16 by default).
+
+#### Changed
+- **Agents' operations go to Switch on the controller's socket.** Every
+  operation an agent host calls through the relay
+  (`POST /agents/{id}/ops/{operation}`) is sent as a call on the socket the
+  controller already holds, when Switch offers calls, instead of as an HTTP
+  request of its own. Over HTTP as before against a server that does not
+  offer them, while the socket is down, and when as many calls are in flight
+  as Switch takes. A call the socket closes on is answered 502, as a request
+  whose connection drops.
+
+#### Fixed
+- **A Claude Code login that is there but does not work is reported as not
+  signed in.** `claude auth status` only says a login or key is present, so a
+  key left by an old install read as signed in while every session failed.
+  When setting up, on a recheck, and whenever a login was not yet known to
+  work, the controller now sends Claude Code one short test prompt, with the
+  person's hooks off and stdin closed, and reports what it said if it fails,
+  from its result, its `errors` or its stderr. A Claude Code too old to have
+  `auth status` is reported as such instead of as a check that never finished.
+- **A controller updates to the release Switch names while sessions sit idle.**
+  It waited until no session existed on the machine, and a session connected to
+  a room counted even with nothing to do, so a machine with long-lived sessions
+  stayed `waiting_idle` for good. It now waits only until no session is in the
+  middle of a turn. Each agent host reports which of its sessions are busy (one
+  that has not said yet counts as busy), and the controller looks again every
+  few seconds while it waits rather than at the next status report. Idle
+  sessions in the controller's own process are restarted with it and resume
+  their conversations; agents running in a process of their own keep running
+  through it. An agent host too old to report busy sessions still holds the
+  update while it has any session.
+- **Agents running in a process of their own move onto the release the
+  controller updated to.** Such an agent host (detached, or a systemd unit with
+  separate users, as on Switch cloud machines) outlives the controller and kept
+  the shared-host bundle it started with, so a fix in it reached the agent only
+  when the agent was restarted by hand. Each agent host now records the bundle
+  it runs (by SHA-256) in its `health.json`, and the controller restarts one on
+  another bundle, or too old to say, once none of its sessions is mid-turn;
+  idle sessions resume their conversations. A host that comes back still
+  outdated is tried again after 10 minutes.
+- **A refusal that cannot pass stops the controller instead of retrying it
+  forever.** The server answers `protocol_unsupported` when it no longer speaks
+  the controller's protocol and `invalid_credential` when it knows no controller
+  by its credential, and marks both not retryable. The controller retried them
+  every few seconds for as long as it ran. It now stops its agents and exits
+  with a new code, `5` (update the controller) or `6` (enroll the machine
+  again), and the systemd unit and launchd job it installs do not restart it on
+  either.
+
+### [0.1.1] - 2026-10-07
+
+#### Fixed
+- **Installer falls back to `~/.local`** when it can't write to a system prefix, and
+  takes a `--data-dir` to place the controller's data directory explicitly.
+
+### [0.1.0] - 2026-10-07
+
+#### Added
+- **Installable on its own.** Each release publishes one npm package (the CLI and
+  the shared-host bundle, no dependencies) and an `install.sh`, which checks Node,
+  installs the newest release, and can enroll the machine and install the service
+  in one go.
+- **`install-service` / `uninstall-service`:** runs the controller as a systemd user
+  unit on Linux or a launchd agent on macOS, restarted only after an error that may
+  pass.
+- **`doctor`:** checks Node, enrollment, the credential, the server (including a
+  proxy that does not route `/v1` to switch-core), each provider CLI and its
+  sign-in, the service, and updates.
+- **`update`:** installs the newest release and restarts the service. `run` logs
+  when a newer one exists.
+- **`run --env-file` and `install-service --env-file`:** environment for the agents,
+  such as provider API keys or Vertex AI and Bedrock settings. Sessions now inherit
+  the Vertex and Bedrock variables Claude Code reads (`ANTHROPIC_VERTEX_PROJECT_ID`,
+  `CLOUD_ML_REGION`, `ANTHROPIC_BEDROCK_BASE_URL`, …).
+- **`enroll --secret-store`:** keeps the controller credential in the macOS keychain
+  (the default on a Mac) or the desktop keyring, as well as in owner-only files (the
+  default elsewhere).
+
+---
+
+## agent-runtime
+
+The Switch protocol client and MCP runtime
+(`console/packages/switch-agent-runtime/`). Version lives in its `package.json`.
+
+### [Unreleased]
+
+#### Added
+- **Waits its turn when Switch is busy opening connections.** A server
+  pacing a reconnect storm refuses an open as `busy` with when to open again,
+  which is this agent's place in its queue. The stream now waits that long,
+  even right after a restart, instead of retrying on its own schedule.
+- When the WebSocket never opens and the runtime asks for the event stream
+  instead, the request carries `fallback=socket_never_opened` and the
+  socket's close code as `fallback_close_code`, so the server's log can tell
+  it from a client built before the socket. Opening the event stream straight
+  away, against an old server, sends neither.
+
+### [0.8.0] - 2026-09-25
+
+#### Added
+- Attaches as a hosted worker on agent-protocol 7: the event stream opens with
+  the worker capability and host identity, hands the protocol-7 frames to the
+  worker, stops for good on a terminal worker refusal or a superseded launch,
+  and fences hosted up-calls by the connection and incarnation it holds.
+- States a retained volume's layout version on open and uploads its cutover
+  manifest until Switch confirms it.
+### [0.7.2] - 2026-10-01
+
+#### Fixed
+- Event-stream handling hardened against a self-takeover and a silently
+  dropped stream when a connection resumes after the machine sleeps (#621).
+
+### [0.7.1] - 2026-09-30
+
+#### Fixed
+- **A connection no longer gives itself up to itself.** A placements or room
+  subscribe request sent under one incarnation and answered after this client
+  had reopened its own stream was refused as "taken over", naming this client
+  as the new holder, and the client stood down for good with nobody else
+  anywhere near the connection. Such a refusal now only fails the request,
+  which is stated again on the next change or reconnect; a real takeover is
+  still caught by the next heartbeat.
+
+### [0.7.0] - 2026-09-25
+
+#### Changed
+- Reworked for the host-owned session model: the runtime serves the Switch tool
+  surface per session host while Console/sidecar own session lifecycle and
+  switch-core relays (#543). No longer published on its own tag — ships inside
+  Switch Console (0.36.0) and its sidecar.
+
+### [0.4.3] - 2026-09-23
+
+#### Added
+- Support for reading any room the agent is a member of without connecting to it,
+  and the create-from-template flow (#628, #405).
+
+#### Changed
+- Watcher ownership follows the console/sidecar split (#507).
+
+#### Security
+- Untrusted room-message bodies are fenced in the delivered prompt (#527).
+
+### [0.4.1] - 2026-09-03
+
+#### Fixed
+- **A deleted room no longer wedges the whole connection.** When the client
+  declared a room the server had dropped, the server refused the entire
+  connection; the client reopened and re-declared the same room, so it was
+  refused again — an unbreakable loop (measured at ~29 errors/min for over a
+  day). A refusal that names one of our rooms is now terminal for that room: it
+  is dropped, reported at error level, and the reduced room list is pushed over
+  the same callback the server's own updates use, so the reopen is a strictly
+  smaller request and cannot spin. Refusals that name no room keep their
+  existing transport backoff (#353).
+- **The heartbeat now backs off when the connection is rejected.** A 404/409 on
+  `/connection/beat` means we are not attached and only a reopen helps, but the
+  loop treated "the server answered" as recovery and beat on at full cadence —
+  one rejected request every two seconds against a connection that could never
+  reopen. A rejection now counts as a beat that did not land: reopen, then
+  double the interval to the 30s cap on the same curve as every other failure;
+  the first beat that lands returns to base cadence (#353).
+
+#### Added
+- Reap orphaned agent runtimes at boot: `reapOrphanedRuntimes` is now part of
+  the package's public surface so the runtime and Switch Console share one
+  definition of an abandoned runtime, and a session started on a dead host is
+  cleaned up on the next start (#309).
+
+### [0.3.3] - 2026-08-27
+
+#### Fixed
+- The runtime now exits when its host does, instead of running forever. Its
+  intended shutdown path (via the transport's `onclose`) never fired for a host
+  that was killed, crashed or force-quit, and the hook listener's TCP server
+  plus the heartbeat and lease timers kept the process alive against a Switch
+  that was already gone — leaving stale processes and loopback listeners piling
+  up across sessions. Shutdown is now driven by four independent triggers —
+  stdin `end`/`close`, termination signals, a stdout/stderr write error, and a
+  parent-pid watchdog — so the process goes away whichever way its host vanishes
+  (#307).
+
+### [0.3.2] - 2026-08-19
+
+#### Fixed
+- An environment naming an agent but carrying no token now resolves against the
+  local agent store instead of refusing to start. Any partial `SWITCH_*`
+  environment was treated as a broken config, but that is the exact shape a host
+  settings file produces when the credential is deliberately kept out of the
+  working tree — and Claude Code exports its settings `env` block into the
+  process, MCP subprocesses included. Switch Console writes exactly that shape for its own
+  agents, so a session started by hand in a directory it set up degraded to
+  `switch_unavailable` with a perfectly good store on disk beside it. The
+  `configure` skill used to write it too; it no longer does, so this is a safety
+  net for the Switch Console case rather than how the standalone path works.
+
+  The agent id makes the lookup exact, so nothing is guessed: an id that matches
+  no store entry, one belonging to a different server, or one claimed by two
+  entries at once all still refuse. A token missing either of the others also
+  still refuses — inferring where to send a credential is a different order of
+  risk from inferring which one to send.
+- Refuses a *partly* expanded environment instead of filling the gap from disk.
+  Some `${SWITCH_*}` still literal while others resolved means a substitution
+  step did not finish, which is not the same as a value deliberately omitted —
+  and silently completing it from the store would authenticate as whatever is on
+  disk without saying so. All three unexpanded is still the host's ordinary
+  pre-expansion spawn.
+- `normalizeEndpoint` folds scheme and host case. It went from grouping
+  endpoints for display to gating whether an identity binds, and a
+  differently-cased host is the same server.
+
+### [0.3.1] - 2026-08-12
+
+#### Changed
+- The MCP server instructions no longer tell the agent to `read_context` on
+  every message event, or to connect before every call. Reading is now
+  conditional on a signal that the agent is actually behind — an unread count
+  above zero, a gap warning, an unfamiliar thread, a long silence — and the
+  connection is described as holding for the session rather than as a
+  precondition to re-establish per call.
+
+### [0.3.0] - 2026-08-11
+
+#### Changed
+- Published to **npmjs.com** under the **`@sandboxaq`** scope (was
+  `@sandbox-quantum` on GitHub Packages), so `npx` fetches it with no login and
+  nothing on disk — anyone, inside or outside SandboxAQ, can run the connector
+  plugins. GitHub Packages required a `read:packages` token even for public
+  packages, which `gh auth login` does not grant, so external consumers hit a
+  404 naming neither the registry nor the missing credential.
+- Publishing now authenticates by **npm trusted publishing (OIDC)** and runs in
+  the `release` environment, so a pushed tag queues the publish for approval;
+  builds carry `--provenance` and no npm token is stored.
+
+The package name (`switch-agent-runtime`) and the runtime's behavior are
+unchanged — only where and under what scope it ships. Version `0.2.x` was
+skipped to `0.3.0` by request.
+
+### [0.2.0] - 2026-08-10
+
+#### Added
+- Resolves its own Switch identity and credentials from the local agent store
+  (`./.switch/agents/`), not only from the environment — so a connector-plugin
+  session that is handed the server but no identity can start standalone instead
+  of exiting before the handshake.
+- `select_agent` tool: when the store names several agents on one server,
+  identity is left open and `select_agent` binds it; the event stream and
+  heartbeat start on bind rather than at boot.
+- Degraded startup: on a resolution failure — no credentials, an ambiguous
+  multi-server store, or an unreachable Switch — the runtime starts anyway and
+  serves a single `switch_unavailable` tool whose result is the diagnostic,
+  instead of vanishing so Switch tools read as silently missing.
+
+#### Changed
+- An unexpanded `${SWITCH_*}` placeholder now counts as absent rather than as a
+  value, so a Claude connector session falls through to the store instead of
+  dying on its own placeholder. Half a set of vars still refuses to start
+.
+
+### [0.1.6] - 2026-08-09
+
+#### Added
+- Declares its `agent-protocol` range, artifact name and release version on the
+  event stream it already opens, so switch-core can record what is connecting
+.
+- Logs the server's declaration from the `connection_state` frame, so which
+  versions were actually talking to each other is answerable from a bug report
+  rather than a guess.
+
+#### Changed
+- Reports a failing event stream on a curve — first failure, then powers of
+  two, plus a line when it recovers — instead of once per reconnect. The
+  reconnect itself is unchanged; only the reporting is rationed, so a stack
+  that is simply stopped costs a handful of log lines rather than one per
+  session per 30s, forever.
+
+### [0.1.5]
+
+Releases before this changelog existed are in the git log. They are not
+reconstructed here: an invented history reads exactly like a real one.
+
+---
+
+## sidecar
+
+The remote runtime Switch Console deploys to an agent host. Versioned in
+[`artifacts.yaml`](artifacts.yaml) and deployed by Switch Console rather than
+published on its own.
+
+### [Unreleased]
+
+#### Added
+- Serves the session-side half of service grants: granted skills in each
+  session, the GitHub credential helper and `gh` wrapper, and scrubbing of
+  issued tokens, as Switch Console does.
+
+### [1.9.12] - 2026-10-01
+
+#### Changed
+- Picks up the agent-runtime 0.7.2 event-stream fix it bundles (#621).
+
+### [1.9.11] - 2026-09-30
+
+#### Added
+- **The room watcher records its connection to Switch in `health.json`** beside
+  its other state, each time it changes, so Console can read it from the host
+  instead of relying on a live connection to the sidecar.
+
+#### Fixed
+- **A stuck process can no longer block replacing a watcher.** Stopping a
+  watcher or session host sent SIGTERM and waited; one waiting on a child that
+  would never finish — a session host that hung up and stayed alive — never
+  exited, so every update to that agent failed with "The SDK host has not
+  stopped". A host asked to stop is now killed, with every process it started,
+  if it has not gone after 10 s (a supervised host) or 20 s (one being
+  replaced).
+- **A session whose host hung up no longer blocks its room for good.** After a
+  reset, a session host could finish and close its link to the watcher while a
+  provider process it had started kept it alive. The watcher still saw it as
+  running, so every room message failed and it was "started again" every five
+  seconds, forever, without anyone being told. Now the host exits within five
+  seconds of finishing whatever it left running; the watcher treats a host that
+  hung up as gone, and stops it and what it started if it has not exited
+  fifteen seconds later; and a session that still will not take a message after
+  five starts in a row is left alone with its messages queued, and the room is
+  told.
+
+#### Changed
+- Claude Code sessions accept their agent definition in the launch spec and pass
+  it to the SDK, rather than reading `.claude/agents/<name>.md` on the host.
+  Sessions saved by an earlier Console, which name the file, still relaunch.
+
+### [1.9.10] - 2026-09-25
+
+#### Changed
+- Session handling refined: shared-agent-runtime initial prompt,
+  session-command and stop-shared-session paths, and transcript handling. Ships
+  with Switch Console 0.37.0.
+
+### [1.9.9] - 2026-09-25
+
+#### Changed
+- Owns its agent sessions under the new host-owned session model; switch-core
+  relays rather than owning session lifecycle (#543). Ships with Switch Console
+  0.36.0.
+
+### [1.9.8] - 2026-09-23
+
+#### Changed
+- Watcher ownership follows the console/sidecar split — remote watchers are
+  parented by the sidecar (#507). Rebuilt on agent-runtime 0.4.3.
+
+### [1.9.7] - 2026-09-03
+
+#### Fixed
+- Reap dead tmux targets so a pane whose tmux session has gone is not treated as
+  a live one (#336).
+
+#### Changed
+- Rebuilt on agent-runtime 0.4.1 (a deleted room no longer wedges the whole
+  connection, and the heartbeat backs off when the connection is rejected).
+
+### [1.9.6] - 2026-09-01
+
+#### Changed
+- Rebuilt on agent-runtime 0.3.4, which reaps orphaned agent runtimes at boot.
+
+### [1.9.5]
+
+#### Changed
+- Runs agent-runtime `0.3.3`, which now exits when its host does instead of
+  leaving stale runtime processes and loopback listeners behind (#307). The
+  client↔sidecar wire (ready line, endpoints, on-disk layout) is unchanged, so
+  the major stays `1`.
+
+### [1.9.4]
+
+#### Fixed
+- The remote session spawner clears the CLI first-run prompts that would
+  otherwise leave a spawned session alive but never answering, matching the
+  desktop-side fix (CHOO-2213). Behavior change only — the client↔sidecar wire
+  (ready line, endpoints, on-disk layout) is unchanged, so the major stays `1`.
+
+### [1.9.3]
+
+#### Added
+- The ready file carries a `deployer` field: the identity of the Switch Console
+  install that started this sidecar, echoed from the environment it was
+  launched with. It is the one thing on the host that says *whose* build is
+  running — the content hash says only which. Purely additive, so no contract
+  revision moves: an older client ignores the field, and a client reading a
+  sidecar that omits it must treat that as unknown rather than as its own.
+- Writes an agent's launch profile on the VM and completes the home-directory
+  placeholder in its environment, so a provider that names a config file by
+  absolute path (OpenCode's `OPENCODE_CONFIG`) launches correctly on a remote
+  host. Additive — the client↔sidecar wire is unchanged, so the major stays `1`.
+
+### [1.9.2]
+
+#### Changed
+- The remote session spawner now installs a provider's hooks whether they are
+  delivered as config files or as a dropped plugin (OpenCode), mirroring the
+  desktop side. A plugin-delivered provider previously launched on the VM with
+  nothing installed and never reported that it stopped (#203). Behavior change
+  only — the client↔sidecar wire (ready line, endpoints, on-disk layout) is
+  unchanged, so the major stays at `1`.
+
+### [1.9.1]
+
+#### Changed
+- Windows-compatible path and process handling in the session spawner, matching
+  the desktop app's Windows fixes (#207). Behavior change only — the
+  client↔sidecar wire (ready line, endpoints, on-disk layout) is unchanged, so
+  the major stays at `1`.
+
+### [1.9.0]
+
+#### Changed
+- Dropped the npm-registry-auth machinery (`npm-registry-auth.ts`): now that the
+  agent runtime is published to public npmjs (CHOO-2021, CHOO-2023), the sidecar
+  no longer needs a token to `npx` it. Behavior change only — the
+  client↔sidecar wire (ready line, endpoints, on-disk layout) is unchanged, so
+  the major stays at `1`.
+
+### [1.8.0]
+
+#### Added
+- Declares its `sidecar-control` range in the ready file switchdash already
+  reads.
+
+#### Changed
+- Three-part semver: `1.7` becomes `1.8.0`. **The major stays at 1** — every
+  switchdash already in the field judges compatibility on the major and parses
+  two parts, so `1.7` and `1.8.0` order correctly and neither side
+  replaces the other. `2.0.0` would have every existing install treat this
+  sidecar as incompatible and replace it while a newer install replaces it back
+.
+- The version no longer carries compatibility. It says which release is running;
+  what the sidecar can speak is the `sidecar-control` range it now declares in
+  its ready file.
+- The version is declared in `artifacts.yaml` and generated into the code.
+  Nothing else declares it — the sidecar is deployed by switchdash rather than
+  published, so it has no packaging file of its own.
+
+### [1.7]
+
+Earlier versions used a two-part `x.y` scheme in which the major *was* the
+compatibility signal. History for those is in the git log.
+
+---
+
+## switch-connector (Claude Code)
+
+`connectors/claude-code-plugin/`. Version lives in
+`.claude-plugin/plugin.json`.
+
+### [Unreleased]
+
+### [0.9.16] - 2026-09-23
+
+#### Changed
+- Skill updated for the recent room-workflow changes (reading a room you belong
+  to without connecting, templates). Pinned agent-runtime moves to 0.4.3; the
+  plugin version bumps so installs re-download (#628, #527).
+
+### [0.9.14] - 2026-09-06
+#### Changed
+- Skill updated: Matrix references removed to match the Postgres-backed message
+  store (#380). Plugin version bumps so installs re-download.
+
+### [0.9.13] - 2026-09-06
+#### Changed
+- Skills updated for agent display names: the switch and configure skills note
+  that agents may render under a human display name on the bridges (#330).
+  Plugin version bumps so installs re-download.
+
+### [0.9.12] - 2026-09-03
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.4.1` (was `0.3.4`) — a deleted room no
+  longer wedges the whole connection, and the heartbeat backs off when the
+  connection is rejected. Plugin version bumps so installs re-download.
+- Skill updated: documents user-defined external reference types and
+  `list_all_references` for discovering references across the instance.
+
+### [0.9.11] - 2026-09-01
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.4` (was `0.3.3`) — picks up reaping
+  of orphaned agent runtimes at boot.
+
+### [0.9.10] - 2026-08-27
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.3` (was `0.3.2`) — picks up the
+  runtime's host-exit fix (#307), which stops stale runtime processes and
+  loopback listeners piling up. Plugin version bumps so installs re-download.
+
+### [0.9.9] - 2026-08-26
+#### Fixed
+- The `configure` skill's standalone feature list no longer claims the **task
+  protocol** works — it was removed from the connector skills, so an agent
+  reading the old list could try something unavailable. Plugin version bumped so
+  installs re-download.
+
+### [0.9.8] - 2026-08-24
+#### Changed
+- The `configure` skill's generated connect command now names the agent it was
+  set up for, so a session started in a directory holding several agents answers
+  `select_agent` on its own instead of asking the operator. Plugin version bumped
+  so installs re-download (CHOO-2344).
+
+### [0.9.7] - 2026-08-22
+#### Fixed
+- The room-workflow skill said a Telegram DM is adopted the way Mattermost's
+  is, so an agent asked for a 1:1 on Telegram would tell the user to message
+  the bot and wait for a room that never arrives. Telegram has no DM: a private
+  chat with the bot is the lobby, which answers with setup guidance and
+  provisions nothing. The skill now says so, and points at a group of two as
+  the way to get DM-like behaviour (CHOO-2314).
+
+### [0.9.6] - 2026-08-19
+
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.2` (was `0.3.1`) — picks up the
+  runtime's store-based credential resolution (CHOO-1862); the plugin version
+  bumps so installs re-download.
+
+#### Fixed
+- **The `configure` skill no longer breaks the standalone path it exists to set
+  up.** It wrote `SWITCH_API_ENDPOINT` and `SWITCH_AGENT_ID` into
+  `.claude/settings.local.json`, and Claude Code turns that `env` block into real
+  environment variables for everything it spawns — so every session it configured
+  started with two of the three values set. The runtime takes a complete
+  environment or none at all and refuses anything in between, deliberately, so
+  those sessions got no Switch tools whatsoever while the token sat unread in
+  `.switch/agents/<name>.json` beside them. The skill now writes the store and
+  nothing else, which is the mode the runtime already supports on every published
+  version; Step 1 strips any `SWITCH_*` an earlier run left in either settings
+  file, and Step 9 writes `permissions.allow` alone.
+- The hook no longer skips mediation on a standalone install. It read its
+  credentials from the environment only, and the `configure` skill deliberately
+  keeps the token out of there, so it reported itself unconfigured and returned
+  without reporting or mediating anything — silently, on every tool call. It now
+  falls back to the same `.switch/agents/*.json` store the runtime reads, keyed
+  on the agent id the session recorded when it joined a room, and names the
+  cause on stderr when it cannot resolve one instead of skipping quietly.
+- The runtime resolves an agent id carrying no token against the store rather
+  than refusing outright. The skill no longer produces that state, but Switch
+  Console writes the same two keys for its own agents, so a session started by
+  hand in a directory Switch Console set up hit the identical dead end.
+- The `configure` skill read a `401` from the health probe as the wrong server
+  and sent the user off to find a different URL. The bridge authenticates
+  everything but a few public routes, so a path left on the end of an otherwise
+  correct base URL answers 401 rather than 404 — the host was right and only
+  needed stripping back.
+- The hook resolves an identity the same way the runtime does in three more
+  cases, each of which let a session run while its governance quietly did not.
+  It folds endpoint case, as the runtime does, so a differently-cased host no
+  longer binds in one and matches nothing in the other. It refuses a partly
+  unexpanded `${SWITCH_*}` environment instead of completing it from disk. And
+  it refuses a token that is missing either of the other two, rather than
+  substituting a different credential from the store while the session itself
+  refuses to start — a test had asserted that substitution as correct.
+- A failed mediation check says so. Any error reaching the bridge — a revoked
+  token, an unreachable server, a timeout — was swallowed and the tool call
+  proceeded with nothing printed, which is indistinguishable from approval. The
+  call still proceeds, because a bridge outage must not wedge a session, but it
+  now says on stderr that it was not checked.
+- The `configure` skill no longer overwrites a credentials file that belongs to
+  another Switch setup. Its script writes `.switch/agents/<name>.json` by name
+  alone and truncated whatever was there, which in a directory shared with a
+  Switch Console install (or an earlier run against a different server) destroyed
+  a token that is issued once and stored nowhere else. It now stops before
+  registering if that file names a different Switch server, and reports which —
+  the same guard the Codex skill and Switch Console's own write paths got. The
+  subagent step gets it too, over
+  `.claude/switch-subagents/<name>.settings.json`: that path is Claude-only, so
+  it was outside that sweep, and it is checked across the whole batch before the
+  bulk registration, since refusing afterwards would strand every agent in it.
+
+#### Changed
+- The `configure` skill is rebuilt on the standalone shape the Codex connector
+  uses: registering and writing the credentials are separate steps that still run
+  as one command (the API key is returned once), the env-var expansion pitfall
+  sits beside the request it applies to rather than after the script that trips
+  on it, the heredoc wrapper is shown rather than described, and the server URL is
+  probed before anything depends on it. It also writes `permissions.allow` for the
+  connector's tools, which Switch Console always did and a skill-configured
+  install went without — so every room action stopped for an approval prompt.
+- The per-project vs global scope choice is gone. Global wrote the identity
+  machine-wide, but credentials are only ever read from the session's working
+  directory, so it behaved as per-project with extra steps.
+- The skill no longer asks for or sends `notify_user`, which left the platform
+  when owner-linked addressing arrived. It had survived here as a step collecting
+  a value the server no longer reads.
+- Both room-workflow skills list the full set of reasons `switch_unavailable`
+  can be the only tool, and both now point at the `configure` skill as the remedy
+  for the ones it can fix.
+
+### [0.9.5] - 2026-08-18
+
+#### Changed
+
+- The room-workflow skill no longer teaches the task protocol as an interaction
+  mode: the lifecycle section is replaced by a short note that the protocol
+  exists, is registered on the server, and must not be called yet, and the
+  guidance to delegate rather than message is removed. The scoped-addressing
+  material moves to its own section. Documentation only — the MCP/HTTP tool
+  surface is unchanged (CHOO-1418).
+
+### [0.9.4] - 2026-08-15
+
+#### Changed
+
+- The room-workflow skill describes owner-only addressing — the new default for
+  agents created in Switch Console — and states that `send_targeted_message`
+  now fails outright for a disallowed sender, and that in-room commands are
+  covered by the policy too (CHOO-2137).
+
+### [0.9.3] - 2026-08-14
+
+#### Changed
+- The room-workflow skill covers Telegram: attachments cross the bridge as real
+  uploads, chats cannot be created by a bot at all (so `create_room` fails there
+  for every channel type), forum topics thread natively, and formatting has no
+  tables and a 4096-character cap (CHOO-1686). It also warns that a Telegram
+  room may be mention-only, where unaddressed talk never reaches Switch at all
+  and `read_context` cannot recover it — the one place the skill's "pull the
+  rest with `read_context`" promise does not hold. The slash-command and
+  attachment platform lists now also name Discord, which had been left out of
+  both.
+- The room workflow adds a Mattermost-only rule: post at the root there unless
+  you were asked in a thread. Mattermost shows a threaded reply as a reply count
+  under the original post rather than in the channel, so a first-time reader can
+  take it for no answer. Threading is unchanged everywhere else.
+
+### [0.9.2] - 2026-08-14
+#### Changed
+- The room-workflow skill lists `opencode` alongside `codex` and `claude-code`
+  wherever it enumerates known agent types — the `list_agents` filter and the
+  per-type options of `update_agent_detail` (#203). The plugin version bumps so
+  installs re-download.
+
+### [0.9.1] - 2026-08-12
+
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.1` (was `0.3.0`) — picks up the
+  runtime's conditional-read MCP instructions; the plugin version bumps so
+  installs re-download.
+- Skill: how to write in a room — answer first, plain words, a few sentences, one
+  point per message — and post a one-line heads-up before going quiet for a long
+  task, then return with the result in the same thread (#210).
+- Skill: document the room-document and room-admin tools it had never
+  mentioned — `load_internal_documents` (without which an agent cannot read a
+  document attached to its own room), `list_references`, the
+  `create`/`update`/`delete_room_document` trio, `add_users_to_room`, and
+  `archive_room` / `unarchive_room`.
+- The skill is state-aware: it loads once for a session instead of before every
+  tool call, and no longer makes an agent reconnect and re-read the room to say
+  one thing. The `description` still directs the agent to load the skill — a
+  passive rewording stopped it loading at all in live runs — but says to load it
+  once, and drops the 40-name tool inventory; a new "steady state" section says the connection holds for the
+  session; and the unconditional "always read / always connect" instructions
+  are replaced by triggers that fire on an actual signal.
+- Skill: correct the paging instruction. It told agents to pass
+  `oldest_timestamp` straight back as `before`, but the first is epoch
+  milliseconds and the second is parsed as an ISO-8601 string, so the call
+  raised instead of paging.
+
+#### Fixed
+- The channel's unread tally now resets when the agent reads the room. The
+  `PostToolUse` matcher never included `read_context`, so the reset the hook
+  already implemented was unreachable and the count only ever climbed from the
+  moment a session connected.
+
+### [0.8.1] - 2026-08-11
+
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.0` — the runtime moved to public
+  npmjs under the `@sandboxaq` scope (CHOO-2021), so `npx` no longer needs a
+  GitHub token. The scope change had shipped without a plugin version bump and so
+  never reached installs; this release carries it and bumps the plugin version so
+  installs re-download.
+- Skill: document `read_context`'s new response shape — `truncated` /
+  `oldest_timestamp` and the per-entry `kind` — and tell the agent not to
+  conclude anything from a truncated read.
+
+#### Removed
+- Dropped the `configure` skill's Step 0, which installed the private-repo /
+  `gh` setup machinery, now that the repository is public. The skill itself
+  stays; an earlier version of this entry said it had been removed wholesale,
+  which it had not.
+
+### [0.7.9] - 2026-08-09
+
+#### Changed
+- Bump the pinned `@sandbox-quantum/switch-agent-runtime` to `0.1.6`, so sessions
+  pick up its rationed stream-failure reporting and version declaration
+. The plugin version bumps with the pin so installs
+  re-download it.
+
+### [0.7.8]
+
+Releases before this changelog existed are in the git log and in the plugin
+manifest history.
+
+---
+
+## switch-connector-codex
+
+`connectors/codex-plugin/`. Version lives in `.codex-plugin/plugin.json`.
+
+### [Unreleased]
+
+### [0.3.17] - 2026-09-23
+
+#### Changed
+- Skill updated for the recent room-workflow changes (reading a room you belong
+  to without connecting, templates). Pinned agent-runtime moves to 0.4.3; the
+  plugin version bumps so installs re-download (#628, #527).
+
+### [0.3.15] - 2026-09-06
+#### Changed
+- Skill updated: Matrix references removed to match the Postgres-backed message
+  store (#380). Plugin version bumps so installs re-download.
+
+### [0.3.14] - 2026-09-06
+#### Changed
+- Skills updated for agent display names: the switch and configure skills note
+  that agents may render under a human display name on the bridges (#330).
+  Plugin version bumps so installs re-download.
+
+### [0.3.13] - 2026-09-03
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.4.1` (was `0.3.4`) — a deleted room no
+  longer wedges the whole connection, and the heartbeat backs off when the
+  connection is rejected. Plugin version bumps so installs re-download.
+- Skills updated: document user-defined external reference types and
+  `list_all_references` for discovering references across the instance.
+
+### [0.3.12] - 2026-09-01
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.4` (was `0.3.3`) — picks up reaping
+  of orphaned agent runtimes at boot.
+
+### [0.3.11] - 2026-08-27
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.3` (was `0.3.2`) — picks up the
+  runtime's host-exit fix (#307), which stops stale runtime processes and
+  loopback listeners piling up. Plugin version bumps so installs re-download.
+
+### [0.3.10] - 2026-08-26
+#### Fixed
+- The `configure` skill's standalone feature list no longer claims the **task
+  protocol** works — it was removed from the connector skills, so an agent
+  reading the old list could try something unavailable. Also corrects a
+  `mcp_servers` → `mcpServers` reference. Plugin version bumped so installs
+  re-download.
+
+### [0.3.9] - 2026-08-24
+#### Changed
+- The `configure` skill's generated connect command now names the agent it was
+  set up for, so a session started in a directory holding several agents answers
+  `select_agent` on its own instead of asking the operator; the plugin README is
+  updated to match. Plugin version bumped so installs re-download (CHOO-2344).
+
+### [0.3.8] - 2026-08-22
+#### Fixed
+- The room-workflow skill said a Telegram DM is adopted the way Mattermost's
+  is, so an agent asked for a 1:1 on Telegram would tell the user to message
+  the bot and wait for a room that never arrives. Telegram has no DM: a private
+  chat with the bot is the lobby, which answers with setup guidance and
+  provisions nothing. The skill now says so, and points at a group of two as
+  the way to get DM-like behaviour (CHOO-2314).
+
+### [0.3.7] - 2026-08-19
+
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.2` (was `0.3.1`) — picks up the
+  runtime's store-based credential resolution (CHOO-1862); the plugin version
+  bumps so installs re-download.
+- The room-workflow skill lists the full set of reasons `switch_unavailable` can
+  be the only tool, and points at the `configure` skill as the remedy for the
+  ones it can fix (CHOO-1862).
+
+### [0.3.6] - 2026-08-18
+
+#### Changed
+
+- The room-workflow skill no longer teaches the task protocol as an interaction
+  mode: the lifecycle section is replaced by a short note that the protocol
+  exists, is registered on the server, and must not be called yet, and the
+  guidance to delegate rather than message is removed. The scoped-addressing
+  material moves to its own section. Documentation only — the MCP/HTTP tool
+  surface is unchanged (CHOO-1418).
+
+#### Fixed
+
+- The `configure` skill no longer overwrites a credentials file that belongs to
+  another Switch setup. Its script writes `.switch/agents/<name>.json` by name
+  alone and truncated whatever was there, which in a directory shared with a
+  Switch Console install (or an earlier run against a different server) destroyed
+  a token that is issued once and stored nowhere else. It now stops before
+  registering if that file names a different Switch server, and reports which.
+
+#### Changed
+- Skill: list the full set of reasons `switch_unavailable` can be the only tool.
+  The runtime is shared, so the identity failures added there apply here too;
+  three of the six were missing.
+- Skill: point at the `configure` skill as the remedy for the causes it can fix,
+  rather than saying the state is unfixable from inside the session — the Codex
+  `configure` skill shipped in 0.3.2, so the remedy now exists on both hosts.
+
+### [0.3.5] - 2026-08-15
+
+#### Changed
+
+- The room-workflow skill describes owner-only addressing — the new default for
+  agents created in Switch Console — and states that `send_targeted_message`
+  now fails outright for a disallowed sender, and that in-room commands are
+  covered by the policy too (CHOO-2137).
+
+### [0.3.4] - 2026-08-14
+
+#### Changed
+- The room-workflow skill covers Telegram: attachments cross the bridge as real
+  uploads, chats cannot be created by a bot at all (so `create_room` fails there
+  for every channel type), forum topics thread natively, and formatting has no
+  tables and a 4096-character cap (CHOO-1686). It also warns that a Telegram
+  room may be mention-only, where unaddressed talk never reaches Switch at all
+  and `read_context` cannot recover it — the one place the skill's "pull the
+  rest with `read_context`" promise does not hold. The slash-command and
+  attachment platform lists now also name Discord, which had been left out of
+  both.
+- The room workflow adds a Mattermost-only rule: post at the root there unless
+  you were asked in a thread. Mattermost shows a threaded reply as a reply count
+  under the original post rather than in the channel, so a first-time reader can
+  take it for no answer. Threading is unchanged everywhere else.
+
+### [0.3.3] - 2026-08-14
+
+#### Changed
+- The room-workflow skill lists `opencode` alongside `codex` and `claude-code`
+  wherever it enumerates known agent types — the `list_agents` filter and the
+  per-type options of `update_agent_detail` (#203). The plugin version bumps so
+  installs re-download.
+
+### [0.3.2] - 2026-08-12
+
+#### Added
+- A `configure` skill: the standalone setup path. Registers this Codex instance
+  as a Switch agent and writes `.switch/agents/<name>.json` in the working
+  directory, so `codex` reaches Switch with no Switch Console involved
+  (CHOO-1936). It writes no MCP config — the plugin's `.mcp.json` stays the
+  single server definition and the runtime resolves its own identity from the
+  store (`switch-agent-runtime` 0.2.0+).
+
+### [0.3.1] - 2026-08-12
+
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.1` (was `0.3.0`) — picks up the
+  runtime's conditional-read MCP instructions; the plugin version bumps so
+  installs re-download.
+- Skill: how to write in a room — answer first, plain words, a few sentences, one
+  point per message — and post a one-line heads-up before going quiet for a long
+  task, then return with the result in the same thread (#210).
+- Skill: document the room-document and room-admin tools it had never
+  mentioned — `load_internal_documents` (without which an agent cannot read a
+  document attached to its own room), `list_references`, the
+  `create`/`update`/`delete_room_document` trio, `add_users_to_room`, and
+  `archive_room` / `unarchive_room`.
+- The skill is state-aware: it loads once for a session instead of before every
+  tool call, and no longer makes an agent reconnect and re-read the room to say
+  one thing. The `description` is a trigger rather than a 40-name tool
+  inventory — which also keeps it clear of Codex's skill-description budget,
+  which silently truncates an overlong one; a new "steady state" section says
+  the connection holds for the session; and the unconditional "always read /
+  always connect" instructions are replaced by triggers that fire on an actual
+  signal.
+- Skill: an unread count is documented as proof you are behind, but its absence
+  is no longer documented as proof you are current — Switch Console resets the
+  tally on every line it delivers, not when the session reads.
+- Skill: correct the paging instruction. It told agents to pass
+  `oldest_timestamp` straight back as `before`, but the first is epoch
+  milliseconds and the second is parsed as an ISO-8601 string, so the call
+  raised instead of paging.
+
+### [0.2.3] - 2026-08-11
+
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.0` — the runtime moved to public
+  npmjs under the `@sandboxaq` scope (CHOO-2021); the scope change had shipped
+  without a plugin version bump and never reached installs, so this release
+  carries it and bumps the plugin version to force re-download.
+- Drop `SWITCHDASH_GITHUB_TOKEN` and `npm_config_userconfig` from the forwarded
+  `env_vars` in `.mcp.json` — `npx` no longer needs a GitHub token now that the
+  runtime is on public npmjs (CHOO-2023).
+- Skill updated for `read_context`'s new response shape — `truncated` /
+  `oldest_timestamp` and the per-entry `kind`.
+
+### [0.2.1] - 2026-08-09
+
+#### Changed
+- Bump the pinned `@sandbox-quantum/switch-agent-runtime` to `0.1.6`. The plugin version bumps with the pin so installs re-download it.
+
+### [0.2.0]
+
+Releases before this changelog existed are in the git log and in the plugin
+manifest history.
+
+---
+
+## switch-connector-opencode
+
+`connectors/opencode-plugin/`. Version lives in `package.json`.
+
+Unlike the other two connectors, nothing installs this one from a marketplace —
+OpenCode has none. Switch Console writes its files directly, so the version is
+for humans reading a diff rather than for an installer, and an install reports
+the app version that wrote it rather than a version of its own.
+
+### [Unreleased]
+
+### [0.1.12] - 2026-09-23
+
+#### Changed
+- Skill updated for the recent room-workflow changes (reading a room you belong
+  to without connecting, templates). The embedded agent-runtime pin moves to
+  0.4.3; the version bumps so Switch Console re-writes the connector (#628, #527).
+
+### [0.1.10] - 2026-09-06
+#### Changed
+- Skill updated: Matrix references removed to match the Postgres-backed message
+  store (#380). (Delivered at the next Switch Console update, which rewrites the
+  embedded connector.)
+
+### [0.1.9] - 2026-09-06
+#### Changed
+- Skill updated for agent display names: the switch skill notes that agents may
+  render under a human display name on the bridges (#330). (Delivered at the
+  next Switch Console update, which rewrites the embedded connector.)
+
+### [0.1.8] - 2026-09-03
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.4.1` (was `0.3.4`) — a deleted room no
+  longer wedges the whole connection, and the heartbeat backs off when the
+  connection is rejected. (Delivered at the next Switch Console update, which
+  rewrites the embedded connector.)
+- Skill updated: documents user-defined external reference types and
+  `list_all_references` for discovering references across the instance.
+
+### [0.1.7] - 2026-09-01
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.4` (was `0.3.3`) — picks up reaping
+  of orphaned agent runtimes at boot.
+
+### [0.1.6] - 2026-08-27
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.3` (was `0.3.2`) — picks up the
+  runtime's host-exit fix (#307). Reaches users with the next Switch Console
+  release, which writes this connector.
+
+### [0.1.5] - 2026-08-22
+#### Fixed
+- The room-workflow skill said a Telegram DM is adopted the way Mattermost's
+  is, so an agent asked for a 1:1 on Telegram would tell the user to message
+  the bot and wait for a room that never arrives. Telegram has no DM: a private
+  chat with the bot is the lobby, which answers with setup guidance and
+  provisions nothing. The skill now says so, and points at a group of two as
+  the way to get DM-like behaviour (CHOO-2314).
+
+### [0.1.4] - 2026-08-19
+
+#### Changed
+- Pin `@sandboxaq/switch-agent-runtime@0.3.2` (was `0.3.1`) — picks up the
+  runtime's store-based credential resolution (CHOO-1862). The pin lives in
+  `distribution.ts` and `opencode.json`; the version bumps so a re-written
+  install is stamped fresh.
+
+### [0.1.3] - 2026-08-18
+
+#### Changed
+
+- The room-workflow skill no longer teaches the task protocol as an interaction
+  mode: the lifecycle section is replaced by a short note that the protocol
+  exists, is registered on the server, and must not be called yet, and the
+  guidance to delegate rather than message is removed. The scoped-addressing
+  material moves to its own section. Documentation only — the MCP/HTTP tool
+  surface is unchanged (CHOO-1418).
+
+### [0.1.2] - 2026-08-15
+
+#### Changed
+
+- The room-workflow skill describes owner-only addressing — the new default for
+  agents created in Switch Console — and states that `send_targeted_message`
+  now fails outright for a disallowed sender, and that in-room commands are
+  covered by the policy too (CHOO-2137).
+
+### [0.1.1] - 2026-08-14
+
+#### Changed
+- The room-workflow skill covers Telegram: attachments cross the bridge as real
+  uploads, chats cannot be created by a bot at all (so `create_room` fails there
+  for every channel type), forum topics thread natively, and formatting has no
+  tables and a 4096-character cap (CHOO-1686). It also warns that a Telegram
+  room may be mention-only, where unaddressed talk never reaches Switch at all
+  and `read_context` cannot recover it. The slash-command and attachment
+  platform lists now also name Discord.
+- The room workflow adds a Mattermost-only rule: post at the root there unless
+  you were asked in a thread. Mattermost shows a threaded reply as a reply count
+  under the original post rather than in the channel, so a first-time reader can
+  take it for no answer. Threading is unchanged everywhere else.
+
+### [0.1.0] - 2026-08-14
+
+First release. Ships the Switch room-workflow skill, registers the Switch MCP
+server in OpenCode's global config as a local server — so the runtime takes its
+credentials from the session environment and none is written to disk — and
+carries a reporting plugin that gives OpenCode sessions real working and
+completed states, naming the tool a turn is currently running.

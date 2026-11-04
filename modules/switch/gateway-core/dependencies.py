@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Callable
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from switch_core.bridges.agent.protocol.agent_core import AgentCore
+from switch_core.bridges.agent.protocol.event_buffer import EventBuffer
+from switch_core.bridges.collaboration.install_service import (
+    MessagingInstallService,
+)
+from switch_core.bridges.collaboration.lifecycle_service import (
+    CollaborationBridgeLifecycleService,
+)
+from switch_core.bridges.resource.service import ResourceService
+from switch_core.clients.client_lifecycle_service import ClientLifecycleService
+from switch_core.config import SwitchConfig
+from switch_core.db.stores.agent_store import AgentStore
+from switch_core.db.stores.api_key_store import ApiKeyStore
+from switch_core.db.stores.budget_store import BudgetStore
+from switch_core.db.stores.collaboration_bridge_store import CollaborationBridgeStore
+from switch_core.db.stores.external_user_store import ExternalUserStore
+from switch_core.db.stores.invitation_store import InvitationStore
+from switch_core.db.stores.join_domain_store import JoinDomainStore
+from switch_core.db.stores.messaging_install_store import MessagingInstallStore
+from switch_core.db.stores.organization_store import OrganizationStore
+from switch_core.db.stores.room_group_store import RoomGroupStore
+from switch_core.db.stores.room_store import RoomStore
+from switch_core.db.stores.template_store import TemplateStore
+from switch_core.db.stores.usage_store import UsageStore
+from switch_core.db.stores.user_store import UserStore
+from switch_core.gateway.invite_mail import InviteMailer
+from switch_core.room_service import RoomService
+from switch_core.rooms_yaml import RoomYamlService
+from switch_core.telemetry import TelemetryService
+from switch_core.user_changes import LocalUserChanges
+
+_state: dict[str, Any] = {}
+
+
+def init_dependencies(
+    *,
+    agent_store: AgentStore,
+    room_store: RoomStore,
+    room_group_store: RoomGroupStore,
+    room_service: RoomService,
+    bridge_store: CollaborationBridgeStore,
+    client_lifecycle: ClientLifecycleService,
+    collab_lifecycle: CollaborationBridgeLifecycleService,
+    event_buffer: EventBuffer,
+    session_factory: Any,
+    user_store: UserStore,
+    external_user_store: ExternalUserStore,
+    api_key_store: ApiKeyStore,
+    invitation_store: InvitationStore,
+    join_domain_store: JoinDomainStore,
+    organization_store: OrganizationStore,
+    template_store: TemplateStore,
+    usage_store: UsageStore,
+    budget_store: BudgetStore,
+    resource_service: ResourceService,
+    protocol: AgentCore,
+    install_service: MessagingInstallService | None,
+    invite_mailer: InviteMailer | None,
+    user_changes: LocalUserChanges,
+    config: SwitchConfig,
+    trust_settings_changed: Callable[[], None] | None = None,
+) -> None:
+    _state["agent_store"] = agent_store
+    _state["room_store"] = room_store
+    _state["room_group_store"] = room_group_store
+    _state["room_service"] = room_service
+    _state["bridge_store"] = bridge_store
+    _state["client_lifecycle"] = client_lifecycle
+    _state["collab_lifecycle"] = collab_lifecycle
+    _state["event_buffer"] = event_buffer
+    _state["session_factory"] = session_factory
+    _state["user_store"] = user_store
+    _state["external_user_store"] = external_user_store
+    _state["api_key_store"] = api_key_store
+    _state["invitation_store"] = invitation_store
+    _state["join_domain_store"] = join_domain_store
+    _state["organization_store"] = organization_store
+    _state["template_store"] = template_store
+    _state["usage_store"] = usage_store
+    _state["budget_store"] = budget_store
+    _state["resource_service"] = resource_service
+    _state["protocol"] = protocol
+    _state["install_service"] = install_service
+    _state["invite_mailer"] = invite_mailer
+    _state["user_changes"] = user_changes
+    _state["config"] = config
+    _state["trust_settings_changed"] = trust_settings_changed
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """The tenant-scoped session for an authenticated endpoint handler.
+
+    Opening it does no I/O: the transaction — and with it the `after_begin`
+    hook that stamps `app.tenant_id` (`db/tenant_session.py`) — only begins on
+    the first query someone issues on it. `get_current_user` takes *this*
+    session (not one of its own) and binds the caller's tenant before its
+    first query on it, so the transaction is stamped from the moment it opens,
+    and the `User` an endpoint receives belongs to the session that endpoint
+    commits.
+
+    Resolution order is load-bearing, so do not read the paragraph above as
+    "order doesn't matter". FastAPI resolves an endpoint's dependencies in
+    declaration order, and a sibling dependency declared *before*
+    `get_current_user` that queries this session during its own resolution
+    would open the transaction with no tenant bound and keep it that way for
+    the rest of the request. None does today — every other dependency is a
+    plain accessor — and
+    `tests/switch_core/gateway/test_session_requires_authentication.py` keeps
+    the weaker, checkable half of that true: every route reaching this
+    dependency also reaches `get_current_user`.
+
+    A request with no authenticated caller must not use this — see
+    `get_system_session`.
+    """
+    async with _state["session_factory"]() as session:
+        yield session
+
+
+async def get_system_session() -> AsyncIterator[AsyncSession]:
+    """The session for a request with no tenant bound yet.
+
+    Password login and the OIDC callback are the original two: both run
+    before anyone is signed in, so neither can bind a tenant from a principal
+    the way `get_current_user` does. `POST /tenants/{id}/switch`
+    (`gateway/tenants.py`) is a third, for a different reason — the caller is
+    authenticated (`get_authenticated_user_id`) but has, by construction, not
+    yet selected the tenant this session opens for. `POST /tenants` is a
+    fourth: it locks the caller's `users` row, which carries no tenant, for
+    the length of a creation that has no tenant yet. Named separately from
+    `get_session` so that reads as a deliberate, reviewable exception rather
+    than an accidentally-unscoped session, and so the guard test above can
+    hold for `get_session` without exemptions. Nothing about opening it
+    differs from `get_session` today — it is the same session and the same
+    hook, simply with nothing bound around it — so the two must stay
+    interchangeable in behaviour only, never in name.
+
+    "No tenant bound" is not the same as "writes land nowhere in particular":
+    the OIDC callback provisions a user and picks its tenant explicitly (see
+    `oidc_routes.py`).
+    """
+    async with _state["session_factory"]() as session:
+        yield session
+
+
+def get_session_factory() -> Any:
+    return _state["session_factory"]
+
+
+def get_room_yaml_service() -> RoomYamlService:
+    protocol: AgentCore = _state["protocol"]
+    return protocol.room_yaml_service()
+
+
+def get_agent_store() -> AgentStore:
+    return _state["agent_store"]  # type: ignore[no-any-return]
+
+
+def get_room_store() -> RoomStore:
+    return _state["room_store"]  # type: ignore[no-any-return]
+
+
+def get_room_group_store() -> RoomGroupStore:
+    return _state["room_group_store"]  # type: ignore[no-any-return]
+
+
+def get_room_service() -> RoomService:
+    return _state["room_service"]  # type: ignore[no-any-return]
+
+
+def get_bridge_store() -> CollaborationBridgeStore:
+    return _state["bridge_store"]  # type: ignore[no-any-return]
+
+
+def get_client_lifecycle() -> ClientLifecycleService:
+    return _state["client_lifecycle"]  # type: ignore[no-any-return]
+
+
+def get_collab_lifecycle() -> CollaborationBridgeLifecycleService:
+    return _state["collab_lifecycle"]  # type: ignore[no-any-return]
+
+
+def get_event_buffer() -> EventBuffer:
+    return _state["event_buffer"]  # type: ignore[no-any-return]
+
+
+def get_user_store() -> UserStore:
+    return _state["user_store"]  # type: ignore[no-any-return]
+
+
+def get_external_user_store() -> ExternalUserStore:
+    return _state["external_user_store"]  # type: ignore[no-any-return]
+
+
+def get_api_key_store() -> ApiKeyStore:
+    return _state["api_key_store"]  # type: ignore[no-any-return]
+
+
+def get_invitation_store() -> InvitationStore:
+    return _state["invitation_store"]  # type: ignore[no-any-return]
+
+
+def get_join_domain_store() -> JoinDomainStore:
+    return _state["join_domain_store"]  # type: ignore[no-any-return]
+
+
+def get_organization_store() -> OrganizationStore:
+    return _state["organization_store"]  # type: ignore[no-any-return]
+
+
+def get_usage_store() -> UsageStore:
+    return _state["usage_store"]  # type: ignore[no-any-return]
+
+
+def get_budget_store() -> BudgetStore:
+    return _state["budget_store"]  # type: ignore[no-any-return]
+
+
+def get_template_store() -> TemplateStore:
+    return _state["template_store"]  # type: ignore[no-any-return]
+
+
+def get_user_changes() -> LocalUserChanges:
+    return _state["user_changes"]  # type: ignore[no-any-return]
+
+
+def get_config() -> SwitchConfig:
+    return _state["config"]  # type: ignore[no-any-return]
+
+
+def trust_settings_changed() -> None:
+    """Tell every process the Switch Trust settings changed, once the change
+    has committed (`trust/signals.py`). Nothing is wired to hear it in a route
+    test."""
+    changed = _state.get("trust_settings_changed")
+    if changed is not None:
+        changed()
+
+
+def get_protocol() -> AgentCore:
+    return _state["protocol"]  # type: ignore[no-any-return]
+
+
+def current_telemetry() -> TelemetryService | None:
+    """The telemetry service, or None where there is nothing wired.
+
+    Reporting from a gateway route needs the service the app was built with,
+    and `get_protocol()` raises when nothing has been initialised — which is
+    the ordinary state in a route test. An analytics call must never be the
+    reason a request fails, and it must never be the reason a test needs a
+    protocol service it otherwise has no use for.
+    """
+    protocol = _state.get("protocol")
+    return getattr(protocol, "telemetry", None) if protocol is not None else None
+
+
+def get_install_store() -> MessagingInstallStore:
+    """Built here rather than threaded through `init_dependencies`.
+
+    It is stateless — no connection, no configuration, nothing for a shared
+    instance to own — and `get_room_yaml_service` above already constructs
+    rather than reads.
+
+    Deliberately not reached through `get_install_service`, which is `None` on
+    a deployment that registered no app of its own. Install rows outlive those
+    credentials: a bridge built by an install has to stay protected after the
+    credentials are taken away, which is exactly when the service is gone.
+    """
+    return MessagingInstallStore()
+
+
+def get_invite_mailer() -> InviteMailer | None:
+    """None when no SMTP relay is configured: an addressed invitation is
+    still minted, and the response says nothing was sent."""
+    return _state["invite_mailer"]  # type: ignore[no-any-return]
+
+
+def get_install_service() -> MessagingInstallService | None:
+    """None when this deployment registered no messaging app of its own.
+
+    Nullable rather than absent because that is the ordinary case, and the
+    endpoints have to answer it with a refusal that says so rather than with a
+    KeyError.
+    """
+    return _state["install_service"]  # type: ignore[no-any-return]
+
+
+def get_resource_service() -> ResourceService:
+    return _state["resource_service"]  # type: ignore[no-any-return]
