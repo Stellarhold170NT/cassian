@@ -1,0 +1,323 @@
+%% diagrams.mmd — Mermaid fallback (L1/L2/L3) for the C4 model of sandbox-quantum/switch
+%% Subject: switch | pin: 39a722c5eeecf8479422351fc7ac2a61fe559a66 (branch main)
+%% Source of truth for the model: docs/switch/03-c4/workspace.dsl (Structurizr DSL).
+%% NOTE: not validated with structurizr-cli (no java runtime available at
+%% measurement time). Diagrams separated by --- per Mermaid multi-diagram docs.
+%% Every element and edge is followed by a %% evidence: line with a grep-verified file:line
+%% (or file path) in the pinned clone. Elements without evidence are not modeled.
+
+flowchart LR
+
+    developer(["Person: Developer (agent owner)"])
+    %% evidence: README.md:38, :30; console/apps/switch-console-desktop/package.json:4
+    operator(["Person: Platform operator (admin)"])
+    %% evidence: artifacts.yaml:109; gateway/src/pages/operator/OperatorWorkspacesPage.tsx
+    switchSystem["Software System: Agent Switch (AI agent orchestration and governance platform)"]
+    %% evidence: core/pyproject.toml:4; README.md:9
+    codingAgents["External System: Coding agents (Claude Code, Codex, Cursor, OpenCode, ACP, Antigravity)"]
+    %% evidence: README.md:31; console/packages/agent-providers/src (claude/codex/cursor/opencode/acp/antigravity); artifacts.yaml:152-155
+    collabPlatforms["External System: Collaboration platforms (Slack, Teams, Discord, Telegram, Mattermost)"]
+    %% evidence: README.md:9, :30; pyproject.toml:31-32, :42-43; bridges/collaboration/adapter.py:433
+    vendorApis["External System: Vendor service APIs (GitHub, OAuth providers, Google Workspace, Jira)"]
+    %% evidence: README.md:32; connections/adapters (github.py, oauth.py, api_key.py); broker.py:1955
+    agentHosts["External System: Agent hosts (Switch cloud machines)"]
+    %% evidence: artifacts.yaml:131; deploy/hosted/machine/switch_machine_boot.py:2, :8; values.yaml:437
+
+    developer -->|Desktop app: install Switch Console, work with AI teammates| switchSystem
+    %% evidence: README.md:30, :38
+    operator -->|HTTPS UI: admin workspaces/machines/usage| switchSystem
+    %% evidence: artifacts.yaml:109; gateway/src/pages/operator/OperatorWorkspacesPage.tsx
+    switchSystem -->|agent-protocol: SSE events, heartbeat, resume cursor, tool calls| codingAgents
+    %% evidence: artifacts.yaml:152-155; console/packages/switch-agent-runtime/src/index.ts:1-8
+    collabPlatforms -->|platform webhooks/APIs: events in, agent replies out| switchSystem
+    %% evidence: README.md:30; bridges/collaboration/adapter.py:433; main.py:74
+    switchSystem -->|OAuth/HTTPS: issue, refresh, revoke vendor tokens| vendorApis
+    %% evidence: connections/adapters (github.py, oauth.py, api_key.py); broker.py:1955
+    switchSystem -->|provisioning: cloud machines, per-seat controller enrollment| agentHosts
+    %% evidence: artifacts.yaml:131; switch_machine_boot.py:2, :8
+
+    classDef person fill:#08427b,stroke:#052e56,color:#fff;
+    classDef system fill:#1168bd,stroke:#0b4884,color:#fff;
+    classDef external fill:#999999,stroke:#8a8a8a,color:#fff;
+    class developer,operator person;
+    class switchSystem system;
+    class codingAgents,collabPlatforms,vendorApis,agentHosts external;
+
+---
+
+flowchart TB
+
+    developer(["Person: Developer (agent owner)"])
+    operator(["Person: Platform operator (admin)"])
+    codingAgents["External System: Coding agents"]
+    collabPlatforms["External System: Collaboration platforms"]
+    vendorApis["External System: Vendor service APIs"]
+    agentHosts["External System: Agent hosts (Switch cloud machines)"]
+
+    subgraph switchSystem["Software System: Agent Switch"]
+        coreFlat["Container: core service kernel (core/switch_core top-level, Python) - main.py composition root + 46 cross-cutting flat modules | 47 files / 17,522 loc"]
+        %% evidence: main.py:2376, :561, :318/:355/:369; config.py:145; census, pin clone
+        bridges["Container: bridges (core/switch_core/bridges, Python) - collaboration + agent-protocol adapters | 112 files / 69,668 loc"]
+        %% evidence: agent_core.py:332; collaboration/adapter.py:433; census, pin clone
+        db["Container: database layer (core/switch_core/db, SQLAlchemy 2.0 on PostgreSQL) - tenant-scoped ORM, RLS, stores"]
+        %% evidence: db/models.py:4825 (attach_row_level_security), 97 classes; engine.py:208
+        gatewayCore["Container: gateway API (core/switch_core/gateway, FastAPI) - Switch Gateway API, 34 routers | 47 files / 21,147 loc"]
+        %% evidence: gateway/app.py:96 (create_gateway_app), 34 include_router; census, pin clone
+        migrations["Container: schema migrations (core/switch_core/migrations, Alembic) - 201 revisions, owner/runtime DDL split"]
+        %% evidence: migrations/env.py:12-15; main.py:2295, :2338
+        management["Container: agent management (core/switch_core/management, Python) - managed-agent control plane, flag-gated"]
+        %% evidence: management/wiring.py:3, :237-238
+        connections["Container: service connections (core/switch_core/connections, Python) - credential broker + catalog + vendor adapters"]
+        %% evidence: broker.py:1955; loader.py:6; adapters (github.py, oauth.py, api_key.py)
+        delivery["Container: delivery (core/switch_core/delivery, Python) - per-row agent addressing, store-in-transaction"]
+        %% evidence: delivery/router.py:1-8
+        coreMisc["Container: core domain subpackages (13 small subpackages, Python) - clients, chats, transport (the write is the send), telemetry, providers..."]
+        %% evidence: transport/postgres.py:1-6; observability/catalogue.py
+        consoleRenderer["Container: console renderer (src/renderer, TS/React Electron renderer) - view registry, feature views, RPC client"]
+        %% evidence: renderer/main.tsx:2, :27; preload/index.ts:4
+        consoleMain["Container: console main process (src/main, TS Electron main) - window, service layer, gateway client, SQLite"]
+        %% evidence: main/index.ts:126, :135, :161, :178, :186; package.json:18
+        consoleShared["Container: console shared + preload + tooling (TS) - @shared logic, electronAPI bridge, tooling-e2e"]
+        %% evidence: preload/index.ts:4; tooling-e2e/src/clients/switch-client.ts:1-6
+        consolePackages["Container: console packages (console/packages, TS pnpm workspace) - agent-runtime, agent-providers, agent-controller, core, plugins, shared"]
+        %% evidence: switch-agent-runtime/src/index.ts:1-12; agent-providers/src dirs; agent-controller/package.json:27-34
+        gatewayWeb["Container: operator dashboard (gateway, TS/React 19 + MUI 7) - /gateway JSON over cookie fetch"]
+        %% evidence: gateway/src/data/api.ts:1, :5; gateway/package.json:2-3
+        deploy["Container: deployment layer (deploy, Docker/Helm/Terraform/Python) - compose, Helm, hosted controller, machine boot"]
+        %% evidence: justfile:51, :240; Dockerfile.switch:36, :11, :50; Dockerfile.gateway:6; switch_machine_boot.py:2
+        docs["Container: documentation (Markdown) - README/CHANGELOG, docs/official + docs/old, console guides (no code boundary)"]
+        %% evidence: README.md:217, :226; docs/README.md:9, :14
+        expertTemplates["Container: expert templates + repo scripts (YAML/Python/Markdown) - switch-expert, examples, maintainer scripts"]
+        %% evidence: switch-expert/template.yaml; scripts/gen_artifacts.py; justfile:124, :131
+    end
+
+    developer -->|Electron UI| consoleRenderer
+    %% evidence: README.md:38; renderer/main.tsx:2, :27
+    operator -->|HTTPS UI| gatewayWeb
+    %% evidence: artifacts.yaml:109; gateway/src/pages/operator/OperatorWorkspacesPage.tsx
+
+    gatewayWeb -->|HTTP/JSON /gateway, cookie auth (gateway-api contract)| gatewayCore
+    %% evidence: gateway/src/data/api.ts:1, :5; artifacts.yaml:237-245
+    consoleMain -->|HTTP/JSON gateway client (gateway-api contract)| gatewayCore
+    %% evidence: main/core/switch-servers/gateway-client.ts (4,589 lines); artifacts.yaml:237-245
+    consolePackages -->|agent-protocol SSE client| bridges
+    %% evidence: switch-agent-runtime/src/index.ts:1-12; artifacts.yaml:152-155
+    consolePackages -->|SDK/CLI drivers: claude-agent-sdk, MCP SDK, opencode-ai/sdk| codingAgents
+    %% evidence: agent-providers/package.json:38-41; agent-providers/src dirs
+    bridges -->|platform APIs: events in, replies out| collabPlatforms
+    %% evidence: collaboration/adapter.py:433; main.py:56-80
+    connections -->|OAuth/HTTPS token lifecycle| vendorApis
+    %% evidence: adapters (github.py, oauth.py, api_key.py); broker.py:1955
+    deploy -->|provision + enroll per-seat controllers| agentHosts
+    %% evidence: switch_machine_boot.py:2, :8; values.yaml:437
+    consolePackages -->|controller routes: enrollment + operations (agent-protocol)| management
+    %% evidence: switch_machine_boot.py:8; wiring.py:237-238; agent/protocol/agent_management.py:24, :37
+    deploy -->|docker build COPY core/switch_core/| coreFlat
+    %% evidence: deploy/shared_resources/images/Dockerfile.switch:36
+    deploy -->|docker build COPY gateway/ + COPY --from=gateway-ui| gatewayWeb
+    %% evidence: Dockerfile.switch:11, :50; Dockerfile.gateway:6
+    expertTemplates -->|raw imports: AGENT.md, template.yaml| consoleRenderer
+    %% evidence: renderer/features/templates/bundled-templates.ts:2-4
+    expertTemplates -->|e2e surface scripts| gatewayCore
+    %% evidence: scripts/e2e_surface.py (grep switch_core.gateway)
+
+    coreFlat -->|main.py:31-80 wires bridge app + adapters| bridges
+    %% evidence: main.py:31-80
+    coreFlat -->|persistence| db
+    %% evidence: main.py, agent_runs.py, budgets.py (grep switch_core.db); 67 import lines
+    coreFlat -->|main.py:183-186 import, :1240 mount| gatewayCore
+    %% evidence: main.py:183-186, :1240
+    coreFlat -->|main.py:188, :1055, :1324-1325 (flag-gated)| management
+    %% evidence: main.py:188, :1055, :1324-1325; wiring.py:237-238
+    coreFlat -->|main.py:179-181 wires router + recipients| delivery
+    %% evidence: main.py:179-181
+    coreFlat -->|main.py:96-98 client actors| coreMisc
+    %% evidence: main.py:96-98
+
+    bridges -->|commands.py:51 user store| db
+    %% evidence: bridges/agent/commands.py:51
+    bridges -->|commands.py:53, :55 events/platform_access| coreFlat
+    %% evidence: bridges/agent/commands.py:53, :55
+    bridges -->|commands.py:56 transport| coreMisc
+    %% evidence: bridges/agent/commands.py:56
+
+    db -->|encrypted_json.py:33 keyring; hosted_machine_store.py:18 tenant_context| coreFlat
+    %% evidence: db/encrypted_json.py:33; db/stores/hosted_machine_store.py:18
+
+    gatewayCore -->|rooms.py:23-24 models/stores| db
+    %% evidence: gateway/rooms.py:23-24
+    gatewayCore -->|workspace_access.py:18 AgentCore; known_agents.py:8| bridges
+    %% evidence: gateway/workspace_access.py:18; gateway/known_agents.py:8
+    gatewayCore -->|organization_services.py:43-44 broker/catalog| connections
+    %% evidence: gateway/organization_services.py:43-44
+    gatewayCore -->|messaging_installs.py:32 authz; ecosystem.py:8 config| coreFlat
+    %% evidence: gateway/messaging_installs.py:32; gateway/ecosystem.py:8
+    gatewayCore -->|rooms.py:77 telemetry; organizations.py:30 clients| coreMisc
+    %% evidence: gateway/rooms.py:77; gateway/organizations.py:30
+
+    management -->|service.py:52, :61 models| db
+    %% evidence: management/service.py:52, :61
+    management -->|wiring.py:31 enable_agent_management| bridges
+    %% evidence: management/wiring.py:31
+    management -->|gateway_routes.py:21-22 auth/dependencies| gatewayCore
+    %% evidence: management/gateway_routes.py:21-22
+
+    connections -->|broker.py:73-74, :83-84 audit/models/session| db
+    %% evidence: connections/broker.py:73-74, :83-84
+    connections -->|broker.py:90 Keyring| coreFlat
+    %% evidence: connections/broker.py:90
+    connections -->|app_credentials.py:62-63 providers.github| coreMisc
+    %% evidence: connections/app_credentials.py:62-63
+
+    delivery -->|router.py:80-84 notify ddl/models| db
+    %% evidence: delivery/router.py:80-84
+    delivery -->|recipient.py:34, :40 agent commands/message events| bridges
+    %% evidence: delivery/recipient.py:34, :40
+    delivery -->|recipient.py:54, :60 clients actors| coreMisc
+    %% evidence: delivery/recipient.py:54, :60
+    delivery -->|recipient.py:32, :53 attachments/budgets| coreFlat
+    %% evidence: delivery/recipient.py:32, :53; router.py:73
+
+    migrations -->|env.py:12-14 Base/engine/schema_version| db
+    %% evidence: migrations/env.py:12-14
+    migrations -->|env.py:15 logging_config| coreFlat
+    %% evidence: migrations/env.py:15
+
+    coreMisc -->|transport/postgres.py:108-109 stores| db
+    %% evidence: transport/postgres.py:108-109
+    coreMisc -->|transport/postgres.py:110 MessageRouter| delivery
+    %% evidence: transport/postgres.py:110
+    coreMisc -->|command_consumer.py:7; mention_warnings.py:18| bridges
+    %% evidence: clients/command_consumer.py:7; clients/mention_warnings.py:18
+    coreMisc -->|transport/postgres.py:59, :77 logging/tenant context| coreFlat
+    %% evidence: transport/postgres.py:59, :77
+
+    consoleRenderer -->|@shared imports| consoleShared
+    %% evidence: renderer/lib/errors/describe-failure.ts:1-2
+    consoleRenderer -->|type-only @main imports (runtime via IPC/RPC)| consoleMain
+    %% evidence: renderer/lib/ipc.ts:1 (import type); AddAgentsToRoomModal.tsx:4
+    consoleRenderer -->|@switch-console/shared, core| consolePackages
+    %% evidence: renderer/lib/stores/live/optimistic-model.ts:1; model-mirror.ts:1
+    consoleMain -->|@shared imports| consoleShared
+    %% evidence: main/lib/log-context.ts:3; main/lib/events.ts:3
+    consoleMain -->|@switch-console/shared, agent-providers| consolePackages
+    %% evidence: main/lib/lifecycle-map.ts:1; main/core/agent-runtime/types.ts:1
+    consoleShared -->|type-only @switch-console imports| consolePackages
+    %% evidence: shared/core/managed-agents/managed-agents.ts:1-2; shared/core/agents/onboarding.ts:1
+
+    consolePackages -->|agent-controller -> agent-providers (workspace:*)| consolePackages
+    %% evidence: agent-controller/package.json:28; agent-controller/src/main.ts:13
+    consolePackages -->|agent-controller -> plugins (workspace:*)| consolePackages
+    %% evidence: agent-controller/package.json:29
+    consolePackages -->|agent-controller -> agent-runtime (devDep)| consolePackages
+    %% evidence: agent-controller/package.json:34
+    consolePackages -->|agent-providers -> agent-runtime| consolePackages
+    %% evidence: agent-providers/package.json:41
+    consolePackages -->|agent-providers -> shared| consolePackages
+    %% evidence: agent-providers/package.json:42; adapter.ts:1
+    consolePackages -->|core -> shared| consolePackages
+    %% evidence: packages/core/src/lib/live-model.ts:1
+    consolePackages -->|plugins -> core| consolePackages
+    %% evidence: packages/plugins/src/agents/session-launch.ts:8; plugin-registry.ts:5
+
+    classDef person fill:#08427b,stroke:#052e56,color:#fff;
+    classDef external fill:#999999,stroke:#8a8a8a,color:#fff;
+    classDef container fill:#1168bd,stroke:#0b4884,color:#fff;
+    class developer,operator person;
+    class codingAgents,collabPlatforms,vendorApis,agentHosts external;
+    class coreFlat,bridges,db,gatewayCore,migrations,management,connections,delivery,coreMisc,consoleRenderer,consoleMain,consoleShared,consolePackages,gatewayWeb,deploy,docs,expertTemplates container;
+
+---
+
+flowchart TB
+
+    subgraph coreFlatL3["Container: core service kernel (core/switch_core top-level)"]
+        compEntry["Component: Entrypoint & app assembly (main())"]
+        %% evidence: main.py:2376, :1240; pyproject.toml:55
+        compSweeps["Component: Lifespan sweep loops"]
+        %% evidence: main.py:318, :355, :369, :303-310
+        compDbPrep["Component: DB preparation & migration runner"]
+        %% evidence: main.py:561, :2295-2296, :2338
+        compConfig["Component: Configuration (SwitchConfig)"]
+        %% evidence: config.py:145; main.py:561
+        compRooms["Component: Room lifecycle services"]
+        %% evidence: room_service.py:72-83; 1,831 lines census
+        compAuthz["Component: Identity, authz & tenancy"]
+        %% evidence: authz.py:44, :68, :89
+        compTemplates["Component: Agent templating"]
+        %% evidence: agent_templates.py (964); template_v2.py, template_installs.py, template_runs.py, template_lint.py, agent_template_ops.py
+        compAgentDomain["Component: Agent session domain"]
+        %% evidence: agent_runs.py, agent_refusals.py, refusal_breaker.py, addressing.py, budgets.py, attachments.py
+    end
+
+    compEntry -->|lifespan starts sweeps| compSweeps
+    %% evidence: main.py:318, :355, :369
+    compEntry -->|upgrade head then _prepare_database| compDbPrep
+    %% evidence: main.py:2295-2296
+    compEntry -->|SwitchConfig threaded through startup| compConfig
+    %% evidence: main.py:561
+    compAgentDomain -->|db stores| db
+    %% evidence: agent_runs.py (grep switch_core.db)
+    compTemplates -->|db stores| db
+    %% evidence: agent_template_ops.py (grep switch_core.db)
+
+    subgraph gatewayCoreL3["Container: gateway API (core/switch_core/gateway)"]
+        gwAssembly["Component: App assembly (create_gateway_app, 34 routers)"]
+        %% evidence: app.py:96; 34 include_router (grep -c)
+        gwRouters["Component: Domain routers"]
+        %% evidence: app.py:167-243; rooms.py:23-24
+        gwAuth["Component: Auth & OIDC"]
+        %% evidence: auth.py:77, :139; app.py:218-219
+        gwSchemas["Component: Request/response schemas (163 Pydantic classes)"]
+        %% evidence: schemas.py (grep -c '^class ' = 163)
+        gwDeps["Component: Shared dependencies (get_current_user/get_protocol/get_session)"]
+        %% evidence: gateway/dependencies.py (imported by management/gateway_routes.py:22)
+    end
+
+    gwAssembly -->|include_router| gwRouters
+    %% evidence: app.py:222-226, :167-187
+    gwAssembly -->|auth + oidc routers| gwAuth
+    %% evidence: app.py:218-219
+    gwRouters -->|models/stores| db
+    %% evidence: rooms.py:23-24
+    gwRouters -->|AgentCore workspace access| bridges
+    %% evidence: workspace_access.py:18
+    gwRouters -->|telemetry/clients| coreMisc
+    %% evidence: rooms.py:77; organizations.py:30
+
+    subgraph bridgesL3["Container: bridges (core/switch_core/bridges)"]
+        brAgentCore["Component: Agent bridge core (AgentCore)"]
+        %% evidence: agent/protocol/agent_core.py:332; main.py:36
+        brProtocol["Component: Agent protocol surface"]
+        %% evidence: main.py:32-53 protocol imports; bridges/agent/protocol/
+        brCommands["Component: Agent commands & tools"]
+        %% evidence: agent/commands.py:51-56
+        brAdapterFw["Component: Collaboration adapter framework (PlatformAdapter ABC)"]
+        %% evidence: collaboration/adapter.py:433; platforms.py (main.py:74)
+        brPlatformAdapters["Component: Platform adapters (Teams/Slack/Discord/Mattermost/Telegram)"]
+        %% evidence: teams/adapter.py:259-279; main.py:56-62
+        brInstall["Component: Install & lifecycle services"]
+        %% evidence: main.py:70, :61-62, :75, :79, :71
+        brMgmtDoor["Component: Management door (agent side)"]
+        %% evidence: agent/protocol/agent_management.py:24, :37, :60; wiring.py:31
+    end
+
+    brAgentCore -->|protocol connection layer| brProtocol
+    %% evidence: main.py:32-40
+    brCommands -->|user store| db
+    %% evidence: commands.py:51
+    brCommands -->|AddressingResolver| delivery
+    %% evidence: commands.py:52
+    brCommands -->|RoomRef transport| coreMisc
+    %% evidence: commands.py:56
+    brAdapterFw -->|register_platforms| brPlatformAdapters
+    %% evidence: main.py:74 + :56-62
+    brInstall -->|per-platform installers| brPlatformAdapters
+    %% evidence: main.py:61-62, :75, :79
+    brMgmtDoor -->|enable_agent_management / install| management
+    %% evidence: wiring.py:31; main.py:1324-1325
+
+    classDef component fill:#85bbf0,stroke:#5d82a8,color:#000;
+    classDef containerRef fill:#1168bd,stroke:#0b4884,color:#fff;
+    class compEntry,compSweeps,compDbPrep,compConfig,compRooms,compAuthz,compTemplates,compAgentDomain,gwAssembly,gwRouters,gwAuth,gwSchemas,gwDeps,brAgentCore,brProtocol,brCommands,brAdapterFw,brPlatformAdapters,brInstall,brMgmtDoor component;
+    class db,bridges,delivery,coreMisc,management containerRef;
