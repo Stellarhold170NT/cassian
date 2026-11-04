@@ -1,0 +1,121 @@
+%% ============================================================================
+%% Mantis C4 -- compact Mermaid mirrors of reports/mantis/workspace.dsl
+%% Subject : github.com/google/mantis @ PIN 1e15346c2ca2d6e7db57ced59615bb9d1685992f
+%% Status  : the DSL was VALIDATED with structurizr-cli v2025.11.09 (exit 0);
+%%           machine exports of all 5 views (structurizr-*.mmd) were produced
+%%           from the validated model in the sandbox. This file is a
+%%           hand-written compact ASCII mirror of the same model, one graph per
+%%           layer, with repo-relative evidence on the edges.
+%% ============================================================================
+
+%% ---------------------------------------------------------------- L1 context
+graph LR
+  subgraph L1["L1 - System Context"]
+    op["Security Operator (person)"]
+    dev["Developer / Code Reviewer (person)"]
+    ci["CI Pipeline (person)"]
+    mcp["External MCP Agent (person)"]
+    mantis["Mantis (software system)"]
+    tgt["Audited Target Repository (external)"]
+    llm["LLM Providers (external)"]
+    adk["Google ADK / Vertex AI (external)"]
+    sbx["Isolated Sandbox Runtime (external)"]
+  end
+  op -->|"run.sh + scripts/configure.py (reference/README.md:20-26)"| mantis
+  dev -->|"advise.py --file (skills/mantis-advise/SKILL.md:29)"| mantis
+  dev -->|"review_packet-latest.md (skills/mantis-report/SKILL.md:365)"| mantis
+  ci -->|"uses: ./action (.github/workflows/mantis-pr-scan.yml:63)"| mantis
+  mcp -->|"MCP sidecar (reference/docs/mcp.md:1-3)"| mantis
+  mantis -->|"SYNC + PIN snapshot (skills/mantis-meta-agent/SKILL.md:155-256)"| tgt
+  mantis -->|"ADK Runner/App/SqliteSessionService (reference/main.py:31-39)"| adk
+  mantis -->|"ResilientLiteLlm via LiteLLM (reference/core/config.py:266)"| llm
+  mantis -->|"run_sandbox_with_evidence (reference/tools/sandbox_tools.py:436)"| sbx
+
+%% -------------------------------------------------------------- L2 containers
+graph TB
+  subgraph M2["L2 - Mantis containers"]
+    harness["Reference Harness (reference/main.py + run.sh + install.sh)"]
+    cli["Operator & CI CLI (reference/scripts)"]
+    core["Core Engine Library (reference/core)"]
+    tools["Agent Tool Registry (reference/tools, TOOLS x30)"]
+    meta["Meta-Agent Orchestrator Skill (mantis-meta-agent)"]
+    stages["Pipeline Stage Skill Suite (18 skills)"]
+    contract["Pipeline State Contract (schema.json)"]
+    state["Workspace State Store (.mantis_state.json/findings/kb)"]
+    action["Mantis PR Scan GitHub Action (action/)"]
+    evals["Evaluation Harnesses (reference/evals)"]
+  end
+  op2["Security Operator"] -->|"install + launch (reference/README.md:20-26)"| harness
+  dev2["Developer / Code Reviewer"] -->|"advise.py --file (mantis-advise/SKILL.md:29)"| cli
+  dev2 -->|"read packet (mantis-report/SKILL.md:41)"| state
+  ci2["CI Pipeline"] -->|"pull_request (.github/workflows/mantis-pr-scan.yml:63)"| action
+  mcp2["External MCP Agent"] -->|"MCP (reference/docs/mcp.md:1-3)"| cli
+  harness -->|"__main__ -> scripts/launch.py (reference/main.py:3566-3574)"| cli
+  harness -->|"core.* imports (reference/main.py:41-57)"| core
+  harness -->|"workflow.json nodes (reference/workflow.json:25-97)"| stages
+  harness -->|"google.adk (reference/main.py:31-39)"| adk2["Google ADK / Vertex AI"]
+  harness -->|"discover/resolve targets (reference/main.py:527,902)"| tgt2["Audited Target Repository"]
+  meta -->|"delegate Stages 0-15 (mantis-meta-agent/SKILL.md:421-512)"| stages
+  meta -->|"RECORD + archive (:343-345, :514)"| state
+  meta -->|"SYNC + PIN (:155-256)"| tgt2
+  stages -->|"schema defs (schema.json:4; mantis-review/SKILL.md:182-183)"| contract
+  stages -->|"findings/plan/kb (mantis-architecture/SKILL.md:55)"| state
+  stages -->|"audit CODE_ROOT (mantis-review/SKILL.md:135-141)"| tgt2
+  cli -->|"core imports (scripts/launch.py:39-41)"| core
+  cli -->|"mcp_server exposes state (scripts/mcp_server.py:18-19)"| state
+  core -->|"from tools import TOOLS (core/synthesizer.py:58)"| tools
+  tools -->|"lazy core.* (tools/research_tools.py:24-25)"| core
+  core -->|"ResilientLiteLlm (core/config.py:266)"| llm2["LLM Providers"]
+  tools -->|"sandbox exec (tools/sandbox_tools.py:436)"| sbx2["Isolated Sandbox Runtime"]
+  evals -->|"core.context/database (evals/run_eval.py:24-31)"| core
+  evals -->|"TOOLS keys (evals/stage_agents.py:122)"| tools
+  action -->|"pr_scan.py (action/action.yml:211)"| cli
+
+%% ------------------------------------ L3 components (3 core containers)
+graph TB
+  subgraph H3["L3 - Reference Harness (reference/)"]
+    runner["CampaignRunner (main.py:292,527,902)"]
+    entry["CliEntry (main.py:3566-3574)"]
+    hskills["Operator Skills (reference/skills/mantis-launch)"]
+    simg["Sandbox Guest Image (reference/sandbox/Dockerfile)"]
+    suite["Self-Test Suite (test_suite.py:78-90)"]
+  end
+  subgraph C3["L3 - Core Engine (reference/core)"]
+    cfg["Provider Config (config.py:266-267)"]
+    db["State Database (database.py:70)"]
+    gl["Graph Loader (graph_loader.py:94,213)"]
+    syn["Graph Synthesizer (synthesizer.py:58)"]
+    gw["LLM Egress Gateway (llm_gateway.py:60,139,291)"]
+    env["Execution Environments (environments/base.py:24,47)"]
+    srv["Surveyor (surveyor.py:919-921)"]
+    sidx["Structural Index Core (structural_index.py:20)"]
+    bud["Budget (budget.py:63,101,139)"]
+    sch["Schemas & SARIF (schemas.py:260-329, sarif.py:324)"]
+    sup["Support Services (core/*)"]
+  end
+  subgraph S3["L3 - Stage Skill Suite (skills/)"]
+    kb["KB Builder Stages (Stages 0-3)"]
+    audit["Audit & Validation Stages (Stages 4-8)"]
+    fix["Verify & Fix Stages (Stages 9-12)"]
+    close["Closing Stages (Stages 13-15)"]
+    advise["Advisor Skill (mantis-advise)"]
+    adapter["Pipeline Consultant (mantis-pipeline-adapter)"]
+  end
+  runner -->|"load graphs (main.py:41-57)"| gl
+  runner -->|"budgets (main.py:41-46)"| bud
+  hskills -->|"run.sh (mantis-launch/SKILL.md:31)"| entry
+  suite -->|"tools imports (test_suite.py:79-90)"| tools3["Agent Tool Registry (L2)"]
+  simg -->|"msb image load (install.sh:72)"| sbx3["Isolated Sandbox Runtime (L1)"]
+  syn -->|"TOOLS (synthesizer.py:58)"| tools3
+  gl -->|"TOOLS (graph_loader.py:51)"| tools3
+  srv -->|"lazy import (surveyor.py:919-921)"| tools3
+  cfg -->|"DEFAULT_MODEL (config.py:266)"| llm3["LLM Providers (L1)"]
+  gw -->|"sanitize_egress_text (llm_gateway.py:291)"| llm3
+  env -->|"SUPPORTED_SANDBOXES (config.py:267)"| sbx3
+  kb -->|"kb -> planning (mantis-architecture/SKILL.md:55)"| audit
+  audit -->|"Stages 4-12 order (mantis-meta-agent/SKILL.md:452-485)"| fix
+  audit -->|"query_structural_index (mantis-plan/SKILL.md:409,441)"| kb
+  fix -->|"reproducers + patches (mantis-reproduce/SKILL.md:52)"| state3["Workspace State Store (L2)"]
+  fix -->|"PoC in sandbox (mantis-reproduce/SKILL.md:52,233)"| sbx3
+  close -->|"review_packet-latest.md (mantis-report/SKILL.md:41)"| state3
+  advise -->|"advise.py --file (mantis-advise/SKILL.md:29)"| cli3["Operator & CI CLI (L2)"]
